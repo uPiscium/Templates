@@ -1,5 +1,5 @@
 [project]
-name = "agent-driven-project"
+name = "@@PROJECT_NAME@@"
 version = "0.1.0"
 description = "A standard Python project managed by uv and Nix"
 readme = "README.md"
