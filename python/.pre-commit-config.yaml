@@ -1,0 +1,30 @@
+# .pre-commit-config.yaml
+default_stages: [commit]
+
+repos:
+  - repo: local
+    hooks:
+      # Pre-commit: 高速なLintとFormatチェック
+      - id: ruff-check
+        name: Ruff Linter
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: Ruff Formatter
+        entry: uv run ruff format --force-exclude --check
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      # Pre-push: テストの実行（プッシュ前のみ）
+      - id: pytest
+        name: Run Tests
+        entry: just test  # タスクランナー経由で実行
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [push]
+
