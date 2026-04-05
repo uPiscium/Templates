@@ -27,6 +27,10 @@
             
             # エージェントが誤ってグローバル環境を触らないための防御壁
             export PIP_REQUIRE_VIRTUALENV=1
+
+            if [ -d ".git" ]; then
+              pre-commit install --install-hooks -t pre-commit -t pre-push > /dev/null 2>&1
+            fi
           '';
         };
       }
