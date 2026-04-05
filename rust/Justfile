@@ -1,0 +1,24 @@
+default: check-all
+
+# フォーマット
+format:
+    @echo "==> Running rustfmt..."
+    cargo fmt --all
+
+# 静的解析（警告をエラーとして扱い、エージェントの妥協を許さない）
+lint:
+    @echo "==> Running clippy..."
+    cargo clippy --all-targets --all-features -- -D warnings
+
+# テスト
+test:
+    @echo "==> Running cargo test..."
+    cargo test --all-targets --all-features
+
+# 総合検証
+check-all: format lint test
+    @echo "==> [OK] All Rust checks passed successfully."
+
+# 依存関係の追加（エージェント用のヘルパー）
+add crate:
+    cargo add {{crate}}

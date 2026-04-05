@@ -5,9 +5,12 @@
     templates = {
       python = {
         path = ./python;
-        description = "Python + uv + just based environment";
+        description = "uv + just based environment";
       };
-      # 将来的に python-js などのテンプレートをここに追加します
+      rust = {
+        path = ./rust;
+        description = "cargo + just based environment";
+      };
     };
   };
 }
