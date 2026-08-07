@@ -1,5 +1,6 @@
 root := justfile_directory()
 script := root / ".automation/bin/agent_core.py"
+lifecycle := root / ".automation/bin/task_lifecycle.py"
 
 [working-directory: root]
 doctor:
@@ -11,11 +12,19 @@ context:
 
 [working-directory: root]
 task-start task slug:
-    python3 {{quote(script)}} agent task-start {{quote(task)}} {{quote(slug)}}
+    python3 {{quote(lifecycle)}} start {{quote(task)}} {{quote(slug)}}
 
 [working-directory: root]
 status task:
-    python3 {{quote(script)}} agent status {{quote(task)}}
+    python3 {{quote(lifecycle)}} status {{quote(task)}}
+
+[working-directory: root]
+state-set task status:
+    python3 {{quote(lifecycle)}} state-set {{quote(task)}} {{quote(status)}}
+
+[working-directory: root]
+batch-plan tasks:
+    python3 {{quote(lifecycle)}} batch-plan {{tasks}}
 
 [working-directory: root]
 verify task:
@@ -43,4 +52,4 @@ pr-ready task:
 
 [working-directory: root]
 cleanup task:
-    python3 {{quote(script)}} agent cleanup {{quote(task)}}
+    python3 {{quote(lifecycle)}} cleanup {{quote(task)}}
