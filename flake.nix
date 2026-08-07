@@ -11,7 +11,10 @@
         path = ./rust;
         description = "cargo + just based environment";
       };
+      agent-base = {
+        path = ./templates/agent-base;
+        description = "Generated Agent-ready base repository scaffold";
+      };
     };
   };
 }
-
