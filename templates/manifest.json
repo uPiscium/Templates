@@ -1,0 +1,8 @@
+{
+  "templates": {
+    "agent-base": {
+      "adapter": "base",
+      "description": "Generated Agent-ready base repository scaffold"
+    }
+  }
+}
