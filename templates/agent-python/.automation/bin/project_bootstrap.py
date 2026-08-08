@@ -76,8 +76,10 @@ def bootstrap(root: Path, requested_name: str | None) -> dict:
             continue
         if PLACEHOLDER not in text:
             continue
-        path.write_text(text.replace(PLACEHOLDER, name), encoding="utf-8")
+        updated = text.replace(PLACEHOLDER, name)
+        path.write_text(updated, encoding="utf-8")
         changed.append(path.relative_to(root).as_posix())
+
     for path in candidate_files(root):
         try:
             if PLACEHOLDER in path.read_text(encoding="utf-8"):
