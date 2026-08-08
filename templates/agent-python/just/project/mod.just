@@ -15,12 +15,12 @@ doctor:
 
 [working-directory: root]
 format-check:
-    uv run ruff format --check .
+    uv run ruff format --check src tests
 
 [working-directory: root]
 lint:
-    uv run ruff check .
-    uv run mypy .
+    uv run ruff check src tests
+    uv run mypy src tests
 
 [working-directory: root]
 test:
