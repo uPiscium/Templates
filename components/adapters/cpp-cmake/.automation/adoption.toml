@@ -1,0 +1,16 @@
+version = 1
+
+preserve_existing = [
+  "CMakeLists.txt",
+  "CMakePresets.json",
+  "cmake/**",
+  "flake.nix",
+  "flake.lock",
+]
+
+[line_merge]
+".gitignore" = ["/.worktrees/", "/.build/"]
+
+[structured_merge]
+Justfile = "agent-module-router"
+AGENTS.md = "agent-rules-block"
