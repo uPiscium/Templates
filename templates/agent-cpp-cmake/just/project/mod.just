@@ -21,11 +21,11 @@ configure: cmake::configure
 
 format-check: quality::format-check
 
-lint: quality::lint
+lint: configure quality::lint
 
-test: test::all
+build: configure cmake::build
 
-build: cmake::build
+test: build test::all
 
-check: doctor configure format-check lint test build
+check: doctor format-check lint test
     @echo "C++/CMake Project Adapter check: PASS"
