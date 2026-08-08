@@ -20,11 +20,11 @@ class CppCMakeAdapterContractTest(unittest.TestCase):
         text = (ROOT / "components" / "adapters" / "cpp-cmake" / "just" / "project" / "mod.just").read_text()
         for recipe in ("doctor:", "configure:", "format-check:", "lint:", "test:", "build:", "check:"):
             self.assertIn(recipe, text)
-        for module in ("cmake", "quality", "test"):
+        for module in ("cmake", "quality", "tests"):
             self.assertIn(f"mod {module} ", text)
         self.assertIn("lint: configure quality::lint", text)
         self.assertIn("build: configure cmake::build", text)
-        self.assertIn("test: build test::all", text)
+        self.assertIn("test: build tests::all", text)
 
     def test_worktree_local_build_and_no_clean_api(self) -> None:
         preset = json.loads((ROOT / "components" / "adapters" / "cpp-cmake" / "CMakePresets.json").read_text())
