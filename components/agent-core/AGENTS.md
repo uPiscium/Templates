@@ -4,6 +4,7 @@ This repository is designed for hierarchical agent-driven development.
 
 ## Durable invariants
 
+- Before planning, editing, delegation, or project commands in a new primary-agent or Task-Orchestrator session, read `.automation/INIT.md` and complete the `initialize` skill. Initialization is read-only and failures block work.
 - Use the repository-local Just API for Task lifecycle, publication, and integration operations.
 - Do not bypass guarded Just recipes with raw state-changing Git or GitHub commands.
 - Ordinary implementation Tasks must not modify Automation Core files: `opencode.json`, `AGENTS.md`, `Justfile`, `.opencode/**`, `.automation/**`, or `.github/workflows/**`.
@@ -14,7 +15,15 @@ This repository is designed for hierarchical agent-driven development.
 - Main Orchestrator owns Task scheduling and final integration. Task Orchestrators own implementation and publication preparation for exactly one Task.
 - Task Orchestrators must not merge pull requests.
 - A command or check that was not executed must never be reported as PASS.
-- Do not substitute a different model ID when an explicitly configured model is unavailable. Report the configured model as unavailable instead.
+- Do not substitute a different model ID when an explicitly configured model is unavailable. Use only explicitly configured fallback policy where applicable.
+
+## Initialization layers
+
+- `AGENTS.md`: durable repository rules.
+- `.automation/INIT.md`: mandatory per-session read-only initialization sequence.
+- `.task-state/task.md`: active Task contract, progress, and evidence.
+- bootstrap: one-time state-changing repository creation/configuration, separate from `/init`.
+- `/init`: read-only validation/context resolution only; it must not rewrite `AGENTS.md` or repair Automation Core.
 
 ## Agent call graph
 
@@ -44,7 +53,7 @@ The call graph is intentionally non-cyclic. `task-orchestrator` may never invoke
 
 ## Permission boundary
 
-Automatically permitted operations are restricted to repository inspection, selected read-only Git/GitHub commands, safe `project::*` checks, Task-local commit, and constrained PR create/edit/ready operations through Just.
+Automatically permitted operations are restricted to repository inspection, selected read-only Git/GitHub commands, safe initialization and `project::*` checks, Task-local commit, and constrained PR create/edit/ready operations through Just.
 
 User approval is required for Task branch push, final merge, cleanup, `/tmp/opencode/**` access, and unclassified shell commands.
 
