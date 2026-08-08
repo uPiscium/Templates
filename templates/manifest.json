@@ -4,6 +4,10 @@
       "adapter": "base",
       "description": "Generated Agent-ready base repository scaffold"
     },
+    "agent-nix": {
+      "adapter": "nix",
+      "description": "Generated Agent-ready Nix flake repository scaffold"
+    },
     "agent-python": {
       "adapter": "python",
       "description": "Generated Agent-ready Python + uv repository scaffold"

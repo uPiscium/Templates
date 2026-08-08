@@ -64,6 +64,7 @@
       "gh repo view *": "allow",
 
       "just project::doctor": "allow",
+      "just project::eval": "allow",
       "just project::format-check": "allow",
       "just project::lint": "allow",
       "just project::test": "allow",

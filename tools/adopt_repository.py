@@ -52,23 +52,25 @@ def available_adapters(source: Path) -> set[str]:
 
 
 def detect_adapter(target: Path, adapters: set[str]) -> tuple[str, str, list[str]]:
-    candidates: list[tuple[str, str]] = []
-    signals = [
+    primary_signals = [
         ("cpp-cmake", "CMakeLists.txt"),
         ("python", "pyproject.toml"),
         ("rust", "Cargo.toml"),
-        ("nix", "flake.nix"),
     ]
-    for adapter, marker in signals:
-        if adapter in adapters and (target / marker).exists():
-            candidates.append((adapter, marker))
-    if len(candidates) == 1:
-        adapter, marker = candidates[0]
-        return adapter, f"unique known marker: {marker}", [adapter]
-    if not candidates:
-        return "base", "no dedicated adapter matched; using mandatory base fallback", []
-    names = [name for name, _ in candidates]
-    return "base", "adapter detection is ambiguous; using mandatory base fallback", names
+    primary = [
+        (adapter, marker)
+        for adapter, marker in primary_signals
+        if adapter in adapters and (target / marker).exists()
+    ]
+    if len(primary) == 1:
+        adapter, marker = primary[0]
+        return adapter, f"unique language/toolchain marker: {marker}", [adapter]
+    if len(primary) > 1:
+        names = [name for name, _ in primary]
+        return "base", "language/toolchain adapter detection is ambiguous; using mandatory base fallback", names
+    if "nix" in adapters and (target / "flake.nix").exists():
+        return "nix", "flake.nix is present and no language/toolchain adapter matched", ["nix"]
+    return "base", "no dedicated adapter matched; using mandatory base fallback", []
 
 
 def select_adapter(source: Path, target: Path, requested: str) -> tuple[str, str, list[str]]:
