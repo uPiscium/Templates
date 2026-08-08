@@ -85,8 +85,21 @@ class ModelFallbackTest(unittest.TestCase):
                 ROOT / "components" / "agent-core" / ".opencode" / "agents" / "task-orchestrator.md",
                 ROOT / "templates" / "agent-base" / ".opencode" / "agents" / "task-orchestrator.md",
             ),
+            (
+                ROOT / "components" / "agent-core" / ".opencode" / "skills" / "task-orchestration" / "SKILL.md",
+                ROOT / "templates" / "agent-base" / ".opencode" / "skills" / "task-orchestration" / "SKILL.md",
+            ),
         ]
         for source, generated in pairs:
+            self.assertEqual(source.read_bytes(), generated.read_bytes(), source.as_posix())
+
+        source_agents = ROOT / "components" / "agent-core" / ".opencode" / "agents"
+        generated_agents = ROOT / "templates" / "agent-base" / ".opencode" / "agents"
+        fallback_agents = sorted(source_agents.glob("*-fallback.md"))
+        self.assertGreaterEqual(len(fallback_agents), 10)
+        for source in fallback_agents:
+            generated = generated_agents / source.name
+            self.assertTrue(generated.is_file(), generated.as_posix())
             self.assertEqual(source.read_bytes(), generated.read_bytes(), source.as_posix())
 
 
