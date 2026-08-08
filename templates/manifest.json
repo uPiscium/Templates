@@ -3,6 +3,14 @@
     "agent-base": {
       "adapter": "base",
       "description": "Generated Agent-ready base repository scaffold"
+    },
+    "agent-python": {
+      "adapter": "python",
+      "description": "Generated Agent-ready Python + uv repository scaffold"
+    },
+    "agent-rust": {
+      "adapter": "rust",
+      "description": "Generated Agent-ready Rust repository scaffold"
     }
   }
 }
