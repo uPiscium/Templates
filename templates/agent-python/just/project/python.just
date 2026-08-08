@@ -6,9 +6,9 @@ sync:
 
 [working-directory: root]
 format:
-    uv run ruff format .
-    uv run ruff check --fix .
+    uv run ruff format src tests
+    uv run ruff check --fix src tests
 
 [working-directory: root]
 typecheck:
-    uv run mypy .
+    uv run mypy src tests
