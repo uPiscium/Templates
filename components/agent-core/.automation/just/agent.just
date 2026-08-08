@@ -23,7 +23,7 @@ state-set task status:
     python3 {{quote(lifecycle)}} state-set {{quote(task)}} {{quote(status)}}
 
 [working-directory: root]
-batch-plan tasks:
+batch-plan +tasks:
     python3 {{quote(lifecycle)}} batch-plan {{tasks}}
 
 [working-directory: root]
