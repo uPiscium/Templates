@@ -29,10 +29,10 @@ class AdoptRepositoryTest(unittest.TestCase):
             ["git", "rev-parse", "HEAD"], cwd=root, check=True, text=True, capture_output=True
         ).stdout.strip()
 
-    def test_plan_is_read_only_and_auto_falls_back_to_base(self) -> None:
+    def test_plan_is_read_only_and_auto_falls_back_to_base_without_marker(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)
-        (repo / "flake.nix").write_text("{ outputs = { self }: {}; }\n", encoding="utf-8")
+        (repo / ".keep").write_text("tracked\n", encoding="utf-8")
         self.commit_all(repo)
         before = subprocess.run(
             ["git", "status", "--porcelain"], cwd=repo, check=True, text=True, capture_output=True
@@ -47,6 +47,17 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertIn("base fallback", plan["adapterSelectionReason"])
         self.assertEqual(before, after)
         self.assertFalse(plan["workingTreeDirty"])
+
+    def test_auto_detects_nix_when_flake_is_only_project_marker(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "flake.nix").write_text("{ outputs = { self }: {}; }\n", encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "auto")
+
+        self.assertEqual(plan["selectedAdapter"], "nix")
+        self.assertIn("flake.nix", plan["adapterSelectionReason"])
 
     def test_base_apply_preserves_repository_files_and_does_not_commit(self) -> None:
         temporary, repo = self.make_repo()

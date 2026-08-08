@@ -6,14 +6,21 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
+    flake-utils.lib.eachDefaultSystem (
+      system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-      in {
+      in
+      {
         packages.default = pkgs.writeText "agent-nix-smoke" "ok\n";
         checks.default = self.packages.${system}.default;
-        formatter = pkgs.nixfmt-rfc-style;
+        formatter = pkgs.nixfmt;
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             nix
@@ -23,10 +30,11 @@
             jq
             yq-go
             nil
-            nixfmt-rfc-style
+            nixfmt
             statix
             deadnix
           ];
         };
-      });
+      }
+    );
 }

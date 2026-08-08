@@ -13,4 +13,4 @@ preserve_existing = [
 
 [structured_merge]
 Justfile = "agent-module-router"
-AGENTS.md = "agent-rules-block"
+"AGENTS.md" = "agent-rules-block"

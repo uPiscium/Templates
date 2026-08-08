@@ -1,0 +1,65 @@
+name: Template CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Python contract tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Generated template drift
+        run: python3 tools/render_templates.py check
+
+  generated-template-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        template:
+          - agent-python
+          - agent-rust
+          - agent-nix
+          - agent-cpp-cmake
+    steps:
+      - uses: actions/checkout@v6
+      - uses: cachix/install-nix-action@v31
+      - name: Instantiate template
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          mkdir -p "$target"
+          cd "$target"
+          nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
+          python3 "$GITHUB_WORKSPACE/tools/prepare_smoke_template.py" "$target"
+          git init -b main
+          git config user.name "Template CI"
+          git config user.email "template-ci@example.invalid"
+          git add .
+          git commit -m initial
+          git update-ref refs/remotes/origin/main HEAD
+          git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+      - name: Agent initialization smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          nix develop --command just agent::doctor
+          nix develop --command just agent::context
+      - name: Project Adapter smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          nix develop --command just project::doctor
+          nix develop --command just project::check
