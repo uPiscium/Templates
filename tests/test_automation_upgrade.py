@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ SCRIPT = ROOT / "components" / "agent-core" / ".automation" / "bin" / "automatio
 SPEC = importlib.util.spec_from_file_location("automation_upgrade", SCRIPT)
 assert SPEC and SPEC.loader
 upgrade = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = upgrade
 SPEC.loader.exec_module(upgrade)
 
 
@@ -71,8 +73,6 @@ class AutomationUpgradeContractTest(unittest.TestCase):
             (automation / "UPSTREAM").write_text(
                 'repository = "github:upiscium/Templates"\nref = "main"\ncomponent = "components/agent-core"\n'
             )
-            # Deliberately retain generated ownership metadata: adoption markers
-            # must take precedence over the default replace mode.
             (automation / "ownership.toml").write_text(
                 'version = 1\n\n[paths]\n"AGENTS.md" = "replace"\n"Justfile" = "replace"\n'
             )
