@@ -1,0 +1,17 @@
+[project]
+name = "@@PROJECT_NAME@@"
+version = "0.1.0"
+description = "A standard Python project managed by uv and Nix"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "mypy>=1.9.0",
+  "pytest>=8.0.0",
+  "ruff>=0.3.0",
+]
+
+[tool.mypy]
+exclude = [".direnv", ".venv"]
