@@ -20,13 +20,19 @@ class ProjectBootstrapTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "My Project"
             root.mkdir()
+            (root / "src").mkdir()
             (root / "pyproject.toml").write_text('name = "@@PROJECT_NAME@@"\n', encoding="utf-8")
             (root / "README.md").write_text("# @@PROJECT_NAME@@\n", encoding="utf-8")
+            (root / "src" / "main.py").write_text('print("@@PROJECT_NAME@@")\n', encoding="utf-8")
 
             first = bootstrap.bootstrap(root, None)
             self.assertEqual(first["projectName"], "my-project")
-            self.assertEqual(sorted(first["changedPaths"]), ["README.md", "pyproject.toml"])
-            self.assertNotIn("@@PROJECT_NAME@@", (root / "pyproject.toml").read_text(encoding="utf-8"))
+            self.assertEqual(
+                sorted(first["changedPaths"]),
+                ["README.md", "pyproject.toml", "src/main.py"],
+            )
+            for relative in ("README.md", "pyproject.toml", "src/main.py"):
+                self.assertNotIn("@@PROJECT_NAME@@", (root / relative).read_text(encoding="utf-8"))
 
             second = bootstrap.bootstrap(root, None)
             self.assertTrue(second["idempotent"])
@@ -57,6 +63,7 @@ class ProjectBootstrapTest(unittest.TestCase):
         self.assertIn("just project::bootstrap smoke-project", workflow)
         self.assertNotIn("prepare_smoke_template.py", workflow)
         self.assertIn("unresolved project-name placeholder remains after bootstrap", workflow)
+        self.assertIn("--exclude=project_bootstrap.py", workflow)
 
 
 if __name__ == "__main__":
