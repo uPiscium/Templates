@@ -2,7 +2,7 @@ root := justfile_directory()
 
 mod cmake 'cmake.just'
 mod quality 'quality.just'
-mod test 'test.just'
+mod tests 'test.just'
 mod? repository 'repository.just'
 
 [working-directory: root]
@@ -25,7 +25,7 @@ lint: configure quality::lint
 
 build: configure cmake::build
 
-test: build test::all
+test: build tests::all
 
 check: doctor format-check lint test
     @echo "C++/CMake Project Adapter check: PASS"
