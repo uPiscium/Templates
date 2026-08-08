@@ -9,8 +9,8 @@ doctor:
     @command -v ruff >/dev/null
     @command -v mypy >/dev/null
     @command -v pytest >/dev/null
-    @test "${UV_PROJECT_ENVIRONMENT:-$PWD/.venv}" = "$PWD/.venv"
-    @test "${PIP_REQUIRE_VIRTUALENV:-1}" = "1"
+    @test "${UV_PROJECT_ENVIRONMENT:-}" = "$PWD/.venv"
+    @test "${PIP_REQUIRE_VIRTUALENV:-}" = "1"
     @echo "Python Project Adapter doctor: PASS"
 
 [working-directory: root]
