@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Iterable
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+IGNORED_DIRECTORY_NAMES = {"__pycache__"}
+IGNORED_FILE_SUFFIXES = {".pyc", ".pyo"}
 
 
 class CompositionError(RuntimeError):
@@ -76,7 +78,9 @@ def _iter_entries(component: str, root: Path) -> Iterable[SourceEntry]:
 
     for current, directories, files in os.walk(root, topdown=True, followlinks=False):
         current_path = Path(current)
-        directories.sort()
+        directories[:] = sorted(
+            directory for directory in directories if directory not in IGNORED_DIRECTORY_NAMES
+        )
         files.sort()
 
         symlink_directories = [
@@ -89,6 +93,8 @@ def _iter_entries(component: str, root: Path) -> Iterable[SourceEntry]:
 
         for filename in files:
             source = current_path / filename
+            if source.suffix in IGNORED_FILE_SUFFIXES:
+                continue
             kind = "symlink" if source.is_symlink() else "file"
             yield SourceEntry(component, source, source.relative_to(root), kind)
 
