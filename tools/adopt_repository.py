@@ -235,10 +235,10 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
 
 def apply_plan(source: Path, target: Path, requested_adapter: str) -> dict:
     plan = build_plan(source, target, requested_adapter)
-    if plan["blockers"]:
-        raise AdoptionError("adoption blocked:\n- " + "\n- ".join(plan["blockers"]))
     if plan["workingTreeDirty"]:
         raise AdoptionError("adoption refused: target working tree is dirty")
+    if plan["blockers"]:
+        raise AdoptionError("adoption blocked:\n- " + "\n- ".join(plan["blockers"]))
 
     root = Path(plan["repositoryRoot"])
     adapter = plan["selectedAdapter"]
