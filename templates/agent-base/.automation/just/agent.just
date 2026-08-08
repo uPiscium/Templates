@@ -1,6 +1,7 @@
 root := justfile_directory()
 script := root / ".automation/bin/agent_core.py"
 lifecycle := root / ".automation/bin/task_lifecycle.py"
+fallback := root / ".automation/bin/model_fallback.py"
 
 [working-directory: root]
 doctor:
@@ -25,6 +26,10 @@ state-set task status:
 [working-directory: root]
 batch-plan +tasks:
     python3 {{quote(lifecycle)}} batch-plan {{tasks}}
+
+[working-directory: root]
+fallback-record role failed_model fallback_model reason outcome:
+    python3 {{quote(fallback)}} record {{quote(role)}} {{quote(failed_model)}} {{quote(fallback_model)}} {{quote(reason)}} {{quote(outcome)}}
 
 [working-directory: root]
 verify task:
