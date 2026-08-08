@@ -2,14 +2,15 @@ root := justfile_directory()
 script := root / ".automation/bin/agent_core.py"
 lifecycle := root / ".automation/bin/task_lifecycle.py"
 fallback := root / ".automation/bin/model_fallback.py"
+init := root / ".automation/bin/init_context.py"
 
 [working-directory: root]
 doctor:
-    python3 {{quote(script)}} agent doctor
+    python3 {{quote(init)}} doctor
 
 [working-directory: root]
 context:
-    python3 {{quote(script)}} agent context
+    python3 {{quote(init)}} context
 
 [working-directory: root]
 task-start task slug:
