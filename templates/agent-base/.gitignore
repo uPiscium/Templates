@@ -5,6 +5,9 @@
 .direnv/
 .venv/
 
+# CMake
+.build/
+
 # Python
 __pycache__/
 *.py[oc]
