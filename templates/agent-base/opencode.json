@@ -34,7 +34,6 @@
     },
     "bash": {
       "*": "ask",
-
       "git status": "allow",
       "git status *": "allow",
       "git diff": "allow",
@@ -51,7 +50,6 @@
       "git branch --list *": "allow",
       "git remote -v": "allow",
       "git worktree list *": "allow",
-
       "gh pr view *": "allow",
       "gh pr list *": "allow",
       "gh pr status *": "allow",
@@ -62,7 +60,6 @@
       "gh run view *": "allow",
       "gh run list *": "allow",
       "gh repo view *": "allow",
-
       "just project::doctor": "allow",
       "just project::eval": "allow",
       "just project::format-check": "allow",
@@ -70,6 +67,9 @@
       "just project::test": "allow",
       "just project::build": "allow",
       "just project::check": "allow",
+      "just automation::version": "allow",
+      "just automation::check-update *": "allow",
+      "just automation::upgrade *": "ask",
       "just agent::task-start *": "deny",
       "just agent::state-set *": "deny",
       "just agent::batch-plan *": "deny",
@@ -83,7 +83,6 @@
       "just agent::push *": "ask",
       "just agent::cleanup *": "ask",
       "just integrate::merge *": "ask",
-
       "git add *": "deny",
       "git commit *": "deny",
       "git push *": "deny",
