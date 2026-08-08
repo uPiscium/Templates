@@ -1,0 +1,24 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: Ruff Linter
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: Ruff Formatter
+        entry: uv run ruff format --force-exclude --check
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: pytest
+        name: Run Tests
+        entry: just project::test
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
