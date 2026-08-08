@@ -20,6 +20,7 @@
             gh
             jq
             gdb
+            gnused
           ];
         };
       });
