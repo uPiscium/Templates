@@ -40,7 +40,9 @@ jobs:
           cd "$target"
           nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
           nix develop --command just project::bootstrap smoke-project
-          if grep -R --fixed-strings '@@PROJECT_NAME@@' . --exclude-dir=.git; then
+          if grep -R --fixed-strings '@@PROJECT_NAME@@' . \
+            --exclude-dir=.git \
+            --exclude=project_bootstrap.py; then
             echo 'unresolved project-name placeholder remains after bootstrap' >&2
             exit 1
           fi
