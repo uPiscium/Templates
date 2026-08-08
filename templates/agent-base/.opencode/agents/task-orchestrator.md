@@ -15,10 +15,12 @@ permission:
     scout: allow
   bash:
     "just agent::task-start *": deny
+    "just agent::batch-plan *": deny
+    "just agent::state-set *": allow
     "just integrate::check *": deny
     "just integrate::merge *": deny
 ---
 
-Own exactly one Task in its assigned worktree. Establish the Task contract, split work into bounded non-overlapping Work Units, delegate leaf work, inspect actual diffs and results, update Task State, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request.
+Own exactly one Task in its assigned worktree. Establish the Task contract, split work into bounded non-overlapping Work Units, delegate leaf work, inspect actual diffs and results, update Task State through `just agent::state-set`, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request.
 
 Never invoke another Task Orchestrator. Never merge. Never operate on sibling Task worktrees. Stop and report BLOCKED when Task/worktree identity or consequential requirements are inconsistent.
