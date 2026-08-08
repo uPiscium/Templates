@@ -152,21 +152,22 @@ def action_for(repo: Path, source_core: Path, relative: Path, ownership: dict[st
         return Action(rel, "noop", "already matches upstream")
 
     if rel == "AGENTS.md":
-        mode = ownership.get(rel)
-        if mode == "replace":
-            return Action(rel, "replace", "ownership metadata marks generated AGENTS.md as replaceable")
         existing = destination.read_text(encoding="utf-8")
-        merged, detail = replace_agent_rules(existing, source.read_text(encoding="utf-8"))
-        return Action(rel, "merge" if merged is not None else "blocked", detail)
+        has_marker = "<!-- BEGIN AGENT CORE RULES -->" in existing or "<!-- END AGENT CORE RULES -->" in existing
+        if has_marker:
+            merged, detail = replace_agent_rules(existing, source.read_text(encoding="utf-8"))
+            return Action(rel, "merge" if merged is not None else "blocked", detail)
+        if ownership.get(rel) == "replace":
+            return Action(rel, "replace", "ownership metadata marks generated AGENTS.md as replaceable")
+        return Action(rel, "blocked", "AGENTS.md ownership is ambiguous and no managed block exists")
 
     if rel == "Justfile":
-        mode = ownership.get(rel)
-        if mode == "replace":
-            return Action(rel, "replace", "ownership metadata marks generated Justfile as replaceable")
-        merged, detail = merge_just_router(
-            destination.read_text(encoding="utf-8"), source.read_text(encoding="utf-8")
-        )
-        return Action(rel, "merge" if merged is not None else "blocked", detail)
+        existing = destination.read_text(encoding="utf-8")
+        adopted_router = "# Agent Core module router" in existing
+        if adopted_router or ownership.get(rel) != "replace":
+            merged, detail = merge_just_router(existing, source.read_text(encoding="utf-8"))
+            return Action(rel, "merge" if merged is not None else "blocked", detail)
+        return Action(rel, "replace", "ownership metadata marks generated Justfile as replaceable")
 
     return Action(rel, "replace", "Agent Core-owned path")
 
@@ -222,7 +223,6 @@ def apply(repo: Path, source: Path) -> dict:
     if plan["blockers"]:
         raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(plan["blockers"]))
     source_core = source / "components" / "agent-core"
-    ownership = load_ownership(repo)
     changed: list[str] = []
     for item in plan["actions"]:
         if item["action"] == "noop":
