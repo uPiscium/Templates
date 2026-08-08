@@ -1,12 +1,12 @@
 # OpenCode Depth-2 Ask Smoke Test
 
-Related: #7
+Related: #7, #13
 
 ## Status
 
-UNVERIFIED in the implementation environment. The repository configuration is present, but this environment does not provide a runnable OpenCode TUI session with the configured models and approval UI.
+UNVERIFIED in the implementation environment. The repository configuration and CI structural checks are present, but automated CI does not provide an interactive OpenCode TUI session with the configured models and approval UI.
 
-Do not treat this document as a PASS result until the procedure below is executed on a generated template.
+Do not treat CI success as a PASS result for this test. Do not treat this document as a PASS result until the procedure below is executed on a generated template and the result record is completed.
 
 ## Purpose
 
@@ -14,10 +14,11 @@ Verify that a permission request originating from a Depth-2 leaf agent can be ob
 
 ## Preconditions
 
-- Generate or enter an Agent-ready repository containing the #7 configuration.
+- Generate or enter an Agent-ready repository containing the current Agent Core configuration.
 - `opencode` is installed and authenticated for the exact configured model IDs.
-- `just`, `git`, `gh`, and the base Project Adapter are available.
+- `just`, `git`, `gh`, and the selected Project Adapter are available.
 - The current repository has a disposable test Task/worktree.
+- `just agent::doctor`, `just agent::context`, and `just project::doctor` have succeeded.
 
 ## Procedure
 
@@ -36,9 +37,11 @@ Verify that a permission request originating from a Depth-2 leaf agent can be ob
 
 ## Result record
 
-Record:
+Record the following together for one test run:
 
-- OpenCode version
+- Date/time and OpenCode version
+- Generated template / Adapter used
+- Agent Core version
 - resolved configured model IDs
 - Main session identifier, if exposed
 - Task Orchestrator session identifier, if exposed
@@ -52,5 +55,9 @@ Record:
 - Main merge Ask: PASS / FAIL / INCOMPLETE
 - `/tmp/opencode/**` Ask: PASS / FAIL / INCOMPLETE
 - other external path deny: PASS / FAIL / INCOMPLETE
+- Overall result: PASS / FAIL / INCOMPLETE
+- Notes / observed UI behavior
 
-If the Main TUI cannot directly surface descendant Ask requests but navigating to the child session permits approval, record that behavior explicitly rather than treating it as equivalent to centralized approval.
+Overall PASS requires every mandatory permission-boundary item above to be PASS. Any unexecuted item makes the run INCOMPLETE rather than PASS.
+
+If the Main TUI cannot directly surface descendant Ask requests but navigating to the child session permits approval, record that behavior explicitly and mark the centralized Depth-2 Ask item FAIL rather than treating child-session navigation as equivalent behavior.
