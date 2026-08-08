@@ -22,4 +22,4 @@ adopt-apply target adapter='auto':
 
 [working-directory: root]
 adapter-migrate-plan target adapter:
-    python3 tools/adopt_repository.py migrate-plan {{quote(target)}} --adapter {{quote(adapter)}}
+    python3 tools/adapter_migration.py {{quote(target)}} --adapter {{quote(adapter)}}
