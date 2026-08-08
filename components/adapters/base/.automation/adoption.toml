@@ -1,0 +1,16 @@
+version = 1
+
+# Existing repository-owned environment files are preserved when adopting the
+# language-neutral base adapter. Agent Core remains responsible for its own
+# automation files and public Just modules.
+preserve_existing = [
+  "flake.nix",
+  "flake.lock",
+]
+
+[line_merge]
+".gitignore" = ["/.worktrees/"]
+
+[structured_merge]
+Justfile = "agent-module-router"
+AGENTS.md = "agent-rules-block"
