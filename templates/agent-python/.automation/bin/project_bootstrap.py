@@ -9,7 +9,26 @@ from pathlib import Path
 
 PLACEHOLDER = "@@PROJECT_NAME@@"
 SKIP_DIRS = {".git", ".direnv", ".venv", ".worktrees", ".task-state", "target", ".build", "build"}
-TEXT_SUFFIXES = {"", ".md", ".toml", ".txt", ".nix", ".json", ".cmake"}
+SKIP_FILES = {".automation/bin/project_bootstrap.py"}
+TEXT_SUFFIXES = {
+    "",
+    ".md",
+    ".toml",
+    ".txt",
+    ".nix",
+    ".json",
+    ".cmake",
+    ".py",
+    ".rs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cxx",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+}
 
 
 class BootstrapError(RuntimeError):
@@ -33,7 +52,10 @@ def normalize_name(raw: str) -> str:
 def candidate_files(root: Path) -> list[Path]:
     result: list[Path] = []
     for path in root.rglob("*"):
-        if any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        relative = path.relative_to(root)
+        if any(part in SKIP_DIRS for part in relative.parts):
+            continue
+        if relative.as_posix() in SKIP_FILES:
             continue
         if not path.is_file() or path.is_symlink():
             continue
@@ -54,10 +76,8 @@ def bootstrap(root: Path, requested_name: str | None) -> dict:
             continue
         if PLACEHOLDER not in text:
             continue
-        updated = text.replace(PLACEHOLDER, name)
-        path.write_text(updated, encoding="utf-8")
+        path.write_text(text.replace(PLACEHOLDER, name), encoding="utf-8")
         changed.append(path.relative_to(root).as_posix())
-
     for path in candidate_files(root):
         try:
             if PLACEHOLDER in path.read_text(encoding="utf-8"):
