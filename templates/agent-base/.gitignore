@@ -1,1 +1,23 @@
 /.worktrees/
+
+# Environment and local caches
+.env
+.direnv/
+.venv/
+
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Rust
+target/
+debug/
+**/*.rs.bk
+**/mutants.out*/
