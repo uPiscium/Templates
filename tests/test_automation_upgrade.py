@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -29,19 +28,20 @@ class AutomationUpgradeContractTest(unittest.TestCase):
 
     def test_upgrade_preserves_adapter_and_repository_owned_paths(self) -> None:
         script = (ROOT / "components" / "agent-core" / ".automation" / "bin" / "automation_upgrade.py").read_text()
+        readme = (ROOT / "README.md").read_text()
         for protected in (
-            '.automation/ADAPTER',
-            '.automation/INIT.fragment.md',
-            '.automation/adoption.toml',
-            'just/project/**',
-            '.github/workflows/**',
+            ".automation/ADAPTER",
+            ".automation/INIT.fragment.md",
+            ".automation/adoption.toml",
         ):
-            self.assertIn(protected.split('/**')[0], script if protected.startswith('.automation/') else (ROOT / "README.md").read_text())
-        self.assertIn('AUTOMATION_MAINTENANCE', script)
-        self.assertIn('upgrade refused on default branch', script)
-        self.assertIn('commitCreated', script)
-        self.assertIn('pushPerformed', script)
-        self.assertIn('mergePerformed', script)
+            self.assertIn(protected, script)
+        self.assertIn("just/project/**", readme)
+        self.assertIn("repository CI", readme)
+        self.assertIn("AUTOMATION_MAINTENANCE", script)
+        self.assertIn("upgrade refused on default branch", script)
+        self.assertIn("commitCreated", script)
+        self.assertIn("pushPerformed", script)
+        self.assertIn("mergePerformed", script)
 
     def test_readme_covers_operational_entrypoints(self) -> None:
         readme = (ROOT / "README.md").read_text()
