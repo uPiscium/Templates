@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
@@ -10,15 +11,21 @@ ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "templates" / "agent-base"
 
 
-def run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=check)
+def run(
+    *args: str,
+    cwd: Path,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=check, env=env)
 
 
 class WorktreeLifecycleSmokeTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.repo = Path(self.temporary.name) / "repo"
+        temporary_root = Path(self.temporary.name)
+        self.repo = temporary_root / "repo"
         shutil.copytree(TEMPLATE, self.repo)
         run("git", "init", "-b", "main", cwd=self.repo)
         run("git", "config", "user.email", "smoke@example.invalid", cwd=self.repo)
@@ -29,8 +36,16 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         run("git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main", cwd=self.repo)
         self.script = self.repo / ".automation" / "bin" / "task_lifecycle.py"
 
+        fake_bin = temporary_root / "bin"
+        fake_bin.mkdir()
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_gh.chmod(0o755)
+        self.env = dict(os.environ)
+        self.env["PATH"] = f"{fake_bin}:{self.env['PATH']}"
+
     def test_start_duplicate_ignore_and_cleanup(self) -> None:
-        first = run("python3", str(self.script), "start", "TASK-1", "smoke", cwd=self.repo)
+        first = run("python3", str(self.script), "start", "TASK-1", "smoke", cwd=self.repo, env=self.env)
         self.assertIn('"status": "initialized"', first.stdout)
         worktree = self.repo / ".worktrees" / "TASK-1-smoke"
         state = worktree / ".task-state" / "task.md"
@@ -38,11 +53,20 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         status = run("git", "status", "--porcelain", cwd=worktree).stdout
         self.assertNotIn(".task-state", status)
 
-        duplicate = run("python3", str(self.script), "start", "TASK-1", "smoke", cwd=self.repo, check=False)
+        duplicate = run(
+            "python3",
+            str(self.script),
+            "start",
+            "TASK-1",
+            "smoke",
+            cwd=self.repo,
+            check=False,
+            env=self.env,
+        )
         self.assertNotEqual(duplicate.returncode, 0)
 
-        run("python3", str(self.script), "state-set", "TASK-1", "cancelled", cwd=worktree)
-        cleanup = run("python3", str(self.script), "cleanup", "TASK-1", cwd=self.repo)
+        run("python3", str(self.script), "state-set", "TASK-1", "cancelled", cwd=worktree, env=self.env)
+        cleanup = run("python3", str(self.script), "cleanup", "TASK-1", cwd=self.repo, env=self.env)
         self.assertIn('"taskStateDiscarded": true', cleanup.stdout)
         self.assertFalse(worktree.exists())
 
