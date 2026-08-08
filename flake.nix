@@ -15,6 +15,10 @@
         path = ./templates/agent-base;
         description = "Generated Agent-ready base repository scaffold";
       };
+      agent-cpp-cmake = {
+        path = ./templates/agent-cpp-cmake;
+        description = "Generated Agent-ready C++/CMake repository scaffold";
+      };
       agent-nix = {
         path = ./templates/agent-nix;
         description = "Generated Agent-ready Nix flake repository scaffold";
