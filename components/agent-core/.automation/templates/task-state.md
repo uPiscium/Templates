@@ -16,6 +16,14 @@ TBD
 
 - TBD
 
+## Coordination surfaces
+
+- None recorded
+
+## External resources
+
+- None recorded
+
 ## Prohibited changes
 
 - Automation Core unless explicitly authorized
