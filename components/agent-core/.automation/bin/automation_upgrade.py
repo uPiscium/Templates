@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -66,21 +67,13 @@ def resolve_source(path: Path | None) -> Path:
 def plan(repo: Path, source: Path) -> dict:
     local = version(repo)
     remote = version(source / "components" / "agent-core")
-    core = source / "components" / "agent-core"
-    managed = [
-        ".automation",
-        ".opencode",
-        "AGENTS.md",
-        "Justfile",
-        "opencode.json",
-    ]
     return {
         "currentVersion": local,
         "upstreamVersion": remote,
         "updateAvailable": local != remote,
         "source": str(source),
-        "managedPaths": managed,
-        "protectedRepositoryPaths": ["just/project", "just/local.just", ".github/workflows"],
+        "managedPaths": [".automation/**", ".opencode/**", "AGENTS.md", "Justfile", "opencode.json"],
+        "protectedRepositoryPaths": ["just/project/**", "just/local.just", ".github/workflows/**"],
         "readOnly": True,
     }
 
@@ -89,11 +82,7 @@ def require_maintenance(repo: Path) -> None:
     branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
     if not branch:
         raise UpgradeError("detached HEAD is not supported")
-    default = run(
-        ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-        cwd=repo,
-        check=False,
-    ).stdout.strip().removeprefix("origin/")
+    default = run(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd=repo, check=False).stdout.strip().removeprefix("origin/")
     if default and branch == default:
         raise UpgradeError("upgrade refused on default branch")
     if not (repo / ".task-state" / "task.md").is_file():
@@ -102,21 +91,49 @@ def require_maintenance(repo: Path) -> None:
         raise UpgradeError("upgrade requires AUTOMATION_MAINTENANCE=1 in a dedicated Automation Maintenance Task")
 
 
+def managed(relative: Path) -> bool:
+    text = relative.as_posix()
+    if text in {"AGENTS.md", "Justfile", "opencode.json"}:
+        return True
+    if text.startswith(".opencode/"):
+        return True
+    if text.startswith(".automation/"):
+        return text not in {
+            ".automation/ADAPTER",
+            ".automation/INIT.fragment.md",
+            ".automation/adoption.toml",
+        }
+    return False
+
+
 def apply(repo: Path, source: Path) -> dict:
     require_maintenance(repo)
     source_core = source / "components" / "agent-core"
-    # Upgrade is intentionally delegated to the Templates-side adoption renderer.
-    # This command only validates the maintenance boundary and emits the exact
-    # source/target contract; it never fetches remote code or commits changes.
+    changed: list[str] = []
+    for path in sorted(source_core.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source_core)
+        if not managed(relative):
+            continue
+        destination = repo / relative
+        before = destination.read_bytes() if destination.is_file() else None
+        data = path.read_bytes()
+        if before == data:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination)
+        changed.append(relative.as_posix())
     return {
-        "status": "READY",
+        "status": "APPLIED",
         "repositoryRoot": str(repo),
         "sourceCore": str(source_core),
         "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
+        "changedPaths": changed,
         "commitCreated": False,
         "pushPerformed": False,
         "mergePerformed": False,
-        "next": "Apply the Templates upgrade materialization for Agent Core-owned paths, inspect the diff, then run just project::check and repository CI before publication.",
+        "requiredNextChecks": ["git diff --check", "just agent::doctor", "just project::check", "repository CI/smoke tests"],
     }
 
 
@@ -125,7 +142,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
     check = sub.add_parser("check-update")
-    check.add_argument("--source", type=Path)
+    check.add_argument("--source", type=Path, required=True)
     upgrade = sub.add_parser("upgrade")
     upgrade.add_argument("--source", type=Path, required=True)
     return p
