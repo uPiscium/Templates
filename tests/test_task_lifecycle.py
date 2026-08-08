@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ MODULE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task
 spec = importlib.util.spec_from_file_location("task_lifecycle", MODULE_PATH)
 assert spec and spec.loader
 lifecycle = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = lifecycle
 spec.loader.exec_module(lifecycle)
 
 
