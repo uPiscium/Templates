@@ -8,7 +8,7 @@ doctor:
     @command -v cargo >/dev/null
     @command -v rustc >/dev/null
     @command -v rustfmt >/dev/null
-    @command -v clippy-driver >/dev/null || command -v cargo-clippy >/dev/null || true
+    @cargo clippy --version >/dev/null
     @echo "Rust Project Adapter doctor: PASS"
 
 [working-directory: root]
