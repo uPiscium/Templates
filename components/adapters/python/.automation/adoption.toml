@@ -1,0 +1,17 @@
+version = 1
+
+preserve_existing = [
+  "pyproject.toml",
+  "uv.lock",
+  "flake.nix",
+  "flake.lock",
+  ".envrc",
+  ".pre-commit-config.yaml",
+]
+
+[line_merge]
+".gitignore" = ["/.worktrees/"]
+
+[structured_merge]
+Justfile = "agent-module-router"
+AGENTS.md = "agent-rules-block"
