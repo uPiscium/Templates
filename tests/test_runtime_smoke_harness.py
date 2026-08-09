@@ -85,10 +85,102 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("--print-logs --log-level DEBUG", interactive)
         self.assertIn("snapshot-sessions", interactive)
         self.assertNotIn(" --auto", interactive)
-        self.assertIn("--print-logs --log-level DEBUG run", direct)
-        self.assertIn("--agent general", direct)
-        self.assertIn("--format json", direct)
+        self.assertIn('"$OPENCODE_BIN" serve', direct)
+        self.assertIn(
+            'request("POST", "/session", {"title": "Direct leaf control"})', direct
+        )
+        self.assertIn('f"/session/{session_id}/message"', direct)
+        self.assertIn('"agent": "general"', direct)
+        self.assertNotIn('"model":', direct)
+        self.assertIn("if len(tool_parts) != 1", direct)
+        self.assertIn('["git", "status", "--porcelain"]', direct)
+        self.assertIn("timeout --kill-after=20s", direct)
+        self.assertNotIn(" --agent general", direct)
         self.assertNotIn(" --auto", direct)
+
+    def test_prepare_commits_scaffold_before_nix_bootstrap_and_bootstraps_second_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "issue-41"
+            calls: list[tuple[str, list[str], Path, Path]] = []
+
+            original_workspace = runtime.workspace
+            original_doctor = runtime.doctor
+            original_run_logged = runtime.run_logged
+            original_run_capture = runtime.run_capture
+            original_write_contract = runtime.write_contract
+
+            def fake_workspace(_: str) -> Path:
+                return base
+
+            def fake_doctor() -> dict:
+                return {"status": "PASS"}
+
+            def fake_run_logged(command: list[str], *, cwd: Path, log: Path) -> None:
+                calls.append(("logged", command, cwd, log))
+
+            def fake_run_capture(command: list[str], *, cwd: Path) -> str:
+                if command == ["opencode", "--version"]:
+                    return "1.18.4"
+                if command == ["git", "rev-parse", "HEAD"]:
+                    return "cafebabe"
+                if command == ["git", "status", "--porcelain"]:
+                    return ""
+                return "result"
+
+            runtime.workspace = fake_workspace
+            runtime.doctor = fake_doctor
+            runtime.run_logged = fake_run_logged
+            runtime.run_capture = fake_run_capture
+            runtime.write_contract = lambda *args, **kwargs: None
+            try:
+                runtime.prepare("issue-41", "agent-python")
+            finally:
+                runtime.workspace = original_workspace
+                runtime.doctor = original_doctor
+                runtime.run_logged = original_run_logged
+                runtime.run_capture = original_run_capture
+                runtime.write_contract = original_write_contract
+
+            commands = [command for _kind, command, *_ in calls]
+
+            def index_of(prefix: list[str]) -> int:
+                for idx, command in enumerate(commands):
+                    if command[: len(prefix)] == prefix:
+                        return idx
+                raise AssertionError(f"command {prefix} not found")
+
+            flake = index_of(["nix", "flake", "init"])
+            git_init = index_of(["git", "init", "-b", "main"])
+            bootstrap = index_of(["nix", "develop", "--command", "just", "project::bootstrap", "smoke-project"])
+            first_commit = index_of(["git", "commit", "-m", "Initialize runtime smoke fixture"])
+            second_commit = index_of(
+                [
+                    "nix",
+                    "develop",
+                    "--command",
+                    "git",
+                    "commit",
+                    "-m",
+                    "Bootstrap runtime smoke fixture",
+                ]
+            )
+            add_indices = [
+                idx for idx, command in enumerate(commands) if command == ["git", "add", "."]
+            ]
+
+            self.assertLess(git_init, bootstrap)
+            self.assertLess(first_commit, bootstrap)
+            self.assertLess(bootstrap, second_commit)
+            self.assertLess(flake, first_commit)
+            self.assertLess(flake, bootstrap)
+            self.assertEqual(2, len(add_indices))
+            self.assertLess(add_indices[0], first_commit)
+            self.assertGreater(second_commit, bootstrap)
+            self.assertGreater(add_indices[1], bootstrap)
+            self.assertIn(
+                ["nix", "develop", "--command", "git", "push", "-u", "origin", "main"],
+                commands,
+            )
 
     def test_report_template_requires_evidence_based_classification(self) -> None:
         metadata = {

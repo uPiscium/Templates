@@ -44,7 +44,7 @@ Run the same configured `general` leaf directly in the `SMOKE-CONTROL` worktree:
 just runtime::direct-leaf issue-41
 ```
 
-This uses non-interactive `opencode run --agent general --format json`, writes event and DEBUG logs under `.runtime-smoke/issue-41/logs/`, and applies a bounded diagnostic timeout. This is a provider/agent isolation control only; it is not evidence that Depth-2 delegation works.
+This starts a local loopback `opencode serve` endpoint on an ephemeral port, creates a session through `/session`, and sends a synchronous `/session/{sessionID}/message` request with `agent: general`. The request does not override the configured model. The launcher verifies that exactly one completed Bash tool call ran `git status --short`, writes JSON event output and DEBUG logs under `.runtime-smoke/issue-41/logs/`, and applies a bounded diagnostic timeout. This is a provider/agent isolation control only; it is not evidence that Depth-2 delegation works.
 
 ## Ask-free nested control
 

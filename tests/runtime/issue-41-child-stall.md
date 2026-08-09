@@ -38,7 +38,7 @@ Do not infer an intermediate stage from a spinner or child label alone.
 just runtime::direct-leaf issue-41
 ```
 
-Expected diagnostic action: `general` runs `git status --short` once without editing.
+Expected diagnostic action: loopback API control sends a direct `general` session request that runs `git status --short` once without editing.
 
 - PASS: provider responds, read-only command completes, process exits normally
 - FAIL: explicit provider/tool/agent error is observed
