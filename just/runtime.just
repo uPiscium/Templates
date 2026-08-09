@@ -1,0 +1,47 @@
+root := justfile_directory()
+runner := root / "tests/runtime/runtime_smoke.py"
+debug_runner := root / "tests/runtime/run_opencode_debug.sh"
+direct_runner := root / "tests/runtime/run_direct_leaf.sh"
+
+[working-directory: root]
+doctor:
+    python3 {{quote(runner)}} doctor
+
+[working-directory: root]
+prepare issue='issue-41' template='agent-python':
+    python3 {{quote(runner)}} prepare --issue {{quote(issue)}} --template {{quote(template)}}
+
+[working-directory: root]
+status issue='issue-41':
+    python3 {{quote(runner)}} status --issue {{quote(issue)}}
+
+[working-directory: root]
+diagnose-child-stall issue='issue-41':
+    @echo "Diagnostic control: in the TUI run /task-run SMOKE-CONTROL"
+    bash {{quote(debug_runner)}} {{quote(issue)}} child-stall
+
+[working-directory: root]
+smoke-depth2 issue='issue-41':
+    @echo "Depth-2 Ask smoke: in the TUI run /task-run SMOKE-ASK"
+    bash {{quote(debug_runner)}} {{quote(issue)}} depth2-ask
+
+[working-directory: root]
+smoke-fallback issue='issue-41':
+    @echo "Fallback observation: in the TUI run /task-run SMOKE-FALLBACK"
+    bash {{quote(debug_runner)}} {{quote(issue)}} fallback
+
+[working-directory: root]
+direct-leaf issue='issue-41':
+    bash {{quote(direct_runner)}} {{quote(issue)}}
+
+[working-directory: root]
+sessions issue='issue-41' label='manual':
+    python3 {{quote(runner)}} snapshot-sessions --issue {{quote(issue)}} --label {{quote(label)}}
+
+[working-directory: root]
+export-session session issue='issue-41':
+    python3 {{quote(runner)}} export-session --issue {{quote(issue)}} --session-id {{quote(session)}}
+
+[working-directory: root]
+report issue='issue-41':
+    python3 {{quote(runner)}} report --issue {{quote(issue)}}
