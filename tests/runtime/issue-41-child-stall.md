@@ -32,7 +32,7 @@ Task tool launch
 
 Do not infer an intermediate stage from a spinner or child label alone.
 
-## Ask ordering gate (retry requirement)
+## Native Ask canary ordering gate (retry requirement)
 
 For `Control C`, classify deterministic ordering as follows:
 
@@ -40,7 +40,7 @@ For `Control C`, classify deterministic ordering as follows:
 - provider execution result for the approved first command
 - `permission.asked`/rejection for `printf 'depth2-ask-rejected\n'`
 
-The prepared diagnostic fixture sets `question: deny` on its generated `general` agent. This is a diagnostic-only restriction, not a production permission weakening, and ensures the leaf reaches the Bash Ask boundary instead of substituting a Question tool interaction.
+The prepared diagnostic fixture uses an explicit canary profile for its generated `general` agent: `question` is denied, Bash defaults to deny, the read-only status control is allowed, and only the two exact canary `printf` commands use Ask. This is independent from production Leaf policy and ensures future non-interactive Leaf changes do not disable the upstream compatibility check.
 
 If the leaf emits a `question` event before the first Bash permission flow, treat the attempt as **INCOMPLETE/invalid** (not a relay failure), and rerun `just runtime::smoke-depth2 issue-41` + `/task-run SMOKE-ASK`.
 
@@ -81,7 +81,9 @@ No Ask event is required by this control.
 - direct PASS + nested FAIL/INCOMPLETE: prioritize nested Task/session/provider execution
 - direct PASS + nested PASS: nested provider path works; continue to Ask probe
 
-## Control C — Depth-2 Ask
+## Control C — Depth-2 native Ask compatibility canary
+
+This control observes upstream compatibility only. It is not a release blocker and does not determine #7 completion; Leaf -> Depth-1 escalation in #51 is the durable release gate.
 
 ```sh
 just runtime::smoke-depth2 issue-41
@@ -125,7 +127,7 @@ Use the sanitized export as supporting evidence, not as a replacement for real T
 | pass | pass | question before Bash permission | protocol mismatch → treat as INCOMPLETE/invalid and retry |
 | pass | pass | stall before permission event | Ask-producing leaf/provider/tool request path |
 | pass | pass | permission event exists but Main cannot handle it | permission relay/UI propagation |
-| pass | pass | approve/reject both work | #7 may proceed to remaining permission-boundary checks |
+| pass | pass | approve/reject both work | upstream compatibility restored; #7 remains gated by Leaf -> Depth-1 escalation |
 
 ## Non-negotiable constraints
 

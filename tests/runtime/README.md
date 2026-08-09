@@ -66,9 +66,9 @@ Interpretation:
 
 - direct leaf stalls: investigate provider/model or leaf-agent execution before nested orchestration
 - direct leaf passes but nested control stalls: investigate Task/subagent session execution
-- nested control passes: proceed to the Ask probe
+- nested control passes: the provider path works; the native Ask canary may be run independently
 
-## Depth-2 Ask probe
+## Depth-2 native Ask compatibility canary
 
 ```sh
 just runtime::smoke-depth2 issue-41
@@ -80,11 +80,13 @@ Then run:
 /task-run SMOKE-ASK
 ```
 
-The `SMOKE-ASK` contract requires the Task Orchestrator to pass one exact bounded Work Unit to one `general` leaf: first `printf 'depth2-ask-approved\n'`, then `printf 'depth2-ask-rejected\n'`.
+`SMOKE-ASK` is an upstream compatibility canary for descendant permission relay. It is not a Templates release gate and does not determine #7 completion; the durable release gate is Leaf -> Depth-1 escalation tracked by #51.
+
+The canary contract requires the Task Orchestrator to pass one exact bounded Work Unit to one `general` leaf: first `printf 'depth2-ask-approved\n'`, then `printf 'depth2-ask-rejected\n'`.
 
 The leaf must call Bash for the first printf immediately, and it must wait for that permission resolution before making any second request. A `question` event before the first Bash permission means the run is non-deterministic for this harness and must be treated as **INCOMPLETE/invalid** for this diagnostic.
 
-To make that protocol enforceable, `runtime::prepare` adds a diagnostic-only `question: deny` override to the generated `general` agent before committing the fixture. This narrows the disposable fixture permission surface without changing the Bash Ask boundary or the generated template source.
+To keep the canary independent from production Leaf policy, `runtime::prepare` installs a diagnostic-only profile before committing the disposable fixture: `question` is denied, Bash defaults to deny, `git status --short` remains available for controls, and only the two exact canary `printf` commands use Ask. This profile does not change generated template source or production permissions.
 
 Approve the first request once and reject the second. If the run is incomplete due to ordering/classification mismatch, stop and re-run `/task-run SMOKE-ASK` (new session) to collect a fresh, retryable observation.
 

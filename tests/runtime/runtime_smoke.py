@@ -35,7 +35,7 @@ TASK_DEFINITIONS = (
     (
         "SMOKE-ASK",
         "depth2-ask",
-        "Exercise a deterministic Depth-2 Bash Ask from a leaf and observe explicit approval/rejection relay in Main TUI without permission weakening.",
+        "Run a deterministic Depth-2 native Ask compatibility canary for upstream descendant permission relay without making it a release gate.",
         [
             "Task Orchestrator must delegate a single bounded Work Unit to exactly one `general` leaf.",
             "Task Orchestrator must pass this exact Work Unit instruction: \"Immediately call the Bash tool with `printf 'depth2-ask-approved\\n'`; do not call `question` or any other tool first. Wait for that permission result, then call the Bash tool with `printf 'depth2-ask-rejected\\n'`. Do not perform any other action.\"",
@@ -87,14 +87,51 @@ def harden_runtime_leaf_permissions(repo: Path) -> None:
         raise RuntimeSmokeError(f"missing generated general agent: {agent}") from exc
 
     permission = "permission:\n  task: deny\n"
-    hardened = "permission:\n  task: deny\n  question: deny\n"
-    if hardened in text:
-        return
-    if text.count(permission) != 1:
-        raise RuntimeSmokeError(
-            "generated general agent does not contain the expected permission block"
+    if "  question: deny\n" not in text:
+        if re.search(r"(?m)^  question:", text) is not None:
+            raise RuntimeSmokeError(
+                "generated general agent has a non-deny question permission"
+            )
+        if text.count(permission) != 1:
+            raise RuntimeSmokeError(
+                "generated general agent does not contain the expected permission block"
+            )
+        text = text.replace(
+            permission,
+            permission + "  question: deny\n",
+            1,
         )
-    agent.write_text(text.replace(permission, hardened, 1), encoding="utf-8")
+    elif text.count("  question: deny\n") != 1:
+        raise RuntimeSmokeError(
+            "generated general agent contains duplicate question deny rules"
+        )
+
+    bash = re.search(r"(?m)^  bash:\n(?P<rules>(?:    .*\n)*)", text)
+    if bash is None:
+        raise RuntimeSmokeError("generated general agent is missing its Bash rules")
+    rules = bash.group("rules")
+    default_deny = '    "*": deny\n'
+    conflicting_default = re.search(r'^    "\*": (?!deny$).+$', rules, re.MULTILINE)
+    if conflicting_default is not None:
+        raise RuntimeSmokeError(
+            "generated general agent has a non-deny default Bash permission"
+        )
+    if default_deny not in rules:
+        rules = default_deny + rules
+
+    diagnostic_rules = (
+        '    "git status --short": allow\n',
+        '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+        '    "printf \'depth2-ask-rejected\\\\n\'": ask\n',
+    )
+    insertion = rules.index(default_deny) + len(default_deny)
+    for rule in diagnostic_rules:
+        if rule not in rules:
+            rules = rules[:insertion] + rule + rules[insertion:]
+            insertion += len(rule)
+
+    text = text[: bash.start("rules")] + rules + text[bash.end("rules") :]
+    agent.write_text(text, encoding="utf-8")
 
 
 def workspace(issue: str) -> Path:
@@ -319,7 +356,10 @@ def report_template(issue: str, metadata: dict) -> str:
 - `git status --short` completed: PASS / FAIL / INCOMPLETE
 - result: PASS / FAIL / INCOMPLETE
 
-## Depth-2 Ask probe
+## Depth-2 native Ask compatibility canary
+
+- release blocker: NO
+- upstream compatibility canary: YES
 
 - Log:
 - Main session ID:
@@ -354,7 +394,8 @@ def report_template(issue: str, metadata: dict) -> str:
 ## Final verdict
 
 - #41 diagnostic acceptance: PASS / FAIL / INCOMPLETE
-- #7 ready for full permission smoke: YES / NO
+- Depth-2 native Ask upstream compatibility: PASS / FAIL / INCOMPLETE
+- #7 release gate: Leaf -> Depth-1 escalation tracked by #51
 - #23 runtime acceptance: PASS / FAIL / INCOMPLETE
 
 ## Notes

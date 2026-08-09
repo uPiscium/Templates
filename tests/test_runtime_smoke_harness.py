@@ -88,7 +88,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             self.assertIn("- Status: initialized", text)
             self.assertIn("- [ ] Evidence is recorded.", text)
 
-    def test_runtime_fixture_denies_question_only_for_general_leaf(self) -> None:
+    def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
             agent = repo / ".opencode" / "agents" / "general.md"
@@ -106,6 +106,52 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             self.assertEqual(1, text.count("  question: deny\n"))
             self.assertIn("  task: deny\n", text)
             self.assertIn("  bash:\n", text)
+            self.assertEqual(1, text.count('    "*": deny\n'))
+            self.assertIn('    "git status --short": allow\n', text)
+            self.assertIn(
+                '    "printf \'depth2-ask-approved\\\\n\'": ask\n', text
+            )
+            self.assertIn(
+                '    "printf \'depth2-ask-rejected\\\\n\'": ask\n', text
+            )
+
+    def test_runtime_canary_extends_future_noninteractive_leaf_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            agent = repo / ".opencode" / "agents" / "general.md"
+            agent.parent.mkdir(parents=True)
+            agent.write_text(
+                "---\npermission:\n  task: deny\n  question: deny\n  bash:\n"
+                '    "*": deny\n'
+                '    "just project::check": allow\n---\n',
+                encoding="utf-8",
+            )
+
+            runtime.harden_runtime_leaf_permissions(repo)
+
+            text = agent.read_text(encoding="utf-8")
+            self.assertEqual(1, text.count('    "*": deny\n'))
+            self.assertIn('    "just project::check": allow\n', text)
+            self.assertIn(
+                '    "printf \'depth2-ask-approved\\\\n\'": ask\n', text
+            )
+
+    def test_runtime_canary_rejects_interactive_leaf_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            agent = repo / ".opencode" / "agents" / "general.md"
+            agent.parent.mkdir(parents=True)
+            agent.write_text(
+                "---\npermission:\n  task: deny\n  question: allow\n  bash:\n"
+                '    "*": ask\n---\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeSmokeError,
+                "non-deny question permission",
+            ):
+                runtime.harden_runtime_leaf_permissions(repo)
 
     def test_debug_launchers_use_official_diagnostic_paths_without_auto_approval(self) -> None:
         interactive = (ROOT / "tests" / "runtime" / "run_opencode_debug.sh").read_text(
@@ -324,7 +370,9 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         report = runtime.report_template("issue-41", metadata)
         self.assertIn("Ask-free nested control", report)
         self.assertIn("Direct leaf control", report)
-        self.assertIn("Depth-2 Ask probe", report)
+        self.assertIn("Depth-2 native Ask compatibility canary", report)
+        self.assertIn("release blocker: NO", report)
+        self.assertIn("#7 release gate: Leaf -> Depth-1 escalation", report)
         self.assertIn("PASS / FAIL / INCOMPLETE", report)
         self.assertIn("Do not infer PASS", report)
 
