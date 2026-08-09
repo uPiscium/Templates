@@ -6,7 +6,7 @@ Agent-ready repositories use an explicit role-scoped model fallback policy at `.
 
 OpenCode does not currently expose first-class cross-model failover for an active agent session. The upstream request for native model fallback is still open. OpenCode also treats some retryable provider errors as retry states, so an unbounded automatic retry loop would be unsafe.
 
-For that reason, this repository implements fallback as explicit alternate agent definitions. Each fallback agent keeps the same role and permission boundary while changing only the configured model.
+For that reason, this repository implements fallback as explicit alternate agent definitions. Each fallback agent keeps the same role, permission boundary, Work Unit, scope, and authority while changing only the configured model.
 
 ## Automatic subagent fallback
 
@@ -23,6 +23,15 @@ The following failures do not trigger automatic fallback:
 - tool execution failure
 - safety refusal
 - unclassified failures
+
+## Role-specific fallback split (Issue #47)
+
+The final role split is:
+
+- `task-orchestrator` → **Spark** primary, automatic fallback to **Sol** only for classified usage/quota/rate-limit failures.
+- `general`, `explore`, `verifier` → **Luna** primary, automatic fallback to **Spark** only for classified usage/quota/rate-limit failures.
+- `scout` → **Luna** primary, automatic fallback to **Terra** only for classified usage/quota/rate-limit failures.
+- `reviewer`, `investigator`, `security-reviewer` remain as configured (`Terra` in the baseline allocation).
 
 ## Main Orchestrator
 

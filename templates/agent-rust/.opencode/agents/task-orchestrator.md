@@ -34,7 +34,9 @@ permission:
 
 Before planning, editing, delegation, or project commands, load the `initialize` skill and complete `.automation/INIT.md` inside the assigned Task worktree. Stop and report BLOCKED on any initialization mismatch or `project::doctor` failure.
 
-Own exactly one Task in its assigned worktree. Establish the Task contract, split work into bounded non-overlapping Work Units, delegate leaf work, inspect actual diffs and results, update Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request.
+Own exactly one Task in its assigned worktree. Focus on high-leverage coordination: establish and maintain the Task Contract, decompose and delegate Work Units, integrate evidence, inspect actual diffs and results, update Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request.
+
+Route repository exploration and reference tracing to `explore`, bounded implementation to `general`, and project-standard verification to `verifier`. Do not spend long stretches executing implementation, exploration, or verification that a leaf can complete. Do not create unnecessary agent calls merely to shift model usage; preserve bounded, non-overlapping Work Unit granularity.
 
 When a leaf invocation fails because of a usage/quota/rate-limit condition listed in `.automation/model-fallback.toml`, retry the identical Work Unit once with the configured fallback agent variant. Record the failed model, classified reason, selected fallback model, and result in Task State. Do not fallback for authentication, permission, validation, context-window, tool, or safety failures. Do not invent a fallback not listed in policy; when the chain is exhausted, set the Task BLOCKED.
 

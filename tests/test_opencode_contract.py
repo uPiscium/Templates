@@ -64,14 +64,49 @@ class OpenCodeContractTest(unittest.TestCase):
         expected = {
             "build.md": "openai/gpt-5.6-sol",
             "task-orchestrator.md": "openai/gpt-5.3-codex-spark",
-            "general.md": "openai/gpt-5.3-codex-spark",
-            "explore.md": "openai/gpt-5.3-codex-spark",
-            "verifier.md": "openai/gpt-5.3-codex-spark",
+            "general.md": "openai/gpt-5.6-luna",
+            "explore.md": "openai/gpt-5.6-luna",
+            "verifier.md": "openai/gpt-5.6-luna",
             "reviewer.md": "openai/gpt-5.6-terra",
             "investigator.md": "openai/gpt-5.6-terra",
             "security-reviewer.md": "openai/gpt-5.6-terra",
             "scout.md": "openai/gpt-5.6-luna",
             "architect.md": "openai/gpt-5.6-sol",
+        }
+        for filename, model in expected.items():
+            self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
+
+    def test_task_orchestrator_is_only_spark_primary(self) -> None:
+        spark_primaries = {
+            path.name
+            for path in AGENTS.glob("*.md")
+            if not path.name.endswith("-fallback.md")
+            and "model: openai/gpt-5.3-codex-spark" in frontmatter(path)
+        }
+        self.assertEqual(spark_primaries, {"task-orchestrator.md"})
+
+    def test_luna_primary_agents(self) -> None:
+        expected_luna = {
+            "general.md",
+            "explore.md",
+            "verifier.md",
+            "scout.md",
+        }
+        for filename in expected_luna:
+            self.assertIn("model: openai/gpt-5.6-luna", frontmatter(AGENTS / filename), filename)
+
+    def test_fallback_model_assignment_is_exact(self) -> None:
+        expected = {
+            "build-fallback.md": "openai/gpt-5.6-terra",
+            "architect-fallback.md": "openai/gpt-5.6-terra",
+            "task-orchestrator-fallback.md": "openai/gpt-5.6-sol",
+            "general-fallback.md": "openai/gpt-5.3-codex-spark",
+            "explore-fallback.md": "openai/gpt-5.3-codex-spark",
+            "verifier-fallback.md": "openai/gpt-5.3-codex-spark",
+            "reviewer-fallback.md": "openai/gpt-5.6-sol",
+            "investigator-fallback.md": "openai/gpt-5.6-sol",
+            "security-reviewer-fallback.md": "openai/gpt-5.6-sol",
+            "scout-fallback.md": "openai/gpt-5.6-terra",
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)

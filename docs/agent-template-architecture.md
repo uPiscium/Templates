@@ -291,7 +291,8 @@ Owns one Task only:
 - validates initialization and Task boundaries;
 - establishes the Task Contract;
 - decomposes work into bounded Work Units;
-- delegates leaf work;
+- coordinates and delegates only needed leaf work; avoids speculative or repeated delegation when one Work Unit can be reused;
+- preserves a single-workflow focus by assigning each Work Unit once unless new evidence requires a reschedule;
 - inspects actual diffs and command output;
 - accepts or rejects returned Work Units;
 - updates Task State;
@@ -615,9 +616,11 @@ The intended initial model allocation is:
 | --- | --- | --- |
 | Main Orchestrator / planning / architecture | GPT-5.6 Sol | decomposition, orchestration, integration decisions |
 | Task Orchestrator | GPT-5.3 Codex Spark | fast bounded Task orchestration |
-| general / explore / verifier | GPT-5.3 Codex Spark | implementation, discovery, executable verification |
+| general / explore / verifier / scout | GPT-5.6 Luna | implementation, discovery, verification, external research |
 | reviewer / investigator / security-reviewer | GPT-5.6 Terra | analysis, diagnosis, review |
-| scout | GPT-5.6 Luna | external documentation research |
+
+This is the final split: `task-orchestrator` is the only Spark primary, while all listed leaf execution/research roles use Luna-first allocation.
+High-quality analysis roles remain as configured (reviewer/investigator/security-reviewer on Terra).
 
 Exact provider model IDs are validated at implementation time. Missing model IDs must not be silently substituted with similar names.
 
