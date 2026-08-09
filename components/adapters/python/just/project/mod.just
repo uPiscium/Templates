@@ -1,5 +1,6 @@
 root := justfile_directory()
 bootstrap_script := root / ".automation/bin/project_bootstrap.py"
+environment_script := root / "just/project/environment.py"
 
 mod python 'python.just'
 mod? repository 'repository.just'
@@ -9,27 +10,29 @@ bootstrap name='':
     python3 {{quote(bootstrap_script)}} {{quote(name)}}
 
 [working-directory: root]
+environment:
+    python3 {{quote(environment_script)}} report
+
+[working-directory: root]
 doctor:
-    @command -v uv >/dev/null
-    @command -v ruff >/dev/null
-    @command -v mypy >/dev/null
-    @command -v pytest >/dev/null
-    @test "${UV_PROJECT_ENVIRONMENT:-}" = "$PWD/.venv"
-    @test "${PIP_REQUIRE_VIRTUALENV:-}" = "1"
+    python3 {{quote(environment_script)}} exec uv --version >/dev/null
+    python3 {{quote(environment_script)}} exec ruff --version >/dev/null
+    python3 {{quote(environment_script)}} exec mypy --version >/dev/null
+    python3 {{quote(environment_script)}} exec pytest --version >/dev/null
     @echo "Python Project Adapter doctor: PASS"
 
 [working-directory: root]
 format-check:
-    uv run ruff format --check src tests
+    python3 {{quote(environment_script)}} exec uv run ruff format --check src tests
 
 [working-directory: root]
 lint:
-    uv run ruff check src tests
-    uv run mypy src tests
+    python3 {{quote(environment_script)}} exec uv run ruff check src tests
+    python3 {{quote(environment_script)}} exec uv run mypy src tests
 
 [working-directory: root]
 test:
-    uv run pytest -v
+    python3 {{quote(environment_script)}} exec uv run pytest -v
 
 [working-directory: root]
 build:
