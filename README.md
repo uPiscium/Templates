@@ -4,7 +4,20 @@ Nix flake templates for reproducible, Agent-ready development environments.
 
 ## Start a new repository
 
-Published templates:
+There are two new-repository distribution channels. Use a GitHub Template Repository when creating the repository on GitHub, or use the Nix flake template when initializing a local directory.
+
+GitHub Template Repository targets:
+
+```text
+agent-python     -> upiscium/Template-Agent-Python
+agent-rust       -> upiscium/Template-Agent-Rust
+agent-nix        -> upiscium/Template-Agent-Nix
+agent-cpp-cmake  -> upiscium/Template-Agent-Cpp-CMake
+```
+
+The GitHub distribution repositories are generated artifacts synchronized from this repository; they are not independent sources of truth. See `docs/github-template-distribution.md` for setup, publishing, and ownership details.
+
+Local Nix templates remain available:
 
 ```sh
 nix flake init -t github:upiscium/Templates#agent-base
@@ -190,9 +203,10 @@ just template::render agent-nix
 just template::render agent-cpp-cmake
 just template::render-all
 just template::check
+just template::distribution-verify
 ```
 
-`template::check` detects generated drift, path collisions, dotfile/mode drift, and unregistered generated directories.
+`template::check` detects generated drift, path collisions, dotfile/mode drift, and unregistered generated directories. `template::distribution-verify` validates the fixed GitHub distribution allowlist; publication itself is CI-only after a successful Template CI run on current `main`.
 
 ## OpenCode hierarchy
 
