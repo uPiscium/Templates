@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "owner": "upiscium",
+  "templates": {
+    "agent-base": {
+      "published": false,
+      "reason": "agent-base is the minimum/fallback contract for local Nix initialization and repository adoption; GitHub new-repository users should choose a concrete language/toolchain template."
+    },
+    "agent-cpp-cmake": {
+      "published": true,
+      "repository": "Template-Agent-Cpp-CMake",
+      "default_branch": "main",
+      "description": "Generated Agent-ready C++/CMake template. Source: upiscium/Templates; do not edit directly."
+    },
+    "agent-nix": {
+      "published": true,
+      "repository": "Template-Agent-Nix",
+      "default_branch": "main",
+      "description": "Generated Agent-ready Nix template. Source: upiscium/Templates; do not edit directly."
+    },
+    "agent-python": {
+      "published": true,
+      "repository": "Template-Agent-Python",
+      "default_branch": "main",
+      "description": "Generated Agent-ready Python + uv template. Source: upiscium/Templates; do not edit directly."
+    },
+    "agent-rust": {
+      "published": true,
+      "repository": "Template-Agent-Rust",
+      "default_branch": "main",
+      "description": "Generated Agent-ready Rust template. Source: upiscium/Templates; do not edit directly."
+    }
+  }
+}

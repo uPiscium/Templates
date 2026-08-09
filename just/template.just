@@ -13,6 +13,22 @@ check:
     python3 tools/render_templates.py check
 
 [working-directory: root]
+distribution-verify:
+    python3 tools/template_distribution.py verify
+
+[working-directory: root]
+distribution-matrix:
+    python3 tools/template_distribution.py matrix
+
+[working-directory: root]
+distribution-materialize template target:
+    python3 tools/template_distribution.py materialize {{quote(template)}} {{quote(target)}}
+
+[working-directory: root]
+distribution-check template target:
+    python3 tools/template_distribution.py check {{quote(template)}} {{quote(target)}}
+
+[working-directory: root]
 adopt-plan target adapter='auto':
     python3 tools/adopt_repository.py plan {{quote(target)}} --adapter {{quote(adapter)}}
 
