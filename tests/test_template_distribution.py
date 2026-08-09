@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ SCRIPT = ROOT / "tools" / "template_distribution.py"
 SPEC = importlib.util.spec_from_file_location("template_distribution", SCRIPT)
 assert SPEC and SPEC.loader
 distribution = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = distribution
 SPEC.loader.exec_module(distribution)
 
 
@@ -45,10 +47,14 @@ class TemplateDistributionTest(unittest.TestCase):
                 for target in sorted(targets.values(), key=lambda item: item.template)
             ]
         }
-        actual = json.loads(
-            os.popen(f"python3 {SCRIPT} matrix").read()
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "matrix"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
         )
-        self.assertEqual(actual, expected)
+        self.assertEqual(json.loads(result.stdout), expected)
 
     def test_materialize_is_exact_and_removes_stale_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
