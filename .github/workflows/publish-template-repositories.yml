@@ -1,0 +1,112 @@
+name: Publish Template Repositories
+
+on:
+  workflow_run:
+    workflows: ["Template CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      vars.TEMPLATE_PUBLISH_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      is_current_main: ${{ steps.current.outputs.is_current_main }}
+    steps:
+      - name: Checkout verified Templates revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify distribution manifest
+        run: python3 tools/template_distribution.py verify
+
+      - name: Build fixed publish matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix="$(python3 tools/template_distribution.py matrix)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse stale verified-main publication
+        id: current
+        shell: bash
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          current_main="$(git ls-remote https://github.com/${GITHUB_REPOSITORY}.git refs/heads/main | awk '{print $1}')"
+          if [ "$current_main" = "$VERIFIED_SHA" ]; then
+            echo "is_current_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Verified SHA $VERIFIED_SHA is no longer current main ($current_main); skipping publication."
+            echo "is_current_main=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.is_current_main == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout verified Templates revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout allowlisted distribution repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.default_branch }}
+          token: ${{ secrets.TEMPLATE_PUBLISH_TOKEN }}
+          path: distribution
+          fetch-depth: 1
+
+      - name: Detect pre-sync distribution drift
+        id: drift
+        continue-on-error: true
+        shell: bash
+        run: |
+          python3 source/tools/template_distribution.py check \
+            "${{ matrix.template }}" distribution
+
+      - name: Materialize exact generated template
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 source/tools/template_distribution.py materialize \
+            "${{ matrix.template }}" distribution
+          python3 source/tools/template_distribution.py check \
+            "${{ matrix.template }}" distribution
+
+      - name: Commit and publish changed snapshot
+        shell: bash
+        env:
+          VERIFIED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          cd distribution
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Distribution repository already matches $VERIFIED_SHA."
+            exit 0
+          fi
+          git config user.name "Templates Publisher"
+          git config user.email "templates-publisher@users.noreply.github.com"
+          git commit -m "Sync from upiscium/Templates@$VERIFIED_SHA"
+          git push origin "HEAD:${{ matrix.default_branch }}"
