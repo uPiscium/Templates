@@ -14,6 +14,59 @@ ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ROOT = ROOT / ".runtime-smoke"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+TASK_DEFINITIONS = (
+    (
+        "SMOKE-CONTROL",
+        "ask-free-control",
+        "Diagnose whether a nested Depth-2 leaf can complete without any Ask permission event.",
+        [
+            "Task Orchestrator must delegate exactly one Work Unit to `general`.",
+            "The leaf must run only `git status --short` once and return the result.",
+            "The leaf must not edit files and must not request any unclassified Bash command.",
+        ],
+        [
+            "Task Orchestrator launches the Depth-2 leaf.",
+            "A provider response is observed for the leaf.",
+            "`git status --short` completes without a permission dialog.",
+            "The leaf returns to its parent instead of remaining busy indefinitely.",
+        ],
+        ["Run from Main TUI with `/task-run SMOKE-CONTROL` under `just runtime::diagnose-child-stall`."],
+    ),
+    (
+        "SMOKE-ASK",
+        "depth2-ask",
+        "Exercise a harmless Depth-2 Bash Ask from a leaf and observe approval/rejection relay in Main TUI.",
+        [
+            "Task Orchestrator must delegate the Ask probe to exactly one `general` leaf.",
+            "The leaf first requests `printf 'depth2-ask-approved\\n'` through Bash and waits for approval.",
+            "After the first probe resolves, the leaf requests `printf 'depth2-ask-rejected\\n'` and waits for rejection.",
+            "Do not perform unrelated implementation or repository changes.",
+        ],
+        [
+            "Depth-2 Ask is visible from the Main TUI.",
+            "Single-command approval propagates to the leaf.",
+            "Rejection propagates to the leaf without weakening permissions.",
+        ],
+        ["Run from Main TUI with `/task-run SMOKE-ASK` under `just runtime::smoke-depth2`."],
+    ),
+    (
+        "SMOKE-FALLBACK",
+        "model-fallback",
+        "Observe genuine usage/quota/rate-limit fallback behavior without manufacturing a provider failure.",
+        [
+            "Task Orchestrator may delegate one trivial read-only Work Unit to a leaf.",
+            "Do not intentionally consume quota or damage credentials/model configuration.",
+            "If no genuine usage-limit condition occurs, record runtime fallback as INCOMPLETE.",
+        ],
+        [
+            "Any genuine eligible failure is classified before fallback.",
+            "Only the configured fallback variant is selected.",
+            "No genuine trigger is reported as INCOMPLETE rather than PASS.",
+        ],
+        ["Run from Main TUI with `/task-run SMOKE-FALLBACK` under `just runtime::smoke-fallback`."],
+    ),
+)
+
 
 class RuntimeSmokeError(RuntimeError):
     pass
@@ -53,7 +106,13 @@ def run_logged(command: list[str], *, cwd: Path, log: Path) -> None:
     with log.open("a", encoding="utf-8") as handle:
         handle.write(f"\n$ {' '.join(command)}\n")
         handle.flush()
-        result = subprocess.run(command, cwd=cwd, text=True, stdout=handle, stderr=subprocess.STDOUT)
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            text=True,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+        )
     if result.returncode != 0:
         raise RuntimeSmokeError(
             f"{' '.join(command)} failed with exit {result.returncode}\n{tail(log)}"
@@ -96,7 +155,14 @@ def identity(path: Path) -> dict[str, str]:
     return result
 
 
-def write_contract(path: Path, *, purpose: str, scope: list[str], acceptance: list[str], test_plan: list[str]) -> None:
+def write_contract(
+    path: Path,
+    *,
+    purpose: str,
+    scope: list[str],
+    acceptance: list[str],
+    test_plan: list[str],
+) -> None:
     item = identity(path)
     scope_text = "\n".join(f"- {entry}" for entry in scope)
     acceptance_text = "\n".join(f"- [ ] {entry}" for entry in acceptance)
@@ -193,69 +259,6 @@ None yet.
     path.write_text(text, encoding="utf-8")
 
 
-def task_contracts(repo: Path) -> None:
-    definitions = (
-        (
-            "SMOKE-CONTROL",
-            "ask-free-control",
-            "Diagnose whether a nested Depth-2 leaf can complete without any Ask permission event.",
-            [
-                "Task Orchestrator must delegate exactly one Work Unit to `general`.",
-                "The leaf must run only `git status --short` once and return the result.",
-                "The leaf must not edit files and must not request any unclassified Bash command.",
-            ],
-            [
-                "Task Orchestrator launches the Depth-2 leaf.",
-                "A provider response is observed for the leaf.",
-                "`git status --short` completes without a permission dialog.",
-                "The leaf returns to its parent instead of remaining busy indefinitely.",
-            ],
-            ["Run from Main TUI with `/task-run SMOKE-CONTROL` under `just runtime::diagnose-child-stall`."],
-        ),
-        (
-            "SMOKE-ASK",
-            "depth2-ask",
-            "Exercise a harmless Depth-2 Bash Ask from a leaf and observe approval/rejection relay in Main TUI.",
-            [
-                "Task Orchestrator must delegate the Ask probe to exactly one `general` leaf.",
-                "The leaf first requests `printf 'depth2-ask-approved\\n'` through Bash and waits for approval.",
-                "After the first probe resolves, the leaf requests `printf 'depth2-ask-rejected\\n'` and waits for rejection.",
-                "Do not perform unrelated implementation or repository changes.",
-            ],
-            [
-                "Depth-2 Ask is visible from the Main TUI.",
-                "Single-command approval propagates to the leaf.",
-                "Rejection propagates to the leaf without weakening permissions.",
-            ],
-            ["Run from Main TUI with `/task-run SMOKE-ASK` under `just runtime::smoke-depth2`."],
-        ),
-        (
-            "SMOKE-FALLBACK",
-            "model-fallback",
-            "Observe genuine usage/quota/rate-limit fallback behavior without manufacturing a provider failure.",
-            [
-                "Task Orchestrator may delegate one trivial read-only Work Unit to a leaf.",
-                "Do not intentionally consume quota or damage credentials/model configuration.",
-                "If no genuine usage-limit condition occurs, record runtime fallback as INCOMPLETE.",
-            ],
-            [
-                "Any genuine eligible failure is classified before fallback.",
-                "Only the configured fallback variant is selected.",
-                "No genuine trigger is reported as INCOMPLETE rather than PASS.",
-            ],
-            ["Run from Main TUI with `/task-run SMOKE-FALLBACK` under `just runtime::smoke-fallback`."],
-        ),
-    )
-    for task, slug, purpose, scope, acceptance, test_plan in definitions:
-        run_logged(
-            ["nix", "develop", "--command", "just", "agent::task-start", task, slug],
-            cwd=repo,
-            log=workspace("issue-41") / "logs" / "prepare.log" if False else repo.parent / "logs" / "prepare.log",
-        )
-        state = repo / ".worktrees" / f"{task}-{slug}" / ".task-state" / "task.md"
-        write_contract(state, purpose=purpose, scope=scope, acceptance=acceptance, test_plan=test_plan)
-
-
 def report_template(issue: str, metadata: dict) -> str:
     return f"""# Runtime Diagnostic Report — {issue}
 
@@ -350,6 +353,7 @@ def prepare(issue: str, template: str) -> dict:
         raise RuntimeSmokeError(
             f"runtime workspace already exists: {base}; preserve it as evidence or remove it explicitly before a fresh run"
         )
+
     logs = base / "logs"
     reports = base / "reports"
     evidence = base / "evidence"
@@ -359,37 +363,65 @@ def prepare(issue: str, template: str) -> dict:
         path.mkdir(parents=True, exist_ok=True)
     prepare_log = logs / "prepare.log"
 
-    run_logged(["nix", "flake", "init", "-t", f"path:{ROOT}#{template}"], cwd=repo, log=prepare_log)
-    run_logged(["nix", "develop", "--command", "just", "project::bootstrap", "smoke-project"], cwd=repo, log=prepare_log)
+    run_logged(
+        ["nix", "flake", "init", "-t", f"path:{ROOT}#{template}"],
+        cwd=repo,
+        log=prepare_log,
+    )
+    run_logged(
+        ["nix", "develop", "--command", "just", "project::bootstrap", "smoke-project"],
+        cwd=repo,
+        log=prepare_log,
+    )
     if template == "agent-python":
-        run_logged(["nix", "develop", "--command", "just", "project::python::sync"], cwd=repo, log=prepare_log)
+        run_logged(
+            ["nix", "develop", "--command", "just", "project::python::sync"],
+            cwd=repo,
+            log=prepare_log,
+        )
 
-    run_logged(["git", "init", "-b", "main"], cwd=repo, log=prepare_log)
-    run_logged(["git", "config", "user.name", "OpenCode Runtime Smoke"], cwd=repo, log=prepare_log)
-    run_logged(["git", "config", "user.email", "opencode-runtime-smoke@example.invalid"], cwd=repo, log=prepare_log)
-    run_logged(["git", "add", "."], cwd=repo, log=prepare_log)
-    run_logged(["git", "commit", "-m", "Initialize runtime smoke fixture"], cwd=repo, log=prepare_log)
+    for command in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.name", "OpenCode Runtime Smoke"],
+        ["git", "config", "user.email", "opencode-runtime-smoke@example.invalid"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "Initialize runtime smoke fixture"],
+    ):
+        run_logged(command, cwd=repo, log=prepare_log)
+
     run_logged(["git", "init", "--bare", str(origin)], cwd=ROOT, log=prepare_log)
     run_logged(["git", "remote", "add", "origin", str(origin)], cwd=repo, log=prepare_log)
     run_logged(["git", "push", "-u", "origin", "main"], cwd=repo, log=prepare_log)
-    run_logged(["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], cwd=repo, log=prepare_log)
+    run_logged(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
+        cwd=repo,
+        log=prepare_log,
+    )
 
     for recipe in ("agent::doctor", "agent::context", "project::doctor", "project::check"):
-        run_logged(["nix", "develop", "--command", "just", recipe], cwd=repo, log=prepare_log)
+        run_logged(
+            ["nix", "develop", "--command", "just", recipe],
+            cwd=repo,
+            log=prepare_log,
+        )
     dirty = run_capture(["git", "status", "--porcelain"], cwd=repo)
     if dirty:
         raise RuntimeSmokeError(f"fixture is dirty after initialization:\n{dirty}")
 
-    # Create deterministic Tasks after the clean baseline is established.
-    definitions = (
-        ("SMOKE-CONTROL", "ask-free-control", "Diagnose whether a nested Depth-2 leaf can complete without any Ask permission event.", ["Task Orchestrator must delegate exactly one Work Unit to `general`.", "The leaf must run only `git status --short` once and return the result.", "The leaf must not edit files and must not request any unclassified Bash command."], ["Task Orchestrator launches the Depth-2 leaf.", "A provider response is observed for the leaf.", "`git status --short` completes without a permission dialog.", "The leaf returns to its parent instead of remaining busy indefinitely."], ["Run from Main TUI with `/task-run SMOKE-CONTROL` under `just runtime::diagnose-child-stall`."]),
-        ("SMOKE-ASK", "depth2-ask", "Exercise a harmless Depth-2 Bash Ask from a leaf and observe approval/rejection relay in Main TUI.", ["Task Orchestrator must delegate the Ask probe to exactly one `general` leaf.", "The leaf first requests `printf 'depth2-ask-approved\\n'` through Bash and waits for approval.", "After the first probe resolves, the leaf requests `printf 'depth2-ask-rejected\\n'` and waits for rejection.", "Do not perform unrelated implementation or repository changes."], ["Depth-2 Ask is visible from the Main TUI.", "Single-command approval propagates to the leaf.", "Rejection propagates to the leaf without weakening permissions."], ["Run from Main TUI with `/task-run SMOKE-ASK` under `just runtime::smoke-depth2`."]),
-        ("SMOKE-FALLBACK", "model-fallback", "Observe genuine usage/quota/rate-limit fallback behavior without manufacturing a provider failure.", ["Task Orchestrator may delegate one trivial read-only Work Unit to a leaf.", "Do not intentionally consume quota or damage credentials/model configuration.", "If no genuine usage-limit condition occurs, record runtime fallback as INCOMPLETE."], ["Any genuine eligible failure is classified before fallback.", "Only the configured fallback variant is selected.", "No genuine trigger is reported as INCOMPLETE rather than PASS."], ["Run from Main TUI with `/task-run SMOKE-FALLBACK` under `just runtime::smoke-fallback`."]),
-    )
-    for task, slug, purpose, scope, acceptance, test_plan in definitions:
-        run_logged(["nix", "develop", "--command", "just", "agent::task-start", task, slug], cwd=repo, log=prepare_log)
+    for task, slug, purpose, scope, acceptance, test_plan in TASK_DEFINITIONS:
+        run_logged(
+            ["nix", "develop", "--command", "just", "agent::task-start", task, slug],
+            cwd=repo,
+            log=prepare_log,
+        )
         state = repo / ".worktrees" / f"{task}-{slug}" / ".task-state" / "task.md"
-        write_contract(state, purpose=purpose, scope=scope, acceptance=acceptance, test_plan=test_plan)
+        write_contract(
+            state,
+            purpose=purpose,
+            scope=scope,
+            acceptance=acceptance,
+            test_plan=test_plan,
+        )
 
     metadata = {
         "issue": issue,
@@ -400,10 +432,18 @@ def prepare(issue: str, template: str) -> dict:
         "smokeRepo": str(repo),
         "origin": str(origin),
     }
-    (base / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (base / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     report = reports / "REPORT.md"
     report.write_text(report_template(issue, metadata), encoding="utf-8")
-    return {"status": "PASS", **metadata, "report": str(report), "prepareLog": str(prepare_log)}
+    return {
+        "status": "PASS",
+        **metadata,
+        "report": str(report),
+        "prepareLog": str(prepare_log),
+    }
 
 
 def status(issue: str) -> dict:
@@ -429,8 +469,7 @@ def snapshot_sessions(issue: str, label: str) -> dict:
     if not repo.is_dir():
         raise RuntimeSmokeError(f"missing prepared smoke repository: {repo}")
     output = run_capture(["opencode", "session", "list", "--format", "json"], cwd=repo)
-    destination = workspace(issue) / "evidence" / f" sessions-{label}.json"
-    destination = destination.with_name(destination.name.lstrip())
+    destination = workspace(issue) / "evidence" / f"sessions-{label}.json"
     destination.write_text(output + "\n", encoding="utf-8")
     return {"status": "PASS", "path": str(destination)}
 
@@ -465,19 +504,24 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Repository-local OpenCode runtime smoke harness")
     sub = result.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
-    p = sub.add_parser("prepare")
-    p.add_argument("--issue", default="issue-41")
-    p.add_argument("--template", default="agent-python")
-    p = sub.add_parser("status")
-    p.add_argument("--issue", default="issue-41")
-    p = sub.add_parser("snapshot-sessions")
-    p.add_argument("--issue", default="issue-41")
-    p.add_argument("--label", required=True)
-    p = sub.add_parser("export-session")
-    p.add_argument("--issue", default="issue-41")
-    p.add_argument("--session-id", required=True)
-    p = sub.add_parser("report")
-    p.add_argument("--issue", default="issue-41")
+
+    command = sub.add_parser("prepare")
+    command.add_argument("--issue", default="issue-41")
+    command.add_argument("--template", default="agent-python")
+
+    command = sub.add_parser("status")
+    command.add_argument("--issue", default="issue-41")
+
+    command = sub.add_parser("snapshot-sessions")
+    command.add_argument("--issue", default="issue-41")
+    command.add_argument("--label", required=True)
+
+    command = sub.add_parser("export-session")
+    command.add_argument("--issue", default="issue-41")
+    command.add_argument("--session-id", required=True)
+
+    command = sub.add_parser("report")
+    command.add_argument("--issue", default="issue-41")
     return result
 
 
