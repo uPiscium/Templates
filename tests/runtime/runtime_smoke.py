@@ -368,6 +368,15 @@ def prepare(issue: str, template: str) -> dict:
         cwd=repo,
         log=prepare_log,
     )
+    for command in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.name", "OpenCode Runtime Smoke"],
+        ["git", "config", "user.email", "opencode-runtime-smoke@example.invalid"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "Initialize runtime smoke fixture"],
+    ):
+        run_logged(command, cwd=repo, log=prepare_log)
+
     run_logged(
         ["nix", "develop", "--command", "just", "project::bootstrap", "smoke-project"],
         cwd=repo,
@@ -379,19 +388,20 @@ def prepare(issue: str, template: str) -> dict:
             cwd=repo,
             log=prepare_log,
         )
-
-    for command in (
-        ["git", "init", "-b", "main"],
-        ["git", "config", "user.name", "OpenCode Runtime Smoke"],
-        ["git", "config", "user.email", "opencode-runtime-smoke@example.invalid"],
-        ["git", "add", "."],
-        ["git", "commit", "-m", "Initialize runtime smoke fixture"],
-    ):
-        run_logged(command, cwd=repo, log=prepare_log)
+    run_logged(["git", "add", "."], cwd=repo, log=prepare_log)
+    run_logged(
+        ["nix", "develop", "--command", "git", "commit", "-m", "Bootstrap runtime smoke fixture"],
+        cwd=repo,
+        log=prepare_log,
+    )
 
     run_logged(["git", "init", "--bare", str(origin)], cwd=ROOT, log=prepare_log)
     run_logged(["git", "remote", "add", "origin", str(origin)], cwd=repo, log=prepare_log)
-    run_logged(["git", "push", "-u", "origin", "main"], cwd=repo, log=prepare_log)
+    run_logged(
+        ["nix", "develop", "--command", "git", "push", "-u", "origin", "main"],
+        cwd=repo,
+        log=prepare_log,
+    )
     run_logged(
         ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"],
         cwd=repo,
