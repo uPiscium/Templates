@@ -79,3 +79,20 @@ jobs:
           cd "$target"
           nix develop --command just project::doctor
           nix develop --command just project::check
+      - name: Python inherited worktree environment smoke
+        if: matrix.template == 'agent-python'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          nix develop --command bash -c '
+            set -euo pipefail
+            export VIRTUAL_ENV=/tmp/main-worktree/.venv
+            export UV_PROJECT_ENVIRONMENT=/tmp/main-worktree/.venv
+            export PIP_REQUIRE_VIRTUALENV=0
+            export PATH="/tmp/main-worktree/.venv/bin:$PATH"
+            just project::environment
+            just project::doctor
+            just project::check
+          '
