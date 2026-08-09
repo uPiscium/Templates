@@ -1,14 +1,15 @@
 root := justfile_directory()
+environment_script := root / "just/project/environment.py"
 
 [working-directory: root]
 sync:
-    uv sync
+    python3 {{quote(environment_script)}} exec uv sync
 
 [working-directory: root]
 format:
-    uv run ruff format src tests
-    uv run ruff check --fix src tests
+    python3 {{quote(environment_script)}} exec uv run ruff format src tests
+    python3 {{quote(environment_script)}} exec uv run ruff check --fix src tests
 
 [working-directory: root]
 typecheck:
-    uv run mypy src tests
+    python3 {{quote(environment_script)}} exec uv run mypy src tests
