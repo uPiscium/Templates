@@ -40,7 +40,7 @@ For `Control C`, classify deterministic ordering as follows:
 - provider execution result for the approved first command
 - `permission.asked`/rejection for `printf 'depth2-ask-rejected\n'`
 
-The prepared diagnostic fixture uses an explicit canary profile for its generated `general` agent: `question` is denied, Bash defaults to deny, the read-only status control is allowed, and only the two exact canary `printf` commands use Ask. This is independent from production Leaf policy and ensures future non-interactive Leaf changes do not disable the upstream compatibility check.
+The prepared diagnostic fixture applies the same explicit profile to its generated `general` and `general-fallback` agents: `question` is denied, Bash defaults to deny, the read-only status control is allowed, and only the two exact canary `printf` commands use Ask. This is independent from production Leaf policy, preserves fallback authority, and ensures future non-interactive Leaf changes do not disable the upstream compatibility check.
 
 If the leaf emits a `question` event before the first Bash permission flow, treat the attempt as **INCOMPLETE/invalid** (not a relay failure), and rerun `just runtime::smoke-depth2 issue-41` + `/task-run SMOKE-ASK`.
 

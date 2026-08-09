@@ -62,6 +62,20 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("printf 'depth2-ask-approved\\n'", scope)
         self.assertIn("printf 'depth2-ask-rejected\\n'", scope)
 
+        smoke_fallback = next(
+            definition
+            for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-FALLBACK"
+        )
+        fallback_scope = " ".join(smoke_fallback[3])
+        fallback_acceptance = " ".join(smoke_fallback[4])
+        self.assertIn("run only `git status --short` once", fallback_scope)
+        self.assertIn(
+            "retry the identical `git status --short` Work Unit",
+            fallback_scope,
+        )
+        self.assertIn("same diagnostic permission profile", fallback_acceptance)
+
     def test_task_contract_replaces_unresolved_template_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "task.md"
@@ -91,59 +105,95 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
     def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
-            agent = repo / ".opencode" / "agents" / "general.md"
-            agent.parent.mkdir(parents=True)
-            agent.write_text(
-                "---\npermission:\n  task: deny\n  bash:\n"
-                '    "git status*": allow\n---\n',
-                encoding="utf-8",
-            )
+            agents = repo / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            for name in runtime.RUNTIME_GENERAL_AGENTS:
+                (agents / name).write_text(
+                    "---\npermission:\n  task: deny\n  bash:\n"
+                    '    "git status*": allow\n---\n',
+                    encoding="utf-8",
+                )
 
             runtime.harden_runtime_leaf_permissions(repo)
             runtime.harden_runtime_leaf_permissions(repo)
 
-            text = agent.read_text(encoding="utf-8")
-            self.assertEqual(1, text.count("  question: deny\n"))
-            self.assertIn("  task: deny\n", text)
-            self.assertIn("  bash:\n", text)
-            self.assertEqual(1, text.count('    "*": deny\n'))
-            self.assertIn('    "git status --short": allow\n', text)
-            self.assertIn(
-                '    "printf \'depth2-ask-approved\\\\n\'": ask\n', text
-            )
-            self.assertIn(
-                '    "printf \'depth2-ask-rejected\\\\n\'": ask\n', text
-            )
+            profiles = []
+            for name in runtime.RUNTIME_GENERAL_AGENTS:
+                text = (agents / name).read_text(encoding="utf-8")
+                self.assertEqual(1, text.count("  question: deny\n"), name)
+                self.assertIn("  task: deny\n", text, name)
+                self.assertIn("  bash:\n", text, name)
+                self.assertEqual(1, text.count('    "*": deny\n'), name)
+                self.assertIn('    "git status --short": allow\n', text, name)
+                self.assertIn(
+                    '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                self.assertIn(
+                    '    "printf \'depth2-ask-rejected\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                profiles.append(
+                    tuple(
+                        line
+                        for line in text.splitlines()
+                        if line
+                        in {
+                            '    "*": deny',
+                            '    "git status --short": allow',
+                            '    "printf \'depth2-ask-approved\\\\n\'": ask',
+                            '    "printf \'depth2-ask-rejected\\\\n\'": ask',
+                        }
+                    )
+                )
+            self.assertEqual(profiles[0], profiles[1])
 
     def test_runtime_canary_extends_future_noninteractive_leaf_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
-            agent = repo / ".opencode" / "agents" / "general.md"
-            agent.parent.mkdir(parents=True)
-            agent.write_text(
+            agents = repo / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            (agents / "general.md").write_text(
                 "---\npermission:\n  task: deny\n  question: deny\n  bash:\n"
                 '    "*": deny\n'
                 '    "just project::check": allow\n---\n',
                 encoding="utf-8",
             )
+            (agents / "general-fallback.md").write_text(
+                "---\npermission:\n  task: deny\n  question: deny\n  bash:\n"
+                '    "*": deny\n'
+                '    "just agent::fallback-record *": deny\n---\n',
+                encoding="utf-8",
+            )
 
             runtime.harden_runtime_leaf_permissions(repo)
 
-            text = agent.read_text(encoding="utf-8")
-            self.assertEqual(1, text.count('    "*": deny\n'))
-            self.assertIn('    "just project::check": allow\n', text)
-            self.assertIn(
-                '    "printf \'depth2-ask-approved\\\\n\'": ask\n', text
-            )
+            primary = (agents / "general.md").read_text(encoding="utf-8")
+            fallback = (agents / "general-fallback.md").read_text(encoding="utf-8")
+            for name, text in (("primary", primary), ("fallback", fallback)):
+                self.assertEqual(1, text.count('    "*": deny\n'), name)
+                self.assertIn(
+                    '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+            self.assertIn('    "just project::check": allow\n', primary)
+            self.assertIn('    "just agent::fallback-record *": deny\n', fallback)
 
     def test_runtime_canary_rejects_interactive_leaf_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
-            agent = repo / ".opencode" / "agents" / "general.md"
-            agent.parent.mkdir(parents=True)
-            agent.write_text(
+            agents = repo / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            (agents / "general.md").write_text(
                 "---\npermission:\n  task: deny\n  question: allow\n  bash:\n"
                 '    "*": ask\n---\n',
+                encoding="utf-8",
+            )
+            (agents / "general-fallback.md").write_text(
+                "---\npermission:\n  task: deny\n  bash:\n---\n",
                 encoding="utf-8",
             )
 
@@ -373,6 +423,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("Depth-2 native Ask compatibility canary", report)
         self.assertIn("release blocker: NO", report)
         self.assertIn("#7 release gate: Leaf -> Depth-1 escalation", report)
+        self.assertIn("primary/fallback diagnostic permission parity", report)
         self.assertIn("PASS / FAIL / INCOMPLETE", report)
         self.assertIn("Do not infer PASS", report)
 

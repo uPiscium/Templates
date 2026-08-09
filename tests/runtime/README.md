@@ -106,6 +106,8 @@ Then run:
 /task-run SMOKE-FALLBACK
 ```
 
+The Task Orchestrator must give `general` exactly one Work Unit: run `git status --short` once and return. Only a genuine classified usage/quota/rate-limit failure may retry that identical Work Unit with `general-fallback`. Both variants receive the same diagnostic default-deny profile and explicit status allow, so permission selection cannot contaminate the fallback observation.
+
 Do not manufacture a quota condition. If no genuine usage/quota/rate-limit failure occurs, runtime fallback remains `INCOMPLETE`.
 
 ## Session evidence
