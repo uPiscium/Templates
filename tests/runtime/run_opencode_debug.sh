@@ -39,14 +39,22 @@ echo "  log:   $log"
 echo
 
 set +e
-nix develop --command bash -c '
-  set -euo pipefail
-  export VIRTUAL_ENV="$PWD/.venv"
-  export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
-  export PIP_REQUIRE_VIRTUALENV=1
-  export PATH="$PWD/.venv/bin:$PATH"
-  exec "$OPENCODE_BIN" --print-logs --log-level DEBUG
-' 2> >(tee "$log" >&2)
+run_opencode_debug() {
+  nix develop --command bash -c '
+    set -euo pipefail
+    export VIRTUAL_ENV="$PWD/.venv"
+    export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+    export PIP_REQUIRE_VIRTUALENV=1
+    export PATH="$PWD/.venv/bin:$PATH"
+    exec "$OPENCODE_BIN" --print-logs --log-level DEBUG
+  '
+}
+
+if [[ "${OPENCODE_RUNTIME_LIVE_LOGS:-}" == "1" ]]; then
+  run_opencode_debug 2> >(tee "$log" >&2)
+else
+  run_opencode_debug 2>"$log"
+fi
 status=$?
 set -e
 

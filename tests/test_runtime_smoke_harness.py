@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -49,6 +51,31 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             },
         )
 
+        smoke_ask = next(
+            definition
+            for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-ASK"
+        )
+        scope = " ".join(smoke_ask[3])
+        self.assertIn("must pass this exact Work Unit instruction", scope)
+        self.assertIn("do not call `question` or any other tool first", scope)
+        self.assertIn("printf 'depth2-ask-approved\\n'", scope)
+        self.assertIn("printf 'depth2-ask-rejected\\n'", scope)
+
+        smoke_fallback = next(
+            definition
+            for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-FALLBACK"
+        )
+        fallback_scope = " ".join(smoke_fallback[3])
+        fallback_acceptance = " ".join(smoke_fallback[4])
+        self.assertIn("run only `git status --short` once", fallback_scope)
+        self.assertIn(
+            "retry the identical `git status --short` Work Unit",
+            fallback_scope,
+        )
+        self.assertIn("same diagnostic permission profile", fallback_acceptance)
+
     def test_task_contract_replaces_unresolved_template_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "task.md"
@@ -75,6 +102,107 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             self.assertIn("- Status: initialized", text)
             self.assertIn("- [ ] Evidence is recorded.", text)
 
+    def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            agents = repo / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            for name in runtime.RUNTIME_GENERAL_AGENTS:
+                (agents / name).write_text(
+                    "---\npermission:\n  task: deny\n  bash:\n"
+                    '    "git status*": allow\n---\n',
+                    encoding="utf-8",
+                )
+
+            runtime.harden_runtime_leaf_permissions(repo)
+            runtime.harden_runtime_leaf_permissions(repo)
+
+            profiles = []
+            for name in runtime.RUNTIME_GENERAL_AGENTS:
+                text = (agents / name).read_text(encoding="utf-8")
+                self.assertEqual(1, text.count("  question: deny\n"), name)
+                self.assertIn("  task: deny\n", text, name)
+                self.assertIn("  bash:\n", text, name)
+                self.assertEqual(1, text.count('    "*": deny\n'), name)
+                self.assertIn('    "git status --short": allow\n', text, name)
+                self.assertIn(
+                    '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                self.assertIn(
+                    '    "printf \'depth2-ask-rejected\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                profiles.append(
+                    tuple(
+                        line
+                        for line in text.splitlines()
+                        if line
+                        in {
+                            '    "*": deny',
+                            '    "git status --short": allow',
+                            '    "printf \'depth2-ask-approved\\\\n\'": ask',
+                            '    "printf \'depth2-ask-rejected\\\\n\'": ask',
+                        }
+                    )
+                )
+            self.assertEqual(profiles[0], profiles[1])
+
+    def test_runtime_canary_extends_future_noninteractive_leaf_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            agents = repo / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            (agents / "general.md").write_text(
+                "---\npermission:\n  task: deny\n  question: deny\n  bash:\n"
+                '    "*": deny\n'
+                '    "just project::check": allow\n---\n',
+                encoding="utf-8",
+            )
+            (agents / "general-fallback.md").write_text(
+                "---\npermission:\n  task: deny\n  question: deny\n  bash:\n"
+                '    "*": deny\n'
+                '    "just agent::fallback-record *": deny\n---\n',
+                encoding="utf-8",
+            )
+
+            runtime.harden_runtime_leaf_permissions(repo)
+
+            primary = (agents / "general.md").read_text(encoding="utf-8")
+            fallback = (agents / "general-fallback.md").read_text(encoding="utf-8")
+            for name, text in (("primary", primary), ("fallback", fallback)):
+                self.assertEqual(1, text.count('    "*": deny\n'), name)
+                self.assertIn(
+                    '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+            self.assertIn('    "just project::check": allow\n', primary)
+            self.assertIn('    "just agent::fallback-record *": deny\n', fallback)
+
+    def test_runtime_canary_rejects_interactive_leaf_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            agents = repo / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            (agents / "general.md").write_text(
+                "---\npermission:\n  task: deny\n  question: allow\n  bash:\n"
+                '    "*": ask\n---\n',
+                encoding="utf-8",
+            )
+            (agents / "general-fallback.md").write_text(
+                "---\npermission:\n  task: deny\n  bash:\n---\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                runtime.RuntimeSmokeError,
+                "non-deny question permission",
+            ):
+                runtime.harden_runtime_leaf_permissions(repo)
+
     def test_debug_launchers_use_official_diagnostic_paths_without_auto_approval(self) -> None:
         interactive = (ROOT / "tests" / "runtime" / "run_opencode_debug.sh").read_text(
             encoding="utf-8"
@@ -98,6 +226,102 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertNotIn(" --agent general", direct)
         self.assertNotIn(" --auto", direct)
 
+    def test_debug_launcher_defaults_stderr_to_per_run_log_file(self) -> None:
+        interactive = (ROOT / "tests" / "runtime" / "run_opencode_debug.sh").read_text(
+            encoding="utf-8"
+        )
+
+        marker = 'if [[ "${OPENCODE_RUNTIME_LIVE_LOGS:-}" == "1" ]]; then'
+        self.assertIn(marker, interactive)
+
+        block_start = interactive.index(marker)
+        block = interactive[
+            block_start : interactive.index("\nfi", block_start)
+        ]
+        self.assertIn('2> >(tee "$log" >&2)', block)
+        self.assertIn('2>"$log"', block)
+        self.assertIn("else", block)
+        self.assertGreater(block.index("else"), block.index('2> >(tee "$log" >&2)'))
+        self.assertGreater(block.index('2>"$log"'), block.index("else"))
+
+    def test_debug_launcher_opt_in_env_var_restores_live_stderr(self) -> None:
+        interactive = (ROOT / "tests" / "runtime" / "run_opencode_debug.sh").read_text(
+            encoding="utf-8"
+        )
+
+        marker = 'if [[ "${OPENCODE_RUNTIME_LIVE_LOGS:-}" == "1" ]]; then'
+        self.assertIn(marker, interactive)
+        self.assertIn("OPENCODE_RUNTIME_LIVE_LOGS", interactive)
+
+        branch_block = interactive.split(marker, 1)[1]
+        branch_block = branch_block.split("fi", 1)[0]
+        self.assertIn("run_opencode_debug", branch_block)
+        self.assertIn('2> >(tee "$log" >&2)', branch_block)
+        self.assertIn("else", branch_block)
+        self.assertIn('2>"$log"', branch_block)
+
+    def test_debug_launcher_routes_stderr_and_preserves_exit_status(self) -> None:
+        launcher = ROOT / "tests" / "runtime" / "run_opencode_debug.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            fake_root = Path(temporary)
+            fake_bin = fake_root / "bin"
+            fake_bin.mkdir()
+            (fake_root / "tests" / "runtime").mkdir(parents=True)
+            (fake_root / ".runtime-smoke" / "test" / "smoke-repo").mkdir(
+                parents=True
+            )
+
+            def executable(name: str, body: str) -> None:
+                path = fake_bin / name
+                path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+                path.chmod(0o755)
+
+            executable("git", 'printf "%s\\n" "$FAKE_ROOT"')
+            executable("python3", "exit 0")
+            executable("opencode", "exit 0")
+            executable("nix", 'printf "debug-marker\\n" >&2\nexit 7')
+
+            environment = os.environ.copy()
+            environment["FAKE_ROOT"] = str(fake_root)
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            default = subprocess.run(
+                ["bash", str(launcher), "test", "depth2-ask"],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(7, default.returncode)
+            self.assertEqual("", default.stderr)
+            logs = list(
+                (fake_root / ".runtime-smoke" / "test" / "logs").glob(
+                    "opencode-depth2-ask-*.log"
+                )
+            )
+            self.assertEqual(1, len(logs))
+            self.assertEqual("debug-marker\n", logs[0].read_text(encoding="utf-8"))
+
+            environment["OPENCODE_RUNTIME_LIVE_LOGS"] = "1"
+            live = subprocess.run(
+                ["bash", str(launcher), "test", "child-stall"],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(7, live.returncode)
+            self.assertEqual("debug-marker\n", live.stderr)
+            live_logs = list(
+                (fake_root / ".runtime-smoke" / "test" / "logs").glob(
+                    "opencode-child-stall-*.log"
+                )
+            )
+            self.assertEqual(1, len(live_logs))
+            self.assertEqual(
+                "debug-marker\n", live_logs[0].read_text(encoding="utf-8")
+            )
+
     def test_prepare_commits_scaffold_before_nix_bootstrap_and_bootstraps_second_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary) / "issue-41"
@@ -108,6 +332,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             original_run_logged = runtime.run_logged
             original_run_capture = runtime.run_capture
             original_write_contract = runtime.write_contract
+            original_harden_permissions = runtime.harden_runtime_leaf_permissions
 
             def fake_workspace(_: str) -> Path:
                 return base
@@ -132,6 +357,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             runtime.run_logged = fake_run_logged
             runtime.run_capture = fake_run_capture
             runtime.write_contract = lambda *args, **kwargs: None
+            runtime.harden_runtime_leaf_permissions = lambda *args, **kwargs: None
             try:
                 runtime.prepare("issue-41", "agent-python")
             finally:
@@ -140,6 +366,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 runtime.run_logged = original_run_logged
                 runtime.run_capture = original_run_capture
                 runtime.write_contract = original_write_contract
+                runtime.harden_runtime_leaf_permissions = original_harden_permissions
 
             commands = [command for _kind, command, *_ in calls]
 
@@ -193,7 +420,10 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         report = runtime.report_template("issue-41", metadata)
         self.assertIn("Ask-free nested control", report)
         self.assertIn("Direct leaf control", report)
-        self.assertIn("Depth-2 Ask probe", report)
+        self.assertIn("Depth-2 native Ask compatibility canary", report)
+        self.assertIn("release blocker: NO", report)
+        self.assertIn("#7 release gate: Leaf -> Depth-1 escalation", report)
+        self.assertIn("primary/fallback diagnostic permission parity", report)
         self.assertIn("PASS / FAIL / INCOMPLETE", report)
         self.assertIn("Do not infer PASS", report)
 

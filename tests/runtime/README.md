@@ -58,15 +58,17 @@ The command starts the real Main TUI with DEBUG logging. In the TUI, run:
 /task-run SMOKE-CONTROL
 ```
 
+DEBUG stderr is saved to the per-run log file without being printed over the TUI. Set `OPENCODE_RUNTIME_LIVE_LOGS=1` only when live DEBUG output is explicitly needed.
+
 The Task contract requires the Task Orchestrator to delegate exactly one `general` leaf and for that leaf to run only `git status --short`.
 
 Interpretation:
 
 - direct leaf stalls: investigate provider/model or leaf-agent execution before nested orchestration
 - direct leaf passes but nested control stalls: investigate Task/subagent session execution
-- nested control passes: proceed to the Ask probe
+- nested control passes: the provider path works; the native Ask canary may be run independently
 
-## Depth-2 Ask probe
+## Depth-2 native Ask compatibility canary
 
 ```sh
 just runtime::smoke-depth2 issue-41
@@ -78,7 +80,17 @@ Then run:
 /task-run SMOKE-ASK
 ```
 
-The leaf contract requests two harmless unclassified Bash commands in sequence. Approve the first once and reject the second. Do not use auto-approval and do not change repository permissions.
+`SMOKE-ASK` is an upstream compatibility canary for descendant permission relay. It is not a Templates release gate and does not determine #7 completion; the durable release gate is Leaf -> Depth-1 escalation tracked by #51.
+
+The canary contract requires the Task Orchestrator to pass one exact bounded Work Unit to one `general` leaf: first `printf 'depth2-ask-approved\n'`, then `printf 'depth2-ask-rejected\n'`.
+
+The leaf must call Bash for the first printf immediately, and it must wait for that permission resolution before making any second request. A `question` event before the first Bash permission means the run is non-deterministic for this harness and must be treated as **INCOMPLETE/invalid** for this diagnostic.
+
+To keep the canary independent from production Leaf policy, `runtime::prepare` installs a diagnostic-only profile before committing the disposable fixture: `question` is denied, Bash defaults to deny, `git status --short` remains available for controls, and only the two exact canary `printf` commands use Ask. This profile does not change generated template source or production permissions.
+
+Approve the first request once and reject the second. If the run is incomplete due to ordering/classification mismatch, stop and re-run `/task-run SMOKE-ASK` (new session) to collect a fresh, retryable observation.
+
+Do not use auto-approval and do not change repository permissions.
 
 A child-session permission that can only be handled by navigating away from Main does not satisfy the centralized Main-TUI Ask requirement.
 
@@ -93,6 +105,8 @@ Then run:
 ```text
 /task-run SMOKE-FALLBACK
 ```
+
+The Task Orchestrator must give `general` exactly one Work Unit: run `git status --short` once and return. Only a genuine classified usage/quota/rate-limit failure may retry that identical Work Unit with `general-fallback`. Both variants receive the same diagnostic default-deny profile and explicit status allow, so permission selection cannot contaminate the fallback observation.
 
 Do not manufacture a quota condition. If no genuine usage/quota/rate-limit failure occurs, runtime fallback remains `INCOMPLETE`.
 

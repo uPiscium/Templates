@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ROOT = ROOT / ".runtime-smoke"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+RUNTIME_GENERAL_AGENTS = ("general.md", "general-fallback.md")
 
 TASK_DEFINITIONS = (
     (
@@ -35,17 +36,18 @@ TASK_DEFINITIONS = (
     (
         "SMOKE-ASK",
         "depth2-ask",
-        "Exercise a harmless Depth-2 Bash Ask from a leaf and observe approval/rejection relay in Main TUI.",
+        "Run a deterministic Depth-2 native Ask compatibility canary for upstream descendant permission relay without making it a release gate.",
         [
-            "Task Orchestrator must delegate the Ask probe to exactly one `general` leaf.",
-            "The leaf first requests `printf 'depth2-ask-approved\\n'` through Bash and waits for approval.",
-            "After the first probe resolves, the leaf requests `printf 'depth2-ask-rejected\\n'` and waits for rejection.",
+            "Task Orchestrator must delegate a single bounded Work Unit to exactly one `general` leaf.",
+            "Task Orchestrator must pass this exact Work Unit instruction: \"Immediately call the Bash tool with `printf 'depth2-ask-approved\\n'`; do not call `question` or any other tool first. Wait for that permission result, then call the Bash tool with `printf 'depth2-ask-rejected\\n'`. Do not perform any other action.\"",
             "Do not perform unrelated implementation or repository changes.",
         ],
         [
             "Depth-2 Ask is visible from the Main TUI.",
-            "Single-command approval propagates to the leaf.",
-            "Rejection propagates to the leaf without weakening permissions.",
+            "The first provider response is for one approved `printf 'depth2-ask-approved\\n'` Bash request in the child and propagates to Main.",
+            "The second request is a rejected `printf 'depth2-ask-rejected\\n'` Bash command in the same leaf and propagates to Main.",
+            "No `question` tool call may precede the first Bash permission event; if it does, classify the run INCOMPLETE/invalid and retry.",
+            "No permission boundaries are weakened; approval and rejection remain real semantics.",
         ],
         ["Run from Main TUI with `/task-run SMOKE-ASK` under `just runtime::smoke-depth2`."],
     ),
@@ -54,13 +56,17 @@ TASK_DEFINITIONS = (
         "model-fallback",
         "Observe genuine usage/quota/rate-limit fallback behavior without manufacturing a provider failure.",
         [
-            "Task Orchestrator may delegate one trivial read-only Work Unit to a leaf.",
+            "Task Orchestrator must delegate exactly one Work Unit to `general`: run only `git status --short` once and return the result.",
+            "If and only if `general` has a classified eligible usage-limit failure, retry the identical `git status --short` Work Unit once with `general-fallback`.",
+            "Neither primary nor fallback may choose another command or operation.",
             "Do not intentionally consume quota or damage credentials/model configuration.",
             "If no genuine usage-limit condition occurs, record runtime fallback as INCOMPLETE.",
         ],
         [
             "Any genuine eligible failure is classified before fallback.",
             "Only the configured fallback variant is selected.",
+            "Primary and fallback use the same diagnostic permission profile and exact Work Unit.",
+            "`git status --short` completes without a permission denial on whichever variant runs.",
             "No genuine trigger is reported as INCOMPLETE rather than PASS.",
         ],
         ["Run from Main TUI with `/task-run SMOKE-FALLBACK` under `just runtime::smoke-fallback`."],
@@ -76,6 +82,66 @@ def validate_name(value: str, label: str) -> str:
     if not SAFE_NAME.fullmatch(value):
         raise RuntimeSmokeError(f"invalid {label}: {value!r}")
     return value
+
+
+def harden_runtime_leaf_agent(agent: Path) -> None:
+    try:
+        text = agent.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeSmokeError(f"missing generated general agent: {agent}") from exc
+
+    permission = "permission:\n  task: deny\n"
+    if "  question: deny\n" not in text:
+        if re.search(r"(?m)^  question:", text) is not None:
+            raise RuntimeSmokeError(
+                "generated general agent has a non-deny question permission"
+            )
+        if text.count(permission) != 1:
+            raise RuntimeSmokeError(
+                "generated general agent does not contain the expected permission block"
+            )
+        text = text.replace(
+            permission,
+            permission + "  question: deny\n",
+            1,
+        )
+    elif text.count("  question: deny\n") != 1:
+        raise RuntimeSmokeError(
+            "generated general agent contains duplicate question deny rules"
+        )
+
+    bash = re.search(r"(?m)^  bash:\n(?P<rules>(?:    .*\n)*)", text)
+    if bash is None:
+        raise RuntimeSmokeError("generated general agent is missing its Bash rules")
+    rules = bash.group("rules")
+    default_deny = '    "*": deny\n'
+    conflicting_default = re.search(r'^    "\*": (?!deny$).+$', rules, re.MULTILINE)
+    if conflicting_default is not None:
+        raise RuntimeSmokeError(
+            "generated general agent has a non-deny default Bash permission"
+        )
+    if default_deny not in rules:
+        rules = default_deny + rules
+
+    diagnostic_rules = (
+        '    "git status --short": allow\n',
+        '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+        '    "printf \'depth2-ask-rejected\\\\n\'": ask\n',
+    )
+    insertion = rules.index(default_deny) + len(default_deny)
+    for rule in diagnostic_rules:
+        if rule not in rules:
+            rules = rules[:insertion] + rule + rules[insertion:]
+            insertion += len(rule)
+
+    text = text[: bash.start("rules")] + rules + text[bash.end("rules") :]
+    agent.write_text(text, encoding="utf-8")
+
+
+def harden_runtime_leaf_permissions(repo: Path) -> None:
+    agents = repo / ".opencode" / "agents"
+    for name in RUNTIME_GENERAL_AGENTS:
+        harden_runtime_leaf_agent(agents / name)
 
 
 def workspace(issue: str) -> Path:
@@ -300,7 +366,10 @@ def report_template(issue: str, metadata: dict) -> str:
 - `git status --short` completed: PASS / FAIL / INCOMPLETE
 - result: PASS / FAIL / INCOMPLETE
 
-## Depth-2 Ask probe
+## Depth-2 native Ask compatibility canary
+
+- release blocker: NO
+- upstream compatibility canary: YES
 
 - Log:
 - Main session ID:
@@ -316,6 +385,8 @@ def report_template(issue: str, metadata: dict) -> str:
 ## Model fallback observation
 
 - deterministic preflight: PASS / FAIL / INCOMPLETE
+- primary/fallback diagnostic permission parity: PASS / FAIL / INCOMPLETE
+- exact `git status --short` Work Unit preserved: PASS / FAIL / INCOMPLETE
 - genuine usage-limit observed: YES / NO
 - runtime fallback: PASS / FAIL / INCOMPLETE
 
@@ -335,7 +406,8 @@ def report_template(issue: str, metadata: dict) -> str:
 ## Final verdict
 
 - #41 diagnostic acceptance: PASS / FAIL / INCOMPLETE
-- #7 ready for full permission smoke: YES / NO
+- Depth-2 native Ask upstream compatibility: PASS / FAIL / INCOMPLETE
+- #7 release gate: Leaf -> Depth-1 escalation tracked by #51
 - #23 runtime acceptance: PASS / FAIL / INCOMPLETE
 
 ## Notes
@@ -388,6 +460,7 @@ def prepare(issue: str, template: str) -> dict:
             cwd=repo,
             log=prepare_log,
         )
+    harden_runtime_leaf_permissions(repo)
     run_logged(["git", "add", "."], cwd=repo, log=prepare_log)
     run_logged(
         ["nix", "develop", "--command", "git", "commit", "-m", "Bootstrap runtime smoke fixture"],
