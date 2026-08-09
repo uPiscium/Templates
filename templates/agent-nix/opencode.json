@@ -70,6 +70,8 @@
       "just automation::version": "allow",
       "just automation::check-update *": "allow",
       "just automation::upgrade *": "ask",
+      "just repository::policy-check": "allow",
+      "just repository::policy-apply": "ask",
       "just agent::task-start *": "deny",
       "just agent::state-set *": "deny",
       "just agent::batch-plan *": "deny",

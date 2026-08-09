@@ -48,7 +48,25 @@ The optional explicit project name can be supplied when the directory name is no
 nix develop --command just project::bootstrap my-project
 ```
 
-`project::bootstrap` is the explicit state-changing setup step. It resolves generated project-name placeholders and is idempotent. It does not commit, push, or merge. After bootstrap, initialize Git as needed and use `/init` or the corresponding Just checks for normal read-only session validation.
+`project::bootstrap` is the explicit state-changing setup step. It resolves generated project-name placeholders and is idempotent. It does not commit, push, merge, or change GitHub repository settings. After bootstrap, initialize Git as needed and use `/init` or the corresponding Just checks for normal read-only session validation.
+
+## Repository policy
+
+Generated Agent-ready repositories declare a GitHub repository policy in `.automation/repository-policy.json`. The policy expects `main` as the default branch and protects the default branch with a repository ruleset: every change must arrive through a pull request, approving reviews are optional (`0` required), deletion and force pushes are blocked, and no bypass actor is configured.
+
+Repository policy is deliberately separate from project bootstrap and `/init`. Inspect the current GitHub repository read-only with:
+
+```sh
+just repository::policy-check
+```
+
+Apply the declared policy explicitly with:
+
+```sh
+just repository::policy-apply
+```
+
+`repository::policy-apply` acts only on the GitHub repository resolved from the current checkout, requires GitHub Administration write permission, and is an Ask operation in OpenCode. If `main` does not exist, it refuses to invent or rename a branch; establish `main` explicitly first. Policy mutation is also refused from Task worktrees. See `.automation/REPOSITORY_POLICY.md` in generated repositories for the complete contract.
 
 ## Repository layers
 
@@ -70,15 +88,16 @@ Generated files under `templates/<name>/` are artifacts. Edit `components/agent-
 
 ## Initialization
 
-Bootstrap and initialization are intentionally separate:
+Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate:
 
 ```text
 nix flake init ...
-  -> just project::bootstrap   # one-time, state-changing project setup
-  -> /init                     # every-session, read-only validation
+  -> just project::bootstrap          # one-time, state-changing project setup
+  -> just repository::policy-apply    # optional explicit GitHub repository setup
+  -> /init                            # every-session, read-only validation
 ```
 
-`/init` is read-only. It validates Agent Core version, Adapter identity, branch/worktree/Task State, tools, project doctor, HEAD, and Git status. It never bootstraps, repairs, installs packages, changes Task State, or rewrites `AGENTS.md`.
+`/init` is read-only. It validates Agent Core version, Adapter identity, branch/worktree/Task State, tools, project doctor, HEAD, and Git status. It never bootstraps, repairs, installs packages, changes Task State, rewrites `AGENTS.md`, or mutates GitHub repository settings.
 
 Existing-repository adoption and Agent Core upgrade are separate mutating workflows from generated-project bootstrap.
 
