@@ -35,17 +35,18 @@ TASK_DEFINITIONS = (
     (
         "SMOKE-ASK",
         "depth2-ask",
-        "Exercise a harmless Depth-2 Bash Ask from a leaf and observe approval/rejection relay in Main TUI.",
+        "Exercise a deterministic Depth-2 Bash Ask from a leaf and observe explicit approval/rejection relay in Main TUI without permission weakening.",
         [
-            "Task Orchestrator must delegate the Ask probe to exactly one `general` leaf.",
-            "The leaf first requests `printf 'depth2-ask-approved\\n'` through Bash and waits for approval.",
-            "After the first probe resolves, the leaf requests `printf 'depth2-ask-rejected\\n'` and waits for rejection.",
+            "Task Orchestrator must delegate a single bounded Work Unit to exactly one `general` leaf.",
+            "Task Orchestrator must pass this exact Work Unit instruction: \"Immediately call the Bash tool with `printf 'depth2-ask-approved\\n'`; do not call `question` or any other tool first. Wait for that permission result, then call the Bash tool with `printf 'depth2-ask-rejected\\n'`. Do not perform any other action.\"",
             "Do not perform unrelated implementation or repository changes.",
         ],
         [
             "Depth-2 Ask is visible from the Main TUI.",
-            "Single-command approval propagates to the leaf.",
-            "Rejection propagates to the leaf without weakening permissions.",
+            "The first provider response is for one approved `printf 'depth2-ask-approved\\n'` Bash request in the child and propagates to Main.",
+            "The second request is a rejected `printf 'depth2-ask-rejected\\n'` Bash command in the same leaf and propagates to Main.",
+            "No `question` tool call may precede the first Bash permission event; if it does, classify the run INCOMPLETE/invalid and retry.",
+            "No permission boundaries are weakened; approval and rejection remain real semantics.",
         ],
         ["Run from Main TUI with `/task-run SMOKE-ASK` under `just runtime::smoke-depth2`."],
     ),
@@ -76,6 +77,24 @@ def validate_name(value: str, label: str) -> str:
     if not SAFE_NAME.fullmatch(value):
         raise RuntimeSmokeError(f"invalid {label}: {value!r}")
     return value
+
+
+def harden_runtime_leaf_permissions(repo: Path) -> None:
+    agent = repo / ".opencode" / "agents" / "general.md"
+    try:
+        text = agent.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeSmokeError(f"missing generated general agent: {agent}") from exc
+
+    permission = "permission:\n  task: deny\n"
+    hardened = "permission:\n  task: deny\n  question: deny\n"
+    if hardened in text:
+        return
+    if text.count(permission) != 1:
+        raise RuntimeSmokeError(
+            "generated general agent does not contain the expected permission block"
+        )
+    agent.write_text(text.replace(permission, hardened, 1), encoding="utf-8")
 
 
 def workspace(issue: str) -> Path:
@@ -388,6 +407,7 @@ def prepare(issue: str, template: str) -> dict:
             cwd=repo,
             log=prepare_log,
         )
+    harden_runtime_leaf_permissions(repo)
     run_logged(["git", "add", "."], cwd=repo, log=prepare_log)
     run_logged(
         ["nix", "develop", "--command", "git", "commit", "-m", "Bootstrap runtime smoke fixture"],

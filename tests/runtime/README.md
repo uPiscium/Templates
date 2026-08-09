@@ -58,6 +58,8 @@ The command starts the real Main TUI with DEBUG logging. In the TUI, run:
 /task-run SMOKE-CONTROL
 ```
 
+DEBUG stderr is saved to the per-run log file without being printed over the TUI. Set `OPENCODE_RUNTIME_LIVE_LOGS=1` only when live DEBUG output is explicitly needed.
+
 The Task contract requires the Task Orchestrator to delegate exactly one `general` leaf and for that leaf to run only `git status --short`.
 
 Interpretation:
@@ -78,7 +80,15 @@ Then run:
 /task-run SMOKE-ASK
 ```
 
-The leaf contract requests two harmless unclassified Bash commands in sequence. Approve the first once and reject the second. Do not use auto-approval and do not change repository permissions.
+The `SMOKE-ASK` contract requires the Task Orchestrator to pass one exact bounded Work Unit to one `general` leaf: first `printf 'depth2-ask-approved\n'`, then `printf 'depth2-ask-rejected\n'`.
+
+The leaf must call Bash for the first printf immediately, and it must wait for that permission resolution before making any second request. A `question` event before the first Bash permission means the run is non-deterministic for this harness and must be treated as **INCOMPLETE/invalid** for this diagnostic.
+
+To make that protocol enforceable, `runtime::prepare` adds a diagnostic-only `question: deny` override to the generated `general` agent before committing the fixture. This narrows the disposable fixture permission surface without changing the Bash Ask boundary or the generated template source.
+
+Approve the first request once and reject the second. If the run is incomplete due to ordering/classification mismatch, stop and re-run `/task-run SMOKE-ASK` (new session) to collect a fresh, retryable observation.
+
+Do not use auto-approval and do not change repository permissions.
 
 A child-session permission that can only be handled by navigating away from Main does not satisfy the centralized Main-TUI Ask requirement.
 
