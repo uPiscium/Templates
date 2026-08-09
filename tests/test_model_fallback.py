@@ -37,6 +37,26 @@ class ModelFallbackTest(unittest.TestCase):
         self.assertEqual(result["agent"], "task-orchestrator-fallback")
         self.assertEqual(result["model"], "openai/gpt-5.6-sol")
 
+    def test_luna_roles_share_spark_fallback_chain(self) -> None:
+        for role in ("general", "explore", "verifier"):
+            result = fallback.next_fallback(role, role, self.cfg)
+            self.assertTrue(result["available"], role)
+            self.assertEqual(result["agent"], f"{role}-fallback", role)
+            self.assertEqual(result["model"], "openai/gpt-5.3-codex-spark", role)
+
+    def test_primary_and_fallback_models_in_policy(self) -> None:
+        expected = {
+            "general": ("openai/gpt-5.6-luna", "openai/gpt-5.3-codex-spark"),
+            "explore": ("openai/gpt-5.6-luna", "openai/gpt-5.3-codex-spark"),
+            "verifier": ("openai/gpt-5.6-luna", "openai/gpt-5.3-codex-spark"),
+            "task-orchestrator": ("openai/gpt-5.3-codex-spark", "openai/gpt-5.6-sol"),
+        }
+        for role, (primary_model, fallback_model) in expected.items():
+            role_cfg = self.cfg["roles"][role]
+            self.assertEqual(role_cfg["primary_model"], primary_model, role)
+            self.assertEqual(role_cfg["fallback_models"], [fallback_model], role)
+            self.assertEqual(role_cfg["fallback_agents"], [f"{role}-fallback"], role)
+
     def test_chain_exhaustion_stops(self) -> None:
         result = fallback.next_fallback("general", "general-fallback", self.cfg)
         self.assertFalse(result["available"])
@@ -57,8 +77,8 @@ class ModelFallbackTest(unittest.TestCase):
             fallback.append_evidence(
                 root,
                 "general",
+                "openai/gpt-5.6-luna",
                 "openai/gpt-5.3-codex-spark",
-                "openai/gpt-5.6-sol",
                 "usage limit",
                 "succeeded",
             )
