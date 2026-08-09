@@ -18,6 +18,7 @@ PULL_REQUEST_PARAMETERS = {
     "required_approving_review_count": 0,
     "required_review_thread_resolution": False,
 }
+EFFECTIVE_RULE_TYPES = ("deletion", "non_fast_forward", "pull_request")
 
 
 class RepositoryPolicyError(RuntimeError):
@@ -217,6 +218,135 @@ def normalize_ruleset(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalized_effective_expected(ruleset: dict[str, Any]) -> list[dict[str, Any]]:
+    expected: list[dict[str, Any]] = []
+    for rule in ruleset.get("rules", []):
+        if not isinstance(rule, dict) or rule.get("type") not in EFFECTIVE_RULE_TYPES:
+            continue
+        normalized = {"type": rule["type"]}
+        if rule["type"] == "pull_request":
+            normalized["parameters"] = {
+                "required_approving_review_count": PULL_REQUEST_PARAMETERS[
+                    "required_approving_review_count"
+                ]
+            }
+        expected.append(normalized)
+    return expected
+
+
+def _normalize_effective_rule(value: dict[str, Any]) -> dict[str, Any]:
+    rule_type = value.get("type")
+    rule: dict[str, Any] = {"type": rule_type}
+
+    if rule_type == "pull_request":
+        parameters = value.get("parameters")
+        if (
+            isinstance(parameters, dict)
+            and "required_approving_review_count" in parameters
+        ):
+            rule["parameters"] = {
+                "required_approving_review_count": parameters[
+                    "required_approving_review_count"
+                ]
+            }
+
+    for key in (
+        "ruleset_id",
+        "ruleset_source_type",
+        "ruleset_source",
+    ):
+        if key in value:
+            rule[key] = value[key]
+
+    return rule
+
+
+def _find_effective_rules(
+    values: list[Any], managed_ruleset_id: int | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], bool]:
+    matching: list[dict[str, Any]] = []
+    source_rules: list[dict[str, Any]] = []
+    by_type: dict[str, list[dict[str, Any]]] = {
+        rule_type: [] for rule_type in EFFECTIVE_RULE_TYPES
+    }
+
+    for index, item in enumerate(values):
+        if not isinstance(item, dict):
+            raise RepositoryPolicyError(
+                f"unexpected branch effective rule at index {index}"
+            )
+        rule_type = item.get("type")
+        if not isinstance(rule_type, str):
+            raise RepositoryPolicyError(
+                f"branch effective rule at index {index} is missing its type"
+            )
+        if rule_type not in EFFECTIVE_RULE_TYPES:
+            continue
+        normalized = _normalize_effective_rule(item)
+        source_rules.append(normalized)
+        by_type[rule_type].append(normalized)
+        if (
+            managed_ruleset_id is not None
+            and normalized.get("ruleset_id") == managed_ruleset_id
+        ):
+            matching.append(normalized)
+
+    source_rules.sort(key=lambda item: item["type"])
+    matching.sort(key=lambda item: item["type"])
+
+    drift: list[str] = []
+    if managed_ruleset_id is None:
+        drift.append(
+            "managed ruleset id is missing, so effective rules cannot be attributed"
+        )
+        return source_rules, matching, drift, False
+
+    existing_types = {rule["type"] for rule in matching}
+    for rule_type in EFFECTIVE_RULE_TYPES:
+        if rule_type not in existing_types:
+            conflicting = by_type[rule_type]
+            if conflicting:
+                ids = sorted(
+                    {
+                        rule.get("ruleset_id")
+                        for rule in conflicting
+                        if isinstance(rule.get("ruleset_id"), int)
+                    }
+                )
+                if ids:
+                    drift.append(
+                        f"{rule_type} rule is not enforced by managed ruleset "
+                        f"{managed_ruleset_id}; found source ruleset IDs={ids}"
+                    )
+                else:
+                    drift.append(
+                        f"{rule_type} rule is missing for managed ruleset "
+                        f"{managed_ruleset_id}"
+                    )
+            else:
+                drift.append(
+                    f"{rule_type} rule is missing for managed ruleset "
+                    f"{managed_ruleset_id}"
+                )
+
+    for rule in matching:
+        if rule["type"] != "pull_request":
+            continue
+        actual_parameters = rule.get("parameters")
+        if not isinstance(actual_parameters, dict):
+            continue
+        if "required_approving_review_count" in actual_parameters:
+            actual_count = actual_parameters.get("required_approving_review_count")
+            if actual_count != PULL_REQUEST_PARAMETERS["required_approving_review_count"]:
+                drift.append(
+                    "effective pull_request rule reports "
+                    f"required_approving_review_count={actual_count!r}; expected 0"
+                )
+
+    match = not drift
+    return source_rules, matching, drift, match
+
+
 def normalized_desired(policy: dict[str, Any]) -> dict[str, Any]:
     result = normalize_ruleset(desired_ruleset(policy))
     for rule in result["rules"]:
@@ -277,6 +407,39 @@ def inspect(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
     normalized_actual = (
         None if actual_ruleset is None else normalize_ruleset(actual_ruleset)
     )
+    configured_match = normalized_actual == expected_ruleset
+    expected_effective_rules = _normalized_effective_expected(expected_ruleset)
+    expected_effective_rules = sorted(
+        expected_effective_rules, key=lambda rule: rule["type"]
+    )
+
+    effective_rules: list[dict[str, Any]]
+    matching_effective_rules: list[dict[str, Any]]
+    effective_drift: list[str]
+    effective_match: bool
+
+    if expected_branch_exists:
+        branch_rules_value = gh_api(
+            root,
+            "GET",
+            f"repos/{repository}/rules/branches/{expected_branch}",
+        )
+        if not isinstance(branch_rules_value, list):
+            raise RepositoryPolicyError("unexpected branch effective rules response")
+        (
+            effective_rules,
+            matching_effective_rules,
+            effective_drift,
+            effective_match,
+        ) = _find_effective_rules(branch_rules_value, ruleset_id)
+    else:
+        effective_rules = []
+        matching_effective_rules = []
+        effective_drift = [
+            f"effective rules for {expected_branch!r} cannot be verified because "
+            "the branch does not exist"
+        ]
+        effective_match = False
 
     drift: list[str] = []
     if actual_branch != expected_branch:
@@ -290,11 +453,35 @@ def inspect(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
         )
     if actual_ruleset is None:
         drift.append(f"missing ruleset {RULESET_NAME!r}")
-    elif normalized_actual != expected_ruleset:
+    elif not configured_match:
         drift.append(f"ruleset {RULESET_NAME!r} differs from policy")
+
+    if not effective_match:
+        if configured_match:
+            if effective_drift:
+                drift.append(
+                    "configured ruleset matches policy, but it is not effective on "
+                    f"main: {'; '.join(effective_drift)}"
+                )
+            else:
+                drift.append(
+                    "configured ruleset matches policy, but it is not effective on "
+                    "main"
+                )
+        else:
+            if expected_branch_exists:
+                drift.append(
+                    "effective rules on main do not match expected policy: "
+                    + "; ".join(effective_drift)
+                )
+            else:
+                drift.append(
+                    "effective rules on main are not verifiable because main is missing"
+                )
 
     return {
         "repository": repository,
+        "visibility": repository_data.get("visibility"),
         "policyVersion": policy["version"],
         "defaultBranch": {
             "expected": expected_branch,
@@ -306,9 +493,17 @@ def inspect(root: Path, policy: dict[str, Any]) -> dict[str, Any]:
             "name": RULESET_NAME,
             "id": ruleset_id,
             "present": actual_ruleset is not None,
-            "match": normalized_actual == expected_ruleset,
+            "match": configured_match,
             "actual": normalized_actual,
             "expected": expected_ruleset,
+        },
+        "effectiveRules": {
+            "expected": expected_effective_rules,
+            "actual": matching_effective_rules,
+            "match": effective_match,
+            "managedRulesetId": ruleset_id,
+            "drift": effective_drift,
+            "rulesFromBranch": effective_rules,
         },
         "drift": drift,
     }
@@ -333,12 +528,12 @@ def command_apply(root: Path) -> int:
     repository = before["repository"]
     expected_branch = policy["default_branch"]
 
+    if not before["defaultBranch"]["expectedBranchExists"]:
+        raise RepositoryPolicyError(
+            f"cannot apply repository policy: branch {expected_branch!r} does not exist"
+        )
+
     if before["defaultBranch"]["actual"] != expected_branch:
-        if not before["defaultBranch"]["expectedBranchExists"]:
-            raise RepositoryPolicyError(
-                f"cannot set default branch to {expected_branch!r}: "
-                f"branch {expected_branch!r} does not exist"
-            )
         gh_api(
             root,
             "PATCH",

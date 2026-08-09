@@ -54,17 +54,25 @@ nix develop --command just project::bootstrap my-project
 
 Generated Agent-ready repositories declare a GitHub repository policy in `.automation/repository-policy.json`. The policy expects `main` as the default branch and protects the default branch with a repository ruleset: every change must arrive through a pull request, approving reviews are optional (`0` required), deletion and force pushes are blocked, and no bypass actor is configured.
 
+`policy-check` and `policy-apply` validate both configured policy equality and effective rules on `main` via GitHub's branch rules API. A ruleset that is configured but not effective is reported as drift.
+
 Repository policy is deliberately separate from project bootstrap and `/init`. Inspect the current GitHub repository read-only with:
 
 ```sh
 just repository::policy-check
 ```
 
+`policy-check` fails as `DRIFT` when effective policy does not match, even when configured rules match. If GitHub plan/feature availability or visibility affects enforcement, it is diagnosed as `DRIFT` rather than `PASS`.
+
 Apply the declared policy explicitly with:
 
 ```sh
 just repository::policy-apply
 ```
+
+`policy-apply` performs final effective verification after configuration changes and errors if policy is configured but not effective.
+
+API errors (including permission, transport, and unexpected response schema issues) are reported as errors, not silently mapped to empty/no-effective-rules.
 
 `repository::policy-apply` acts only on the GitHub repository resolved from the current checkout, requires GitHub Administration write permission, and is an Ask operation in OpenCode. If `main` does not exist, it refuses to invent or rename a branch; establish `main` explicitly first. Policy mutation is also refused from Task worktrees. See `.automation/REPOSITORY_POLICY.md` in generated repositories for the complete contract.
 
