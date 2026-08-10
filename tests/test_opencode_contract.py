@@ -4,10 +4,188 @@ import json
 import re
 import unittest
 from pathlib import Path
+from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "components" / "agent-core"
 AGENTS = CORE / ".opencode" / "agents"
+
+LEAF_PRIMARY_AGENTS = (
+    "general",
+    "explore",
+    "verifier",
+    "reviewer",
+    "investigator",
+    "security-reviewer",
+    "scout",
+    "architect",
+)
+TASK_ORCHESTRATOR_LEAVES = (
+    "general",
+    "explore",
+    "verifier",
+    "reviewer",
+    "investigator",
+    "security-reviewer",
+    "scout",
+)
+LEAF_STATUS_SET = {"COMPLETED", "BLOCKED", "NEEDS_APPROVAL", "NEEDS_DECISION"}
+READ_ONLY_GIT_COMMANDS = {
+    "git status",
+    "git status *",
+    "git diff",
+    "git diff *",
+    "git log",
+    "git log *",
+    "git show *",
+    "git blame *",
+    "git grep *",
+    "git rev-parse *",
+    "git ls-files *",
+    "git merge-base *",
+    "git cat-file *",
+    "git branch --list *",
+    "git remote -v",
+    "git worktree list *",
+}
+PROJECT_CHECK_COMMANDS = {
+    "just project::doctor",
+    "just project::eval",
+    "just project::format-check",
+    "just project::lint",
+    "just project::test",
+    "just project::build",
+    "just project::check",
+}
+LEAF_ALLOWED_BASH = {
+    "general": READ_ONLY_GIT_COMMANDS | PROJECT_CHECK_COMMANDS,
+    "explore": READ_ONLY_GIT_COMMANDS,
+    "verifier": {"git status", "git status *", "git diff", "git diff *"}
+    | PROJECT_CHECK_COMMANDS,
+    "reviewer": READ_ONLY_GIT_COMMANDS,
+    "investigator": READ_ONLY_GIT_COMMANDS | PROJECT_CHECK_COMMANDS,
+    "security-reviewer": READ_ONLY_GIT_COMMANDS,
+    "scout": set(),
+    "architect": READ_ONLY_GIT_COMMANDS,
+}
+
+
+def _line_indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and ((value[0] == value[-1]) and value[0] in {'"', "'"}):
+        return value[1:-1]
+    return value
+
+
+def _partition_mapping_line(line: str) -> tuple[str, str] | None:
+    match = re.match(r'^(?:"([^"]+)"|\'([^\']+)\'|([^:]+)):\s*(.*)$', line)
+    if match is None:
+        return None
+    key = next(group for group in match.groups()[:3] if group is not None)
+    return key.strip(), match.group(4).strip()
+
+
+def _parse_yamlish_mapping(
+    lines: list[str], start: int, base_indent: int
+) -> tuple[dict[str, Any], int]:
+    mapping: dict[str, Any] = {}
+    i = start
+    while i < len(lines):
+        raw = lines[i]
+        if not raw.strip():
+            i += 1
+            continue
+
+        indent = _line_indent(raw)
+        if indent < base_indent:
+            break
+        if indent > base_indent:
+            i += 1
+            continue
+
+        stripped = raw.strip()
+        entry = _partition_mapping_line(stripped)
+        if entry is None:
+            i += 1
+            continue
+
+        key, value = entry
+
+        if value:
+            mapping[key] = _unquote(value)
+            i += 1
+            continue
+
+        # Nested map; advance to next line and parse any deeper lines regardless of spacing.
+        i += 1
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i >= len(lines) or _line_indent(lines[i]) <= base_indent:
+            mapping[key] = {}
+            continue
+
+        child_indent = _line_indent(lines[i])
+        nested, i = _parse_yamlish_mapping(lines, i, child_indent)
+        mapping[key] = nested
+
+    return mapping, i
+
+
+def parse_permission_block(frontmatter_text: str) -> dict[str, Any]:
+    lines = frontmatter_text.splitlines()
+    for idx, line in enumerate(lines):
+        if re.match(r"^permission:\s*$", line.strip()):
+            base_indent = _line_indent(line) + 2
+            parsed, _ = _parse_yamlish_mapping(lines, idx + 1, base_indent)
+            return parsed
+    raise AssertionError("missing permission: frontmatter block")
+
+
+def _iter_permission_values(permission_value: Any) -> Iterable[str]:
+    if isinstance(permission_value, dict):
+        for value in permission_value.values():
+            yield from _iter_permission_values(value)
+    else:
+        if isinstance(permission_value, str):
+            yield permission_value
+
+
+def permission_entries_are_scalar_lines(permission: dict[str, Any]) -> bool:
+    return all(isinstance(value, (str, dict)) for value in permission.values())
+
+
+def permission_for(agent: str) -> dict[str, Any]:
+    return parse_permission_block(frontmatter(AGENTS / f"{agent}.md"))
+
+
+def body_text(agent: str) -> str:
+    text = (AGENTS / f"{agent}.md").read_text(encoding="utf-8")
+    match = re.match(r"^---\n.*?\n---\n(.*)", text, flags=re.S)
+    if not match:
+        raise AssertionError(f"missing frontmatter body: {agent}")
+    return match.group(1)
+
+
+def status_report_lines(text: str) -> set[str]:
+    return set(re.findall(r"\b(?:COMPLETED|BLOCKED|NEEDS_APPROVAL|NEEDS_DECISION)\b", text))
+
+
+def assert_prompt_contract_for_leaf_statuses(test_case: unittest.TestCase, body: str, name: str) -> None:
+    test_case.assertEqual(status_report_lines(body), LEAF_STATUS_SET, name)
+    lower = body.lower()
+    test_case.assertIn("non-interactive", lower, name)
+    test_case.assertIn("start the final response with exactly one `status:", lower, name)
+    test_case.assertIn("do not attempt denied operations", lower, name)
+    test_case.assertIn("ask the user", lower, name)
+    test_case.assertIn("call `question`", lower, name)
+    test_case.assertIn("claim any unexecuted command as executed/passed", lower, name)
+    for field in ("denied_operation", "why_needed", "expected_effect", "safe_alternatives"):
+        test_case.assertIn(field, lower, name)
+    test_case.assertIn("ambiguity, options with tradeoffs, and recommendation", lower, name)
 
 
 def frontmatter(path: Path) -> str:
@@ -112,26 +290,130 @@ class OpenCodeContractTest(unittest.TestCase):
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
 
     def test_leaf_agents_cannot_delegate(self) -> None:
-        leaves = (
-            "general.md",
-            "explore.md",
-            "verifier.md",
-            "reviewer.md",
-            "investigator.md",
-            "security-reviewer.md",
-            "scout.md",
-            "architect.md",
-        )
-        for filename in leaves:
+        for filename in [f"{leaf}.md" for leaf in LEAF_PRIMARY_AGENTS]:
             self.assertIn("task: deny", frontmatter(AGENTS / filename), filename)
 
+    def test_leaf_agents_have_authority_contract(self) -> None:
+        for leaf in LEAF_PRIMARY_AGENTS:
+            primary = permission_for(leaf)
+            fallback = permission_for(f"{leaf}-fallback")
+
+            self.assertTrue(permission_entries_are_scalar_lines(primary), leaf)
+            self.assertTrue(permission_entries_are_scalar_lines(fallback), f"{leaf}-fallback")
+
+            self.assertEqual(primary.get("task"), "deny", leaf)
+            self.assertEqual(fallback.get("task"), "deny", f"{leaf}-fallback")
+
+            self.assertEqual(primary.get("question"), "deny", leaf)
+            self.assertEqual(fallback.get("question"), "deny", f"{leaf}-fallback")
+
+            self.assertEqual(primary.get("external_directory"), "deny", leaf)
+            self.assertEqual(fallback.get("external_directory"), "deny", f"{leaf}-fallback")
+
+            self.assertEqual(primary.get("doom_loop"), "deny", leaf)
+            self.assertEqual(fallback.get("doom_loop"), "deny", f"{leaf}-fallback")
+
+            for action in _iter_permission_values(primary):
+                self.assertNotEqual(action, "ask", leaf)
+            for action in _iter_permission_values(fallback):
+                self.assertNotEqual(action, "ask", f"{leaf}-fallback")
+
+            if leaf == "scout":
+                self.assertEqual(primary.get("webfetch"), "allow", leaf)
+                self.assertEqual(primary.get("websearch"), "allow", leaf)
+                self.assertEqual(fallback.get("webfetch"), "allow", f"{leaf}-fallback")
+                self.assertEqual(fallback.get("websearch"), "allow", f"{leaf}-fallback")
+            else:
+                self.assertEqual(primary.get("webfetch"), "deny", leaf)
+                self.assertEqual(primary.get("websearch"), "deny", leaf)
+                self.assertEqual(fallback.get("webfetch"), "deny", f"{leaf}-fallback")
+                self.assertEqual(fallback.get("websearch"), "deny", f"{leaf}-fallback")
+
+            if leaf != "general":
+                self.assertEqual(primary.get("edit"), "deny", leaf)
+                self.assertEqual(fallback.get("edit"), "deny", f"{leaf}-fallback")
+
+            primary_bash = primary.get("bash", {})
+            fallback_bash = fallback.get("bash", {})
+            self.assertIsInstance(primary_bash, dict, leaf)
+            self.assertIsInstance(fallback_bash, dict, f"{leaf}-fallback")
+
+            self.assertEqual(primary_bash.get("*"), "deny", leaf)
+            self.assertEqual(fallback_bash.get("*"), "deny", f"{leaf}-fallback")
+
+            primary_allowed = {cmd for cmd, action in primary_bash.items() if action == "allow"}
+            fallback_allowed = {cmd for cmd, action in fallback_bash.items() if action == "allow"}
+            self.assertEqual(primary_allowed, LEAF_ALLOWED_BASH[leaf], leaf)
+            self.assertEqual(fallback_allowed, LEAF_ALLOWED_BASH[leaf], f"{leaf}-fallback")
+
+            for command, action in primary_bash.items():
+                if action == "allow":
+                    self.assertNotRegex(
+                        command,
+                        r"(agent::task-start|agent::state-set|agent::batch-plan|agent::commit|agent::push|agent::pr-"
+                        r"create|agent::pr-edit|agent::pr-ready|agent::cleanup|integrate::check|integrate::merge|"
+                        r"integrate::status|project::commit|project::publish|project::release)",
+                        leaf,
+                    )
+            for command, action in fallback_bash.items():
+                if action == "allow":
+                    self.assertNotRegex(
+                        command,
+                        r"(agent::task-start|agent::state-set|agent::batch-plan|agent::commit|agent::push|agent::pr-"
+                        r"create|agent::pr-edit|agent::pr-ready|agent::cleanup|integrate::check|integrate::merge|"
+                        r"integrate::status|project::commit|project::publish|project::release)",
+                        f"{leaf}-fallback",
+                    )
+
+            # Primary/fallback authority parity; metadata/model differences are not part of this assertion.
+            self.assertEqual(primary, fallback, leaf)
+
+    def test_leaf_prompts_expose_completion_status_contract(self) -> None:
+        for leaf in LEAF_PRIMARY_AGENTS:
+            for agent_name in (leaf, f"{leaf}-fallback"):
+                assert_prompt_contract_for_leaf_statuses(self, body_text(agent_name), agent_name)
+
+    def test_task_orchestrator_fallback_policy_contracts(self) -> None:
+        primary_text = body_text("task-orchestrator").lower()
+        fallback_text = body_text("task-orchestrator-fallback").lower()
+        self.assertIn("retry the identical work unit once", primary_text)
+        self.assertIn("do not fallback for authentication", primary_text)
+        self.assertIn("authentication, permission", primary_text)
+        self.assertIn("when the chain is exhausted, set the task blocked", primary_text)
+        self.assertIn("record the failed model, classified reason, selected fallback model", primary_text)
+
+        self.assertIn("same authority and constraints", fallback_text)
+        self.assertIn("explicit model fallback policy", fallback_text)
+        self.assertIn("classified usage/quota/rate-limit failure", fallback_text)
+
+        primary_permissions = permission_for("task-orchestrator")
+        fallback_permissions = permission_for("task-orchestrator-fallback")
+        self.assertEqual(primary_permissions, fallback_permissions)
+
+        self.assertIn("blocked", primary_text)
+        self.assertIn("continue", primary_text)
+        self.assertTrue(any(term in primary_text for term in ("rejection", "reject")), "task-orchestrator should define rejection behavior")
+        self.assertTrue(any(term in primary_text for term in ("continue", "continuing", "continuation")), "task-orchestrator should define continuation behavior")
+        self.assertTrue(
+            "launder" in primary_text,
+            "task-orchestrator should contain anti-laundering language",
+        )
+
     def test_task_orchestrator_call_graph_is_non_cyclic(self) -> None:
-        fm = frontmatter(AGENTS / "task-orchestrator.md")
-        task_section = fm.split("permission:\n", 1)[1].split("  bash:\n", 1)[0]
-        self.assertIn('"*": deny', task_section)
-        self.assertNotIn("task-orchestrator: allow", task_section)
-        for leaf in ("general", "explore", "verifier", "reviewer", "investigator", "security-reviewer", "scout"):
-            self.assertIn(f"{leaf}: allow", task_section)
+        task_permissions = permission_for("task-orchestrator").get("task", {})
+        self.assertIsInstance(task_permissions, dict)
+        self.assertEqual(task_permissions.get("*"), "deny")
+        for leaf in TASK_ORCHESTRATOR_LEAVES:
+            self.assertEqual(task_permissions.get(leaf), "allow", leaf)
+            self.assertEqual(task_permissions.get(f"{leaf}-fallback"), "allow", f"{leaf}-fallback")
+
+        self.assertNotIn("task-orchestrator", task_permissions)
+        self.assertNotIn("task-orchestrator-fallback", task_permissions)
+        expected_task_targets = {"*"}
+        for leaf in TASK_ORCHESTRATOR_LEAVES:
+            expected_task_targets.add(leaf)
+            expected_task_targets.add(f"{leaf}-fallback")
+        self.assertEqual(set(task_permissions), expected_task_targets)
 
 
 if __name__ == "__main__":

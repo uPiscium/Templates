@@ -11,6 +11,7 @@ Do not treat CI success as a PASS result for this test. Do not treat this docume
 ## Purpose
 
 Verify that a permission request originating from a Depth-2 leaf agent can be observed and handled from the single Main OpenCode TUI session without weakening repository permissions.
+This is an upstream compatibility canary for `anomalyco/opencode#13715` and is not itself a release gate.
 
 ## Preconditions
 
@@ -30,10 +31,12 @@ Verify that a permission request originating from a Depth-2 leaf agent can be ob
 6. Verify whether the approval request is surfaced in the Main TUI.
 7. Approve it once and confirm only the requested command proceeds.
 8. Repeat with a second harmless Ask and reject it; confirm rejection propagates to the leaf without weakening permissions.
-9. Trigger `just agent::push <TASK-ID>` from the Task Orchestrator and confirm it requires Ask.
-10. Confirm raw `git push ...` is denied rather than offered as an alternate approval path.
-11. Confirm `just integrate::merge <PR>` is unavailable/denied from the Task Orchestrator and remains an Ask operation for the Main Orchestrator.
-12. Confirm access to `/tmp/opencode/**` asks and another external directory is denied.
+9. In the same Task Orchestrator session, simulate a leaf escalation (`NEEDS_APPROVAL` or `NEEDS_DECISION`) for an operation that requires explicit depth-1 judgment.
+10. Confirm the Task Orchestrator makes the approval/rejection decision itself (or returns `BLOCKED`) without relaying the leaf request unchanged, and records evidence.
+11. Trigger `just agent::push <TASK-ID>` from the Task Orchestrator and confirm it requires Ask.
+12. Confirm raw `git push ...` is denied rather than offered as an alternate approval path.
+13. Confirm `just integrate::merge <PR>` is unavailable/denied from the Task Orchestrator and remains an Ask operation for the Main Orchestrator.
+14. Confirm access to `/tmp/opencode/**` asks and another external directory is denied.
 
 ## Result record
 
@@ -46,9 +49,10 @@ Record the following together for one test run:
 - Main session identifier, if exposed
 - Task Orchestrator session identifier, if exposed
 - leaf session identifier, if exposed
-- Depth-2 Ask visible from Main TUI: PASS / FAIL / INCOMPLETE
+- Depth-2 Ask visible from Main TUI (compatibility canary): PASS / FAIL / INCOMPLETE
 - approval propagation: PASS / FAIL / INCOMPLETE
 - rejection propagation: PASS / FAIL / INCOMPLETE
+- Leaf→Depth-1 escalation decision boundary (release gate): PASS / FAIL / INCOMPLETE
 - Task push Ask: PASS / FAIL / INCOMPLETE
 - raw push deny: PASS / FAIL / INCOMPLETE
 - Task merge deny: PASS / FAIL / INCOMPLETE
@@ -58,6 +62,6 @@ Record the following together for one test run:
 - Overall result: PASS / FAIL / INCOMPLETE
 - Notes / observed UI behavior
 
-Overall PASS requires every mandatory permission-boundary item above to be PASS. Any unexecuted item makes the run INCOMPLETE rather than PASS.
+Overall PASS requires every mandatory release-gate item above to be PASS. Any unexecuted item makes the run INCOMPLETE rather than PASS.
 
 If the Main TUI cannot directly surface descendant Ask requests but navigating to the child session permits approval, record that behavior explicitly and mark the centralized Depth-2 Ask item FAIL rather than treating child-session navigation as equivalent behavior.

@@ -26,6 +26,8 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             "prepare issue='issue-41' template='agent-python'",
             "diagnose-child-stall issue='issue-41'",
             "smoke-depth2 issue='issue-41'",
+            "smoke-escalation issue='issue-41'",
+            "validate-escalation issue='issue-41'",
             "smoke-fallback issue='issue-41'",
             "direct-leaf issue='issue-41'",
             "export-session session issue='issue-41'",
@@ -47,6 +49,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             {
                 ("SMOKE-CONTROL", "ask-free-control"),
                 ("SMOKE-ASK", "depth2-ask"),
+                ("SMOKE-ESCALATION", "leaf-escalation"),
                 ("SMOKE-FALLBACK", "model-fallback"),
             },
         )
@@ -61,6 +64,35 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("do not call `question` or any other tool first", scope)
         self.assertIn("printf 'depth2-ask-approved\\n'", scope)
         self.assertIn("printf 'depth2-ask-rejected\\n'", scope)
+        self.assertNotIn("printf 'leaf-escalation-approved\\n'", scope)
+        self.assertNotIn("git push origin HEAD:main", scope)
+
+        smoke_escalation = next(
+            definition
+            for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-ESCALATION"
+        )
+        escalation_scope = " ".join(smoke_escalation[3])
+        escalation_acceptance = " ".join(smoke_escalation[4])
+        self.assertIn("NEEDS_APPROVAL", escalation_scope)
+        self.assertIn("leaf-escalation-approved\\n", escalation_scope)
+        self.assertIn("git push origin HEAD:main", escalation_scope)
+        self.assertNotIn("printf 'depth2-ask-approved\\n'", escalation_scope)
+        self.assertNotIn("printf 'depth2-ask-rejected\\n'", escalation_scope)
+        self.assertIn("exact", escalation_scope)
+        self.assertIn("exact four decision steps", escalation_scope)
+        self.assertIn("must not call Bash", escalation_scope)
+        self.assertIn("immediately call Bash", escalation_scope)
+        self.assertIn("no other tool first", escalation_scope)
+        self.assertIn("internal Depth-1 rejection", escalation_scope)
+        self.assertIn("Do not call Bash or create a permission request", escalation_scope)
+        self.assertIn("ordinary Task closeout", escalation_scope)
+        self.assertIn("Bounded read-only policy inspection", escalation_scope)
+        self.assertIn("NEEDS_APPROVAL", escalation_acceptance)
+        self.assertIn("Depth-1", escalation_acceptance)
+        self.assertIn("No denied command execution", escalation_acceptance)
+        self.assertIn("four decision steps occur in order", escalation_acceptance)
+        self.assertIn("false", escalation_acceptance)
 
         smoke_fallback = next(
             definition
@@ -102,6 +134,64 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             self.assertIn("- Status: initialized", text)
             self.assertIn("- [ ] Evidence is recorded.", text)
 
+    def test_validate_escalation_requires_ordered_noninteractive_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "issue"
+            logs = base / "logs"
+            state = (
+                base
+                / "smoke-repo"
+                / ".worktrees"
+                / "SMOKE-ESCALATION-leaf-escalation"
+                / ".task-state"
+                / "task.md"
+            )
+            logs.mkdir(parents=True)
+            state.parent.mkdir(parents=True)
+            log = logs / "opencode-leaf-escalation-test.log"
+            valid_lines = [
+                "message=created id=to parentID=main agent=task-orchestrator",
+                "message=created id=leaf1 parentID=to title=step1 agent=general",
+                'message="exiting loop" session.id=leaf1',
+                "message=asking permission=bash patterns=leaf-escalation-approved",
+                "message=created id=leaf2 parentID=to title=step3 agent=general",
+                'message="exiting loop" session.id=leaf2',
+            ]
+            log.write_text("\n".join(valid_lines) + "\n", encoding="utf-8")
+            state.write_text(
+                "- Leaf general (Step 1): request -> `NEEDS_APPROVAL` (non-executed)\n"
+                "- Bash (Depth-1): executed `printf 'leaf-escalation-approved\\n'` after approval.\n"
+                "- Leaf general (Step 3): request -> `NEEDS_APPROVAL` (non-executed)\n"
+                "- Step 4 Depth-1 decision: rejected `git push origin HEAD:main` without Bash or permission request.\n"
+                "- output `leaf-escalation-approved`\n",
+                encoding="utf-8",
+            )
+
+            original_workspace = runtime.workspace
+            runtime.workspace = lambda _issue: base
+            try:
+                result = runtime.validate_escalation("test")
+                self.assertEqual(result["status"], "PASS")
+                self.assertEqual(result["approvedAskCount"], 1)
+
+                log.write_text(
+                    "\n".join(
+                        valid_lines
+                        + [
+                            'evaluated permission=bash pattern="git push origin HEAD:main"'
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    runtime.RuntimeSmokeError,
+                    "prohibited push reached Bash/permission evaluation",
+                ):
+                    runtime.validate_escalation("test")
+            finally:
+                runtime.workspace = original_workspace
+
     def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary)
@@ -132,6 +222,16 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 )
                 self.assertIn(
                     '    "printf \'depth2-ask-rejected\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                self.assertNotIn(
+                    '    "printf \'leaf-escalation-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                self.assertNotIn(
+                    '    "git push origin HEAD:main": ask\n',
                     text,
                     name,
                 )
@@ -176,6 +276,16 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 self.assertEqual(1, text.count('    "*": deny\n'), name)
                 self.assertIn(
                     '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                self.assertNotIn(
+                    '    "printf \'leaf-escalation-approved\\\\n\'": ask\n',
+                    text,
+                    name,
+                )
+                self.assertNotIn(
+                    '    "git push origin HEAD:main": ask\n',
                     text,
                     name,
                 )
@@ -333,6 +443,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             original_run_capture = runtime.run_capture
             original_write_contract = runtime.write_contract
             original_harden_permissions = runtime.harden_runtime_leaf_permissions
+            hardened_paths: list[Path] = []
 
             def fake_workspace(_: str) -> Path:
                 return base
@@ -357,7 +468,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             runtime.run_logged = fake_run_logged
             runtime.run_capture = fake_run_capture
             runtime.write_contract = lambda *args, **kwargs: None
-            runtime.harden_runtime_leaf_permissions = lambda *args, **kwargs: None
+            runtime.harden_runtime_leaf_permissions = lambda path: hardened_paths.append(path)
             try:
                 runtime.prepare("issue-41", "agent-python")
             finally:
@@ -408,6 +519,29 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 ["nix", "develop", "--command", "git", "push", "-u", "origin", "main"],
                 commands,
             )
+            ask_worktree = base / "smoke-repo" / ".worktrees" / "SMOKE-ASK-depth2-ask"
+            self.assertEqual(hardened_paths, [ask_worktree])
+            self.assertIn(
+                [
+                    "git",
+                    "add",
+                    ".opencode/agents/general.md",
+                    ".opencode/agents/general-fallback.md",
+                ],
+                commands,
+            )
+            self.assertIn(
+                [
+                    "nix",
+                    "develop",
+                    "--command",
+                    "git",
+                    "commit",
+                    "-m",
+                    "Install native Ask canary profile",
+                ],
+                commands,
+            )
 
     def test_report_template_requires_evidence_based_classification(self) -> None:
         metadata = {
@@ -421,8 +555,13 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("Ask-free nested control", report)
         self.assertIn("Direct leaf control", report)
         self.assertIn("Depth-2 native Ask compatibility canary", report)
+        self.assertIn("Leaf → Depth-1 escalation release gate", report)
         self.assertIn("release blocker: NO", report)
-        self.assertIn("#7 release gate: Leaf -> Depth-1 escalation", report)
+        self.assertIn("#51 release gate (Leaf -> Depth-1 escalation)", report)
+        self.assertIn("#7 release status", report)
+        self.assertIn("SMOKE-ESCALATION contract: READY", report)
+        self.assertIn("`runtime::validate-escalation`", report)
+        self.assertIn("must remain INCOMPLETE", report)
         self.assertIn("primary/fallback diagnostic permission parity", report)
         self.assertIn("PASS / FAIL / INCOMPLETE", report)
         self.assertIn("Do not infer PASS", report)
