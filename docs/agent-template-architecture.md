@@ -321,7 +321,7 @@ Leaf agents are execution specialists:
 - `explore`: read-only code discovery and reference tracing;
 - `general`: bounded implementation within exclusive edit scope;
 - `verifier`: executable tests/lint/type-check/build verification;
-- `reviewer`: correctness review;
+- `reviewer`: correctness review through native read/search tools only; Bash remains fully denied;
 - `investigator`: root-cause diagnosis;
 - `security-reviewer`: security-boundary review;
 - `scout`: external primary-source research.

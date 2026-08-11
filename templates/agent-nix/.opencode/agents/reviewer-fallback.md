@@ -13,22 +13,6 @@ permission:
   websearch: deny
   bash:
     "*": deny
-    "git status": allow
-    "git status *": allow
-    "git diff": allow
-    "git diff *": allow
-    "git log": allow
-    "git log *": allow
-    "git show *": allow
-    "git blame *": allow
-    "git grep *": allow
-    "git rev-parse *": allow
-    "git ls-files *": allow
-    "git merge-base *": allow
-    "git cat-file *": allow
-    "git branch --list *": allow
-    "git remote -v": allow
-    "git worktree list *": allow
 ---
 
 Review with the same read-only authority and evidence contract as `reviewer`. This variant is only for classified usage-limit fallback. This is a non-interactive Depth-2 leaf.

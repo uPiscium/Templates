@@ -146,7 +146,7 @@ just runtime::validate-escalation issue-51-final
 ```
 
 Do not mark the release gate PASS unless this command returns `status: PASS`.
-The validator, rather than model-authored acceptance-checkbox state, is authoritative for this gate. It checks ordered Leaf completions, the approved and user-rejected Ask paths, that both Ask origins match their Task Orchestrator session IDs, that rejection returns control to the parent Main session, absence of Leaf interaction, absence of any push Bash/permission event, no rejection retry, and exact approval-leg Task-State evidence. Read-only lifecycle/status commands after the rejection do not count as retries of the rejected operation.
+The validator, rather than model-authored acceptance-checkbox state, is authoritative for this gate. It checks ordered Leaf completions, the approved and user-rejected Ask paths, that both Ask origins match their Task Orchestrator session IDs, that rejection returns control to the parent Main session, and that the sanitized Task Orchestrator session export records the exact originating Bash tool part as `status: error` with an explicit user-permission rejection rather than completion. It also checks absence of Leaf interaction, absence of any push Bash/permission event, no rejection retry, and exact approval-leg Task-State evidence. Read-only lifecycle/status commands after the rejection do not count as retries of the rejected operation.
 
 ## Model fallback observation
 

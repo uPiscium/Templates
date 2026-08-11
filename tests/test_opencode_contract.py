@@ -62,7 +62,7 @@ LEAF_ALLOWED_BASH = {
     "explore": READ_ONLY_GIT_COMMANDS,
     "verifier": {"git status", "git status *", "git diff", "git diff *"}
     | PROJECT_CHECK_COMMANDS,
-    "reviewer": READ_ONLY_GIT_COMMANDS,
+    "reviewer": set(),
     "investigator": READ_ONLY_GIT_COMMANDS | PROJECT_CHECK_COMMANDS,
     "security-reviewer": READ_ONLY_GIT_COMMANDS,
     "scout": set(),

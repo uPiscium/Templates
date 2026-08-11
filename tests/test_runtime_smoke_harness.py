@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -171,7 +172,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 "message=created id=to parentID=main agent=task-orchestrator",
                 "message=created id=leaf1 parentID=to title=step1 agent=general",
                 'message="exiting loop" session.id=leaf1',
-                "message=process session.id=to",
+                "message=process session.id=to messageID=approval-message",
                 "message=asking permission=bash patterns=leaf-escalation-approved",
                 "message=created id=leaf2 parentID=to title=step3 agent=general",
                 'message="exiting loop" session.id=leaf2',
@@ -180,7 +181,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 "message=created id=reject-to parentID=main agent=task-orchestrator",
                 "message=created id=reject-leaf parentID=reject-to title=user-reject agent=general",
                 'message="exiting loop" session.id=reject-leaf',
-                "message=process session.id=reject-to",
+                "message=process session.id=reject-to messageID=reject-message",
                 "message=asking permission=bash patterns=leaf-escalation-user-rejected",
                 "message=process session.id=main",
             ]
@@ -197,7 +198,28 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 encoding="utf-8",
             )
             original_workspace = runtime.workspace
+            original_run_capture = runtime.run_capture
+            rejection_export = {
+                "messages": [
+                    {
+                        "parts": [
+                            {
+                                "type": "tool",
+                                "tool": "bash",
+                                "state": {
+                                    "status": "error",
+                                    "error": "The user rejected permission to use this specific tool call.",
+                                },
+                                "messageID": "reject-message",
+                            }
+                        ]
+                    }
+                ]
+            }
             runtime.workspace = lambda _issue: base
+            runtime.run_capture = lambda _command, *, cwd: json.dumps(
+                rejection_export
+            )
             try:
                 result = runtime.validate_escalation("test")
                 self.assertEqual(result["status"], "PASS")
@@ -205,12 +227,17 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 self.assertEqual(result["approvedAskOrigin"], "to")
                 self.assertEqual(result["rejectedAskOrigin"], "reject-to")
                 self.assertEqual(result["rejectionReturnedToMainSession"], "main")
+                self.assertEqual(result["rejectionToolStatus"], "error")
+                self.assertIn(
+                    "user rejected permission",
+                    result["rejectionToolError"].lower(),
+                )
 
                 reject_log.write_text(
                     "\n".join(
                         [
                             *valid_reject_lines[:3],
-                            "message=process session.id=wrong-origin",
+                            "message=process session.id=wrong-origin messageID=reject-message",
                             valid_reject_lines[4],
                             valid_reject_lines[5],
                         ]
@@ -241,6 +268,20 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                     "\n".join(valid_reject_lines) + "\n", encoding="utf-8"
                 )
 
+                rejection_export["messages"][0]["parts"][0]["state"] = {
+                    "status": "completed",
+                    "output": "leaf-escalation-user-rejected",
+                }
+                with self.assertRaisesRegex(
+                    runtime.RuntimeSmokeError,
+                    "does not prove permission rejection without execution",
+                ):
+                    runtime.validate_escalation("test")
+                rejection_export["messages"][0]["parts"][0]["state"] = {
+                    "status": "error",
+                    "error": "The user rejected permission to use this specific tool call.",
+                }
+
                 log.write_text(
                     "\n".join(
                         valid_lines
@@ -258,6 +299,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                     runtime.validate_escalation("test")
             finally:
                 runtime.workspace = original_workspace
+                runtime.run_capture = original_run_capture
 
     def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

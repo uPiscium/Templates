@@ -706,14 +706,20 @@ def validate_escalation(issue: str) -> dict:
         lambda line: "message=asking" in line and "leaf-escalation-approved" in line,
     )
 
-    def preceding_process_session(source_lines: list[str], event_index: int) -> str:
+    def preceding_process_event(
+        source_lines: list[str], event_index: int
+    ) -> tuple[str, str]:
         for line in reversed(source_lines[:event_index]):
-            match = re.search(r"message=process session.id=(\S+)", line)
+            match = re.search(
+                r"message=process session.id=(\S+) messageID=(\S+)", line
+            )
             if match is not None:
-                return match.group(1)
+                return match.group(1), match.group(2)
         raise RuntimeSmokeError("permission Ask has no preceding process session")
 
-    approval_ask_origin = preceding_process_session(lines, approval_ask)
+    approval_ask_origin, _approval_message_id = preceding_process_event(
+        lines, approval_ask
+    )
     if approval_ask_origin != orchestrator_id:
         raise RuntimeSmokeError(
             "approved Ask did not originate from the Task Orchestrator session"
@@ -833,7 +839,9 @@ def validate_escalation(issue: str) -> dict:
         < rejection_ask
     ):
         raise RuntimeSmokeError("rejection events are not in the required order")
-    rejection_ask_origin = preceding_process_session(reject_lines, rejection_ask)
+    rejection_ask_origin, rejection_message_id = preceding_process_event(
+        reject_lines, rejection_ask
+    )
     if rejection_ask_origin != reject_orchestrator_id:
         raise RuntimeSmokeError(
             "rejected Ask did not originate from the Task Orchestrator session"
@@ -848,6 +856,40 @@ def validate_escalation(issue: str) -> dict:
     if rejection_resume_session != reject_parent_id:
         raise RuntimeSmokeError(
             "rejected Ask did not return control to the parent Main session"
+        )
+
+    rejection_export = run_capture(
+        ["opencode", "export", "--sanitize", reject_orchestrator_id],
+        cwd=smoke_repo(issue),
+    )
+    message_marker = f'"messageID": "{rejection_message_id}"'
+    rejection_tool_segments = []
+    for marker in re.finditer(re.escape(message_marker), rejection_export):
+        part_start = rejection_export.rfind('"type":', 0, marker.start())
+        if part_start == -1:
+            continue
+        segment = rejection_export[part_start : marker.end()]
+        if re.search(r'"type"\s*:\s*"tool"', segment) and re.search(
+            r'"tool"\s*:\s*"bash"', segment
+        ):
+            rejection_tool_segments.append(segment)
+    if len(rejection_tool_segments) != 1:
+        raise RuntimeSmokeError(
+            "expected exactly one rejected-command Bash tool part in sanitized session export"
+        )
+    rejection_tool_segment = rejection_tool_segments[0]
+    status_match = re.search(r'"status"\s*:\s*"([^"]+)"', rejection_tool_segment)
+    error_match = re.search(
+        r'"error"\s*:\s*("(?:\\.|[^"\\])*")', rejection_tool_segment
+    )
+    rejection_tool_status = status_match.group(1) if status_match else ""
+    rejection_tool_error = json.loads(error_match.group(1)) if error_match else ""
+    if (
+        rejection_tool_status != "error"
+        or "user rejected permission" not in rejection_tool_error.lower()
+    ):
+        raise RuntimeSmokeError(
+            "rejected command Bash tool part does not prove permission rejection without execution"
         )
     between_leaf_and_ask = reject_lines[reject_leaf_exit + 1 : rejection_ask]
     unrelated_permissions = [
@@ -897,6 +939,8 @@ def validate_escalation(issue: str) -> dict:
         "rejectionTaskOrchestratorSession": reject_orchestrator_id,
         "rejectionLeafSession": reject_leaf_id,
         "rejectionReturnedToMainSession": rejection_resume_session,
+        "rejectionToolStatus": rejection_tool_status,
+        "rejectionToolError": rejection_tool_error,
         "prohibitedPushPermissionEvents": 0,
         "taskState": str(state),
     }
