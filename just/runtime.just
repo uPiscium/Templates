@@ -26,6 +26,20 @@ smoke-depth2 issue='issue-41':
     bash {{quote(debug_runner)}} {{quote(issue)}} depth2-ask
 
 [working-directory: root]
+smoke-escalation issue='issue-41':
+    @echo "Leaf->Depth-1 escalation release smoke: in the TUI run /task-run SMOKE-ESCALATION"
+    bash {{quote(debug_runner)}} {{quote(issue)}} leaf-escalation
+
+[working-directory: root]
+smoke-escalation-reject issue='issue-41':
+    @echo "Leaf->Depth-1 user-rejection smoke: in the TUI run /task-run SMOKE-ESCALATION-PERMISSION"
+    bash {{quote(debug_runner)}} {{quote(issue)}} leaf-escalation-reject
+
+[working-directory: root]
+validate-escalation issue='issue-41':
+    python3 {{quote(runner)}} validate-escalation --issue {{quote(issue)}}
+
+[working-directory: root]
 smoke-fallback issue='issue-41':
     @echo "Fallback observation: in the TUI run /task-run SMOKE-FALLBACK"
     bash {{quote(debug_runner)}} {{quote(issue)}} fallback

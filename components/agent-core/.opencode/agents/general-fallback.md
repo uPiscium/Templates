@@ -5,7 +5,36 @@ hidden: true
 model: openai/gpt-5.3-codex-spark
 permission:
   task: deny
+  question: deny
+  external_directory: deny
+  doom_loop: deny
+  webfetch: deny
+  websearch: deny
   bash:
+    "*": deny
+    "git status": allow
+    "git status *": allow
+    "git diff": allow
+    "git diff *": allow
+    "git log": allow
+    "git log *": allow
+    "git show *": allow
+    "git blame *": allow
+    "git grep *": allow
+    "git rev-parse *": allow
+    "git ls-files *": allow
+    "git merge-base *": allow
+    "git cat-file *": allow
+    "git branch --list *": allow
+    "git remote -v": allow
+    "git worktree list *": allow
+    "just project::doctor": allow
+    "just project::eval": allow
+    "just project::format-check": allow
+    "just project::lint": allow
+    "just project::test": allow
+    "just project::build": allow
+    "just project::check": allow
     "just agent::task-start *": deny
     "just agent::commit *": deny
     "just agent::push *": deny
@@ -13,9 +42,28 @@ permission:
     "just agent::pr-edit *": deny
     "just agent::pr-ready *": deny
     "just agent::cleanup *": deny
-    "just agent::fallback-record *": deny
     "just integrate::check *": deny
     "just integrate::merge *": deny
 ---
 
-Implement only the assigned Work Unit with the same scope and authority as `general`. This variant is only for classified usage-limit fallback. Do not update Task State, publish, integrate, clean up, or delegate.
+Implement only the assigned Work Unit with the same scope and authority as `general`. This variant is only for classified usage-limit fallback.
+
+This is a non-interactive Depth-2 leaf.
+
+Depth-2 leaf return contract:
+- Start the final response with exactly one `status: COMPLETED`, `status: BLOCKED`, `status: NEEDS_APPROVAL`, or `status: NEEDS_DECISION` field.
+- Do not attempt denied operations, ask the user, call `question`, delegate, broaden permissions, or claim any unexecuted command as executed/passed.
+- `COMPLETED`: include edited file list and evidence.
+- `BLOCKED`: include blockers and why implementation cannot continue.
+- `NEEDS_APPROVAL`: include:
+  - denied_operation: `<exact denied operation/command>`
+  - why_needed: `<why this operation is needed>`
+  - supporting_evidence: `<facts showing why it is needed>`
+  - expected_effect: `<expected repo effect>`
+  - consequence_if_denied: `<impact if approval is not granted>`
+  - work_unit_state: `<current bounded Work Unit state>`
+  - safe_continuation_point: `<where work can safely resume>`
+  - safe_alternatives: `<one or more safe alternatives>`
+- `NEEDS_DECISION`: include ambiguity, options with tradeoffs, and recommendation.
+
+Do not update Task State, publish, integrate, clean up, or delegate.

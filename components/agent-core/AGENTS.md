@@ -14,7 +14,12 @@ This repository is designed for hierarchical agent-driven development.
 - Leaf agents must not create subagents.
 - Main Orchestrator owns Task scheduling and final integration. Task Orchestrators own implementation and publication preparation for exactly one Task.
 - Task Orchestrators must not merge pull requests.
+- Depth-2 leaf agents are non-interactive; they may only report `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION` and never perform their own permission requests.
+- Task Orchestrator is the approval and decision boundary for any delegated escalation (`NEEDS_APPROVAL`/`NEEDS_DECISION`) and must re-evaluate scope, authority, least privilege, safety, alternatives, and current evidence before deciding.
+- A leaf denial is not automatically promoted to Ask. After independent re-evaluation, the Task Orchestrator may originate a new Depth-1 request only when that operation is already Ask/allow under its own configured authority; the leaf profile remains unchanged.
+- A user-rejected Depth-1 permission decision is final for that exact operation within the Task. It must not be retried, rephrased, re-delegated, or replaced by an equivalent operation; use recorded permission evidence and a safe alternative or BLOCKED result.
 - A command or check that was not executed must never be reported as PASS.
+- Unresolved leaf requests must not be inferred as approval. For `NEEDS_DECISION`, the Task Orchestrator resolves from the Task Contract/evidence when possible; if human judgment remains necessary, it asks from Depth 1 with options, tradeoffs, known facts, and a recommendation, then applies the answer.
 - Do not substitute a different model ID when an explicitly configured model is unavailable. Use only explicitly configured fallback policy where applicable.
 
 ## Initialization layers
