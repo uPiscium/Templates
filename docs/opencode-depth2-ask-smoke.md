@@ -32,7 +32,7 @@ This is an upstream compatibility canary for `anomalyco/opencode#13715` and is n
 7. Approve it once and confirm only the requested command proceeds.
 8. Repeat with a second harmless Ask and reject it; confirm rejection propagates to the leaf without weakening permissions.
 9. In the same Task Orchestrator session, simulate a leaf escalation (`NEEDS_APPROVAL` or `NEEDS_DECISION`) for an operation that requires explicit depth-1 judgment.
-10. Confirm the Task Orchestrator makes the approval/rejection decision itself (or returns `BLOCKED`) without relaying the leaf request unchanged, and records evidence.
+10. Confirm the Task Orchestrator independently resolves the approval/decision without relaying the Leaf request unchanged. For unresolved `NEEDS_DECISION`, confirm `question` originates from Depth 1 with options/tradeoffs/recommendation and its answer is applied.
 11. Trigger `just agent::push <TASK-ID>` from the Task Orchestrator and confirm it requires Ask.
 12. Confirm raw `git push ...` is denied rather than offered as an alternate approval path.
 13. Confirm `just integrate::merge <PR>` is unavailable/denied from the Task Orchestrator and remains an Ask operation for the Main Orchestrator.

@@ -183,7 +183,16 @@ def assert_prompt_contract_for_leaf_statuses(test_case: unittest.TestCase, body:
     test_case.assertIn("ask the user", lower, name)
     test_case.assertIn("call `question`", lower, name)
     test_case.assertIn("claim any unexecuted command as executed/passed", lower, name)
-    for field in ("denied_operation", "why_needed", "expected_effect", "safe_alternatives"):
+    for field in (
+        "denied_operation",
+        "why_needed",
+        "supporting_evidence",
+        "expected_effect",
+        "consequence_if_denied",
+        "work_unit_state",
+        "safe_continuation_point",
+        "safe_alternatives",
+    ):
         test_case.assertIn(field, lower, name)
     test_case.assertIn("ambiguity, options with tradeoffs, and recommendation", lower, name)
 
@@ -389,6 +398,7 @@ class OpenCodeContractTest(unittest.TestCase):
         primary_permissions = permission_for("task-orchestrator")
         fallback_permissions = permission_for("task-orchestrator-fallback")
         self.assertEqual(primary_permissions, fallback_permissions)
+        self.assertEqual(primary_permissions.get("question"), "allow")
 
         self.assertIn("blocked", primary_text)
         self.assertIn("continue", primary_text)
@@ -398,6 +408,20 @@ class OpenCodeContractTest(unittest.TestCase):
             "launder" in primary_text,
             "task-orchestrator should contain anti-laundering language",
         )
+        for text, name in (
+            (primary_text, "task-orchestrator"),
+            (fallback_text, "task-orchestrator-fallback"),
+        ):
+            self.assertIn("needs_decision", text, name)
+            self.assertIn("task contract", text, name)
+            self.assertIn("question", text, name)
+            self.assertIn("options", text, name)
+            self.assertIn("tradeoffs", text, name)
+            self.assertIn("recommendation", text, name)
+            self.assertIn("user-rejected", text, name)
+            self.assertIn("final for that exact operation", text, name)
+            self.assertIn("never retry, rephrase, re-delegate, or substitute", text, name)
+            self.assertNotIn("elevate to depth 0", text, name)
 
     def test_task_orchestrator_call_graph_is_non_cyclic(self) -> None:
         task_permissions = permission_for("task-orchestrator").get("task", {})

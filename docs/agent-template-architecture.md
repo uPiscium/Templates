@@ -23,7 +23,7 @@ This document is a design contract for later implementation issues. It intention
 9. Session initialization is read-only. Repository bootstrap and Agent Core upgrades are separate state-changing workflows.
 10. Task State is disposable execution state and must never be committed or pushed.
 11. Depth-2 leaf agents are non-interactive and may return only `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`.
-12. The Depth-1 Task Orchestrator is the escalation approval boundary and must independently re-evaluate scope, authority, least-privilege alignment, safety, alternatives, and evidence before approving or rejecting any `NEEDS_APPROVAL`/`NEEDS_DECISION` result.
+12. The Depth-1 Task Orchestrator is the escalation approval and decision boundary and must independently re-evaluate scope, authority, least-privilege alignment, safety, alternatives, and evidence before resolving any `NEEDS_APPROVAL`/`NEEDS_DECISION` result. An unresolved human decision is asked from Depth 1, not relayed by the Leaf.
 13. Task Orchestrator must not automatically convert leaf denials into Ask, propagate requests unchanged, weaken configured permissions, or report unexecuted work as PASS. It may originate a new Depth-1 permission request only after independent re-evaluation and only when that operation is already Ask/allow under its own profile.
 
 ## 3. Repository composition model
@@ -272,6 +272,7 @@ A Task Orchestrator may not call another Task Orchestrator. Leaf agents have `ta
 Depth-2 leaf work is non-interactive. A leaf may return only `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, and `NEEDS_DECISION`; no leaf may originate direct permission requests outside its configured allowlist.
 
 Depth-1 Task Orchestrator is the decision boundary for `NEEDS_APPROVAL` and `NEEDS_DECISION`, including independent re-checks for scope, authority, safety, least privilege, alternatives, and evidence.
+It resolves `NEEDS_DECISION` from the Task Contract/evidence when possible. If human judgment remains necessary, it uses `question` directly from Depth 1 with options, tradeoffs, known facts, and a recommendation, then applies the response.
 
 ## 10. Agent responsibilities
 
@@ -305,6 +306,8 @@ Owns one Task only:
   - re-validates scope, configured authority, least privilege, safety, alternatives, and evidence before deciding any `NEEDS_APPROVAL`/`NEEDS_DECISION`.
   - may only approve follow-on operations already in its own Task configuration.
   - on rejection, chooses a safe alternative or returns `BLOCKED` with evidence.
+  - treats a user-rejected permission decision as final for the exact operation within that Task; records the permission result and never retries, rephrases, re-delegates, or substitutes an equivalent operation.
+  - resolves `NEEDS_DECISION` from available evidence or asks the user directly from Depth 1 and continues from the answer.
 - does not automatically relay or launder leaf escalation requests or weaken permissions to satisfy them. A new Depth-1 request requires independent justification and existing Ask/allow authority in the orchestrator profile.
 - updates Task State;
 - verifies and reviews the integrated Task;

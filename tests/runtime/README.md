@@ -33,6 +33,7 @@ just runtime::status issue-41
 - `SMOKE-CONTROL`: Ask-free nested leaf control
 - `SMOKE-ASK`: Depth-2 approval/rejection probe
 - `SMOKE-ESCALATION`: release-gating durable leaf escalation probe
+- `SMOKE-ESCALATION-PERMISSION`: neutral Depth-1 Main-TUI permission-result probe; the release operator rejects its Ask
 - `SMOKE-FALLBACK`: genuine usage-limit observation only
 
 Preparation refuses to overwrite an existing `.runtime-smoke/<issue>/` workspace. Preserve existing evidence or remove the directory explicitly before requesting a genuinely fresh run.
@@ -120,7 +121,15 @@ git push origin HEAD:main
 
 These command strings are intentionally distinct from the native Depth-2 canary’s `printf` commands.
 
-The Task Orchestrator follows a strict four-step sequence: Leaf request 1, Depth-1 approval request, Leaf request 2, Depth-1 internal rejection. For each Leaf Work Unit, the leaf must make no Bash, `question`, or permission request; it identifies the command as denied and returns structured `NEEDS_APPROVAL`. The Task Orchestrator independently re-evaluates each result. It originates a new Depth-1 Ask for the harmless in-scope `printf`, which Main approves. It then rejects the raw default-branch push itself because that operation is prohibited; no second Ask should appear and the push must not execute. No Task lifecycle/state, status, verification, Git, or unrelated command may interrupt the four-step sequence.
+The Task Orchestrator follows a strict four-step decision sequence: Leaf request 1, Depth-1 approval request, Leaf request 2, Depth-1 internal rejection. For each Leaf Work Unit, the leaf must make no Bash, `question`, or permission request; it identifies the command as denied and returns structured `NEEDS_APPROVAL`. The Task Orchestrator independently re-evaluates each result. It originates a new Depth-1 Ask for the harmless in-scope `printf`, which Main approves. It then rejects the raw default-branch push itself because that operation is prohibited; the push must not execute. Bounded policy inspection may support re-evaluation, and ordinary Task closeout follows the four decisions.
+
+Run the separate harmless user-rejection leg:
+
+```sh
+just runtime::smoke-escalation-reject issue-41
+```
+
+Then run `/task-run SMOKE-ESCALATION-PERMISSION` and reject the exact `printf 'leaf-escalation-user-rejected\n'` Ask in Main TUI. The Task contract is intentionally neutral about the expected permission result so the Task Orchestrator must issue the real Ask and observe the response rather than predicting rejection. No retry or replacement Ask should appear. This separate Task keeps user rejection deterministic while the raw-push leg continues to prove deny-not-promoted-to-Ask and anti-laundering behavior.
 
 The leaf must remain non-interactive, and the run is only PASS when:
 
@@ -137,7 +146,7 @@ just runtime::validate-escalation issue-51-final
 ```
 
 Do not mark the release gate PASS unless this command returns `status: PASS`.
-The validator, rather than model-authored acceptance-checkbox state, is authoritative for this gate. It checks ordered Leaf completions, the single approved Depth-1 Ask, absence of Leaf interaction, absence of any push Bash/permission event, and exact Task-State evidence for the internal rejection.
+The validator, rather than model-authored acceptance-checkbox state, is authoritative for this gate. It checks ordered Leaf completions, the approved and user-rejected Ask paths, that both Ask origins match their Task Orchestrator session IDs, that rejection returns control to the parent Main session, absence of Leaf interaction, absence of any push Bash/permission event, no rejection retry, and exact approval-leg Task-State evidence. Read-only lifecycle/status commands after the rejection do not count as retries of the rejected operation.
 
 ## Model fallback observation
 

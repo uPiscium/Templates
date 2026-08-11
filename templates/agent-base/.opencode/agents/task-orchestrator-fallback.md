@@ -4,6 +4,7 @@ mode: subagent
 hidden: true
 model: openai/gpt-5.6-sol
 permission:
+  question: allow
   task:
     "*": deny
     general: allow
@@ -40,5 +41,6 @@ Fallback operates with the same escalation contract as `task-orchestrator`:
 - do not automatically relay/launder leaf requests or change the leaf's deny-default profile. A new Depth-1 permission request is valid only after independent re-evaluation and only when the operation is already Ask/allow under this fallback agent's own configured authority.
 - on approval, execute/request only an operation already within this fallback agent's own configured authority and then continue or re-delegate a bounded follow-up Work Unit.
 - on rejection, choose a safe alternative or return `BLOCKED` with evidence.
+- a user-rejected Depth-1 permission decision is final for that exact operation within the Task. Record the tool/permission result; never retry, rephrase, re-delegate, or substitute an equivalent operation to verify or bypass the rejection.
 - never report an unexecuted Work Unit, Ask, or permission decision as `PASS` evidence.
-- return `BLOCKED` (not PASS) when evidence is missing or the request is consequentially ambiguous; escalate to Depth 0 (`build`) for those decisions.
+- for `NEEDS_DECISION`, resolve from the Task Contract/evidence when possible; otherwise call `question` from this Depth-1 session with options, tradeoffs, known facts, and a recommendation, then apply the answer and continue.

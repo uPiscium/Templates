@@ -27,6 +27,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             "diagnose-child-stall issue='issue-41'",
             "smoke-depth2 issue='issue-41'",
             "smoke-escalation issue='issue-41'",
+            "smoke-escalation-reject issue='issue-41'",
             "validate-escalation issue='issue-41'",
             "smoke-fallback issue='issue-41'",
             "direct-leaf issue='issue-41'",
@@ -50,6 +51,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 ("SMOKE-CONTROL", "ask-free-control"),
                 ("SMOKE-ASK", "depth2-ask"),
                 ("SMOKE-ESCALATION", "leaf-escalation"),
+                ("SMOKE-ESCALATION-PERMISSION", "leaf-escalation-permission"),
                 ("SMOKE-FALLBACK", "model-fallback"),
             },
         )
@@ -93,6 +95,21 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("No denied command execution", escalation_acceptance)
         self.assertIn("four decision steps occur in order", escalation_acceptance)
         self.assertIn("false", escalation_acceptance)
+
+        smoke_reject = next(
+            definition
+            for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-ESCALATION-PERMISSION"
+        )
+        reject_scope = " ".join(smoke_reject[3])
+        reject_acceptance = " ".join(smoke_reject[4])
+        self.assertIn("leaf-escalation-user-rejected", reject_scope)
+        self.assertIn("actual Main TUI permission result", reject_scope)
+        self.assertIn("without predicting it", reject_scope)
+        self.assertIn("first tool call after the Leaf return", reject_scope)
+        self.assertIn("do not retry", reject_scope)
+        self.assertIn("Task Orchestrator session", reject_acceptance)
+        self.assertIn("command does not execute", reject_acceptance)
 
         smoke_fallback = next(
             definition
@@ -148,16 +165,29 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             )
             logs.mkdir(parents=True)
             state.parent.mkdir(parents=True)
-            log = logs / "opencode-leaf-escalation-test.log"
+            log = logs / "opencode-leaf-escalation-20260101.log"
+            reject_log = logs / "opencode-leaf-escalation-reject-test.log"
             valid_lines = [
                 "message=created id=to parentID=main agent=task-orchestrator",
                 "message=created id=leaf1 parentID=to title=step1 agent=general",
                 'message="exiting loop" session.id=leaf1',
+                "message=process session.id=to",
                 "message=asking permission=bash patterns=leaf-escalation-approved",
                 "message=created id=leaf2 parentID=to title=step3 agent=general",
                 'message="exiting loop" session.id=leaf2',
             ]
+            valid_reject_lines = [
+                "message=created id=reject-to parentID=main agent=task-orchestrator",
+                "message=created id=reject-leaf parentID=reject-to title=user-reject agent=general",
+                'message="exiting loop" session.id=reject-leaf',
+                "message=process session.id=reject-to",
+                "message=asking permission=bash patterns=leaf-escalation-user-rejected",
+                "message=process session.id=main",
+            ]
             log.write_text("\n".join(valid_lines) + "\n", encoding="utf-8")
+            reject_log.write_text(
+                "\n".join(valid_reject_lines) + "\n", encoding="utf-8"
+            )
             state.write_text(
                 "- Leaf general (Step 1): request -> `NEEDS_APPROVAL` (non-executed)\n"
                 "- Bash (Depth-1): executed `printf 'leaf-escalation-approved\\n'` after approval.\n"
@@ -166,13 +196,50 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 "- output `leaf-escalation-approved`\n",
                 encoding="utf-8",
             )
-
             original_workspace = runtime.workspace
             runtime.workspace = lambda _issue: base
             try:
                 result = runtime.validate_escalation("test")
                 self.assertEqual(result["status"], "PASS")
                 self.assertEqual(result["approvedAskCount"], 1)
+                self.assertEqual(result["approvedAskOrigin"], "to")
+                self.assertEqual(result["rejectedAskOrigin"], "reject-to")
+                self.assertEqual(result["rejectionReturnedToMainSession"], "main")
+
+                reject_log.write_text(
+                    "\n".join(
+                        [
+                            *valid_reject_lines[:3],
+                            "message=process session.id=wrong-origin",
+                            valid_reject_lines[4],
+                            valid_reject_lines[5],
+                        ]
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    runtime.RuntimeSmokeError,
+                    "rejected Ask did not originate from the Task Orchestrator session",
+                ):
+                    runtime.validate_escalation("test")
+                reject_log.write_text(
+                    "\n".join(valid_reject_lines) + "\n", encoding="utf-8"
+                )
+
+                reject_log.write_text(
+                    "\n".join([*valid_reject_lines[:-1], "message=process session.id=other"])
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    runtime.RuntimeSmokeError,
+                    "rejected Ask did not return control to the parent Main session",
+                ):
+                    runtime.validate_escalation("test")
+                reject_log.write_text(
+                    "\n".join(valid_reject_lines) + "\n", encoding="utf-8"
+                )
 
                 log.write_text(
                     "\n".join(
@@ -560,6 +627,8 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("#51 release gate (Leaf -> Depth-1 escalation)", report)
         self.assertIn("#7 release status", report)
         self.assertIn("SMOKE-ESCALATION contract: READY", report)
+        self.assertIn("SMOKE-ESCALATION-PERMISSION contract: READY", report)
+        self.assertIn("Ask origin is Task Orchestrator session", report)
         self.assertIn("`runtime::validate-escalation`", report)
         self.assertIn("must remain INCOMPLETE", report)
         self.assertIn("primary/fallback diagnostic permission parity", report)

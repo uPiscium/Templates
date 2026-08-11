@@ -17,6 +17,8 @@ Use this skill when the Main Orchestrator is asked to run a specific Task that a
    - do not automatically relay/launder leaf requests or change a leaf's deny-default profile;
    - only issue a new Depth-1 permission request after independent re-evaluation and when the operation is already Ask/allow within the Task Orchestrator's configured role authority;
    - on rejection, pick a safe alternative or return `BLOCKED` with evidence.
+   - treat a user-rejected Depth-1 operation as final for that Task; do not retry, rephrase, re-delegate, or substitute an equivalent operation to verify/bypass rejection.
+   - for unresolved `NEEDS_DECISION`, use `question` from Depth 1 with concrete options, tradeoffs, known facts, and a recommendation; apply the answer rather than relaying the Leaf request or escalating it to Depth 0.
 7. If the Task Orchestrator invocation fails with a usage/quota/rate-limit condition explicitly listed in `.automation/model-fallback.toml`, retry the identical Task once with the configured `task-orchestrator-fallback` variant.
 8. Inside the Task, leaf Work Units may use the same controlled retry rule for their role-specific fallback variants. Do not fallback for authentication, permission, validation, context-window, tool, or safety errors.
 9. Record every attempted fallback in Task State evidence. When a configured chain is exhausted, mark the Task BLOCKED instead of inventing another model.

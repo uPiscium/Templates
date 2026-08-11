@@ -36,7 +36,11 @@ Depth-2 leaf return contract:
 - `NEEDS_APPROVAL`: include:
   - denied_operation: `<exact denied operation/command>`
   - why_needed: `<why this operation is needed>`
+  - supporting_evidence: `<facts showing why it is needed>`
   - expected_effect: `<expected repo effect>`
+  - consequence_if_denied: `<impact if approval is not granted>`
+  - work_unit_state: `<current bounded Work Unit state>`
+  - safe_continuation_point: `<where work can safely resume>`
   - safe_alternatives: `<one or more safe alternatives>`
 - `NEEDS_DECISION`: include ambiguity, options with tradeoffs, and recommendation.
 
