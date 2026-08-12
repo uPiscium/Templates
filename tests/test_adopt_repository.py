@@ -92,6 +92,32 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertFalse(result["pushPerformed"])
         self.assertFalse(result["mergePerformed"])
 
+    def test_plan_reports_preserved_old_just_environment_prerequisite(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "flake.nix").write_text(
+            '''{
+  outputs = { self, nixpkgs }: {
+    devShells.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.mkShell {
+      packages = [ nixpkgs.legacyPackages.x86_64-linux.just ];
+    };
+  };
+}
+''',
+            encoding="utf-8",
+        )
+        (repo / "flake.lock").write_text('{"nodes":{},"root":"root","version":7}\n', encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "base")
+
+        compatibility = plan["targetJustCompatibility"]
+        self.assertEqual(compatibility["requiredJustVersion"], "1.55.0")
+        self.assertEqual(compatibility["status"], "unknown")
+        self.assertIn("flake.nix", compatibility["reason"])
+        self.assertIn("flake.lock", compatibility["reason"])
+        self.assertIn("postAdoptionPrerequisite", compatibility)
+
     def test_existing_opencode_collision_blocks_apply(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)
