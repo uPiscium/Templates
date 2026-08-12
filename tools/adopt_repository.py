@@ -19,6 +19,12 @@ class AdoptionError(RuntimeError):
     pass
 
 
+JUST_COMPATIBILITY_PREREQUISITE = (
+    "Before running Agent Core recipes in the target repository, enter or update "
+    "the target repository environment so `just` is at least the required version."
+)
+
+
 @dataclass(frozen=True)
 class Action:
     path: str
@@ -29,6 +35,37 @@ class Action:
 
 def templates_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def required_just_version(source: Path) -> str | None:
+    justfile = source / "components" / "agent-core" / "Justfile"
+    if not justfile.is_file():
+        return None
+    for line in justfile.read_text(encoding="utf-8").splitlines():
+        prefix = 'set minimum-version := "'
+        if line.startswith(prefix) and line.endswith('"'):
+            return line[len(prefix):-1]
+    return None
+
+
+def target_just_compatibility(root: Path, required: str | None) -> dict:
+    preserved_tooling = [
+        path for path in ("flake.nix", "flake.lock") if (root / path).exists()
+    ]
+    reason = (
+        "target repository tooling was not executed during the read-only adoption plan"
+    )
+    if preserved_tooling:
+        reason = (
+            "target repository preserves existing tooling files: "
+            + ", ".join(preserved_tooling)
+        )
+    return {
+        "requiredJustVersion": required,
+        "status": "unknown",
+        "reason": reason,
+        "postAdoptionPrerequisite": JUST_COMPATIBILITY_PREREQUISITE,
+    }
 
 
 def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -219,6 +256,8 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
     dirty = bool(run(["git", "status", "--porcelain"], cwd=root).stdout.strip())
     version = (source / "components" / "agent-core" / ".automation" / "VERSION")
     version_value = version.read_text(encoding="utf-8").strip() if version.is_file() else None
+    just_version = required_just_version(source)
+    compatibility = target_just_compatibility(root, just_version)
     return {
         "repositoryRoot": str(root),
         "requestedAdapter": requested_adapter,
@@ -226,6 +265,7 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
         "adapterSelectionReason": reason,
         "adapterCandidates": detected,
         "agentCoreVersion": version_value,
+        "targetJustCompatibility": compatibility,
         "workingTreeDirty": dirty,
         "actions": [asdict(action) for action in actions],
         "blockers": blockers,
@@ -282,6 +322,7 @@ def apply_plan(source: Path, target: Path, requested_adapter: str) -> dict:
         "repositoryRoot": str(root),
         "adapter": adapter,
         "agentCoreVersion": plan["agentCoreVersion"],
+        "targetJustCompatibility": plan["targetJustCompatibility"],
         "commitCreated": False,
         "pushPerformed": False,
         "mergePerformed": False,

@@ -4,13 +4,14 @@ Agent-ready repositories always have a Project Adapter. A repository without a d
 
 ## Commands
 
-From the Templates repository:
+From the Templates repository, use the root dev shell so adoption tooling parses with the declared Just version:
 
 ```sh
-just template::adopt-plan /path/to/repository
-just template::adopt-plan /path/to/repository base
-just template::adopt-apply /path/to/repository base
-just template::adapter-migrate-plan /path/to/repository cpp-cmake
+cd /path/to/Templates
+nix develop --command just template::adopt-plan /path/to/repository
+nix develop --command just template::adopt-plan /path/to/repository base
+nix develop --command just template::adopt-apply /path/to/repository base
+nix develop --command just template::adapter-migrate-plan /path/to/repository cpp-cmake
 ```
 
 `adopt-plan` is read-only. It reports the selected Adapter, selection reason, Agent Core version, dirty-state status, planned file actions, and blockers.
