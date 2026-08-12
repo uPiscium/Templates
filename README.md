@@ -129,6 +129,13 @@ nix develop --command just template::adapter-migrate-plan /path/to/repository py
 
 Adoption/migration never commits, pushes, merges, stashes, or resets the target repository.
 
+
+## Planning Agent
+
+Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-5.6-sol`, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer` plus their configured fallbacks.
+
+`plan` never starts the Task lifecycle, edits Task State, runs executable doctor/check commands, or reports unexecuted verification as PASS. It reads `AGENTS.md`, `.automation/INIT.md`, adapter initialization guidance, and optional Task State, then returns confirmed facts, assumptions, open decisions, a bounded implementation plan, `execution_prerequisites`, and `verification_handoff` entries for an execution-capable workflow.
+
 ## Task and worktree lifecycle
 
 Main schedules Tasks. Each Task owns one branch, one repo-local worktree under `.worktrees/`, one disposable `.task-state/task.md`, and one Task Orchestrator. Leaf agents cannot delegate or mutate Task State.

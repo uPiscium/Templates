@@ -28,6 +28,14 @@ Repository bootstrap and Automation Core upgrade are separate state-changing wor
 8. For a Task worktree, confirm the Task Contract in `.task-state/task.md`: Purpose, Scope, Prohibited changes, Dependencies, Acceptance criteria, Test plan, Stop conditions, Coordination surfaces, and External resources.
 9. Only after every required check succeeds may the parent workflow plan Work Units, edit files, delegate, or run project build/test commands.
 
+## Planning-only sessions
+
+The repository-local `plan` agent is read-only and has `bash: deny`. It must still read `AGENTS.md`, this file, `.automation/INIT.fragment.md`, and optional `.task-state/task.md`, but it must not run `just agent::doctor`, `just agent::context`, `just project::doctor`, project-controlled commands, or executable verification.
+
+A planning-only session reports `PLANNING_INITIALIZATION_HANDOFF` with explicit `execution_prerequisites` and `verification_handoff` entries for every unexecuted doctor, context, project, build, test, or verification check. It must not report `INITIALIZED`, PASS, or successful verification for checks it did not execute.
+
+This exception applies only to the repository-local `plan` agent. Execution-capable primary agents and Task Orchestrators must complete the mandatory sequence above before editing, implementation delegation, or project commands.
+
 ## Stop conditions
 
 Stop initialization and report `BLOCKED` when any of the following is true:

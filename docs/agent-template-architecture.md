@@ -243,6 +243,30 @@ Depth 0: Main Orchestrator (`build`)
 
 The call graph is intentionally acyclic.
 
+
+### 9.2 Repository-local planning agent
+
+Agent Core owns a repository-local `plan` primary agent so Agent-ready repositories do not inherit planning authority from a generic global profile. The planning contract is intentionally read-only:
+
+```text
+plan
+├── primary = openai/gpt-5.6-sol
+├── edit = deny
+├── question = allow
+├── bash = deny
+└── delegation
+    ├── explore / explore-fallback
+    ├── architect / architect-fallback
+    ├── reviewer / reviewer-fallback
+    └── security-reviewer / security-reviewer-fallback
+```
+
+`plan` may use native reads and approved read-only leaves to produce requirements analysis and implementation sequencing. It must not delegate to `general`, `verifier`, `investigator`, `task-orchestrator`, or any implementation/execution-capable agent. It must not start Task lifecycle, edit `.task-state/**`, run raw Git/GitHub mutation, or run project-controlled commands.
+
+Because `plan` has `bash: deny`, it cannot complete the executable initialization sequence. Instead it performs planning-only initialization by reading `AGENTS.md`, `.automation/INIT.md`, `.automation/INIT.fragment.md`, and optional Task State, then returns `PLANNING_INITIALIZATION_HANDOFF` semantics: explicit `execution_prerequisites` and `verification_handoff` entries for every unexecuted doctor, context, project, build, test, or policy check. Unexecuted checks remain `UNEXECUTED`; they are never reported as PASS.
+
+This planning-only branch does not weaken full initialization. `build`, `task-orchestrator`, and other execution-capable workflows still must run `just agent::doctor`, `just agent::context`, and `just project::doctor` before editing, implementation delegation, or project commands.
+
 ### 9.1 Allowed delegation graph
 
 ```text
