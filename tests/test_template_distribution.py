@@ -121,6 +121,12 @@ class TemplateDistributionTest(unittest.TestCase):
         self.assertIn("distribution-check", justfile)
         self.assertNotIn("distribution-publish", justfile)
 
+    def test_root_flake_exposes_default_devshell_tooling(self) -> None:
+        flake = (ROOT / "flake.nix").read_text(encoding="utf-8")
+        self.assertIn("devShells.default", flake)
+        for tool in ["just", "python3", "git", "gh"]:
+            self.assertRegex(flake, rf"\b{tool}\b")
+
 
 if __name__ == "__main__":
     unittest.main()

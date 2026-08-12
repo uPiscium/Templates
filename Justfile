@@ -1,4 +1,4 @@
-set minimum-version := "1.31.0"
+set minimum-version := "1.55.0"
 
 mod template 'just/template.just'
 mod runtime 'just/runtime.just'

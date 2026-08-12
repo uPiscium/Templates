@@ -106,14 +106,16 @@ Existing-repository adoption and Agent Core upgrade are separate mutating workfl
 Plan first:
 
 ```sh
-just template::adopt-plan /path/to/repository
+cd /path/to/Templates
+nix develop --command just template::adopt-plan /path/to/repository
 ```
 
 Apply with an explicit Adapter when appropriate:
 
 ```sh
-just template::adopt-apply /path/to/repository base
-just template::adopt-apply /path/to/repository python
+cd /path/to/Templates
+nix develop --command just template::adopt-apply /path/to/repository base
+nix develop --command just template::adopt-apply /path/to/repository python
 ```
 
 Auto-detection prefers CMake/Python/Rust markers; a standalone `flake.nix` selects Nix; unknown or ambiguous repositories fall back to `base`.
@@ -121,7 +123,8 @@ Auto-detection prefers CMake/Python/Rust markers; a standalone `flake.nix` selec
 Migrate a base-adopted repository by inspecting the read-only migration plan before changing Adapter-owned paths:
 
 ```sh
-just template::adapter-migrate-plan /path/to/repository python
+cd /path/to/Templates
+nix develop --command just template::adapter-migrate-plan /path/to/repository python
 ```
 
 Adoption/migration never commits, pushes, merges, stashes, or resets the target repository.

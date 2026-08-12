@@ -1,4 +1,4 @@
-set minimum-version := "1.52.0"
+set minimum-version := "1.55.0"
 
 mod agent '.automation/just/agent.just'
 mod automation '.automation/just/automation.just'
