@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import re
 import unittest
 from pathlib import Path
@@ -250,6 +254,7 @@ class OpenCodeContractTest(unittest.TestCase):
     def test_model_assignment_is_exact(self) -> None:
         expected = {
             "build.md": "openai/gpt-5.6-sol",
+            "plan.md": "openai/gpt-5.6-sol",
             "task-orchestrator.md": "openai/gpt-5.3-codex-spark",
             "general.md": "openai/gpt-5.6-luna",
             "explore.md": "openai/gpt-5.6-luna",
@@ -297,6 +302,174 @@ class OpenCodeContractTest(unittest.TestCase):
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
+
+
+    def test_plan_agent_repository_local_read_only_contract(self) -> None:
+        front = frontmatter(AGENTS / "plan.md")
+        body = body_text("plan")
+        permission = permission_for("plan")
+
+        self.assertIn("mode: primary", front)
+        self.assertIn("model: openai/gpt-5.6-sol", front)
+        self.assertEqual(permission.get("edit"), "deny")
+        self.assertEqual(permission.get("question"), "allow")
+        self.assertEqual(permission.get("skill"), "allow")
+        self.assertEqual(permission.get("external_directory"), "deny")
+        self.assertEqual(permission.get("doom_loop"), "deny")
+        self.assertEqual(permission.get("webfetch"), "deny")
+        self.assertEqual(permission.get("websearch"), "deny")
+        self.assertEqual(permission.get("bash"), "deny")
+
+        task = permission.get("task")
+        self.assertIsInstance(task, dict)
+        allowed = {name for name, action in task.items() if action == "allow"}
+        self.assertEqual(
+            allowed,
+            {
+                "explore",
+                "explore-fallback",
+                "architect",
+                "architect-fallback",
+                "reviewer",
+                "reviewer-fallback",
+                "security-reviewer",
+                "security-reviewer-fallback",
+            },
+        )
+        self.assertEqual(task.get("*"), "deny")
+        for forbidden in (
+            "general",
+            "general-fallback",
+            "verifier",
+            "verifier-fallback",
+            "investigator",
+            "investigator-fallback",
+            "task-orchestrator",
+            "task-orchestrator-fallback",
+            "scout",
+            "scout-fallback",
+        ):
+            self.assertEqual(task.get(forbidden), "deny", forbidden)
+
+        lower = body.lower()
+        for phrase in (
+            "planning_initialization_handoff",
+            "execution_prerequisites",
+            "verification_handoff",
+            "unexecuted",
+            "never pass",
+            "do not run `just agent::doctor`",
+            "do not run `just agent::context`",
+            "do not run `just project::doctor`",
+            "do not edit files",
+            "do not delegate to `general`",
+            "do not delegate to `verifier`",
+            "do not delegate to `investigator`",
+            "do not delegate to `task-orchestrator`",
+        ):
+            self.assertIn(phrase, lower)
+
+
+    def test_opencode_debug_agent_plan_effective_policy_when_cli_available(self) -> None:
+        opencode = shutil.which("opencode")
+        if opencode is None:
+            self.skipTest("opencode CLI is not available")
+
+        source_project = ROOT / "templates" / "agent-base"
+        with tempfile.TemporaryDirectory(prefix="templates-56-opencode-") as directory:
+            project = Path(directory) / "agent-base"
+            shutil.copytree(source_project, project)
+            config = Path(directory) / "opencode"
+            agents = config / "agents"
+            agents.mkdir(parents=True)
+            (config / "opencode.json").write_text(
+                json.dumps(
+                    {
+                        "permission": {
+                            "task": {"*": "allow", "general": "allow", "verifier": "allow"},
+                            "bash": {"*": "allow"},
+                            "edit": "allow",
+                            "question": "deny",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (agents / "plan.md").write_text(
+                """---
+description: deliberately permissive global plan
+mode: primary
+model: openai/gpt-5.6-sol
+permission:
+  edit: allow
+  question: deny
+  task:
+    "*": allow
+    general: allow
+    verifier: allow
+  bash:
+    "*": allow
+---
+
+global permissive plan
+""",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["XDG_CONFIG_HOME"] = directory
+            env["OPENCODE_CONFIG_HOME"] = str(config)
+            result = subprocess.run(
+                [opencode, "debug", "agent", "plan", "--pure"],
+                cwd=project,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+        data = json.loads(result.stdout)
+        permissions = data["permission"]
+
+        def last_action(permission: str, pattern: str = "*") -> str:
+            matches = [
+                item["action"]
+                for item in permissions
+                if item["permission"] == permission and item.get("pattern") == pattern
+            ]
+            self.assertTrue(matches, f"missing {permission}:{pattern}")
+            return matches[-1]
+
+        self.assertEqual(data["description"], "Repository-local read-only planning agent")
+        self.assertEqual(data["mode"], "primary")
+        self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-5.6-sol"})
+        self.assertEqual(last_action("edit"), "deny")
+        self.assertEqual(last_action("question"), "allow")
+        self.assertEqual(last_action("bash"), "deny")
+        self.assertEqual(last_action("task"), "deny")
+        for allowed in (
+            "explore",
+            "explore-fallback",
+            "architect",
+            "architect-fallback",
+            "reviewer",
+            "reviewer-fallback",
+            "security-reviewer",
+            "security-reviewer-fallback",
+        ):
+            self.assertEqual(last_action("task", allowed), "allow", allowed)
+        for denied in (
+            "general",
+            "general-fallback",
+            "verifier",
+            "verifier-fallback",
+            "investigator",
+            "investigator-fallback",
+            "task-orchestrator",
+            "task-orchestrator-fallback",
+            "scout",
+            "scout-fallback",
+        ):
+            self.assertEqual(last_action("task", denied), "deny", denied)
 
     def test_leaf_agents_cannot_delegate(self) -> None:
         for filename in [f"{leaf}.md" for leaf in LEAF_PRIMARY_AGENTS]:

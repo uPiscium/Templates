@@ -13,6 +13,7 @@ TASK_EDGE_RE = re.compile(r"^\s{4}([a-z0-9-]+): allow\s*$", re.MULTILINE)
 class OpenCodeDiscoverySmokeTest(unittest.TestCase):
     def test_required_commands_and_skills_are_discoverable(self) -> None:
         for relative in (
+            "agents/plan.md",
             "commands/init.md",
             "commands/task-start.md",
             "commands/task-run.md",

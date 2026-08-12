@@ -74,6 +74,26 @@ class InitContractTest(unittest.TestCase):
             self.assertIn("initialize", text, name)
             self.assertIn("Stop if initialization fails", text, name)
 
+
+    def test_initialize_skill_preserves_full_init_and_defines_plan_handoff(self) -> None:
+        skill = (
+            ROOT
+            / "components"
+            / "agent-core"
+            / ".opencode"
+            / "skills"
+            / "initialize"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Full initialization for execution-capable", skill)
+        self.assertIn("Run `just agent::doctor`; stop on failure", skill)
+        self.assertIn("Run `just agent::context`; retain", skill)
+        self.assertIn("Run `just project::doctor`; stop on failure", skill)
+        self.assertIn("Planning-only initialization", skill)
+        self.assertIn("PLANNING_INITIALIZATION_HANDOFF", skill)
+        self.assertIn("execution_prerequisites", skill)
+        self.assertIn("UNEXECUTED", skill)
+
     def test_adapter_fragment_is_part_of_init_contract(self) -> None:
         core = (
             ROOT / "components" / "agent-core" / ".automation" / "INIT.md"
@@ -102,6 +122,7 @@ class InitContractTest(unittest.TestCase):
             ("components/agent-core/.opencode/commands/task-run.md", "templates/agent-base/.opencode/commands/task-run.md"),
             ("components/agent-core/.opencode/commands/task-batch.md", "templates/agent-base/.opencode/commands/task-batch.md"),
             ("components/agent-core/.opencode/agents/build.md", "templates/agent-base/.opencode/agents/build.md"),
+            ("components/agent-core/.opencode/agents/plan.md", "templates/agent-base/.opencode/agents/plan.md"),
             ("components/agent-core/.opencode/agents/task-orchestrator.md", "templates/agent-base/.opencode/agents/task-orchestrator.md"),
             ("components/agent-core/AGENTS.md", "templates/agent-base/AGENTS.md"),
         ]
