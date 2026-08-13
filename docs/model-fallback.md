@@ -24,14 +24,16 @@ The following failures do not trigger automatic fallback:
 - safety refusal
 - unclassified failures
 
-## Role-specific fallback split (Issue #47)
+## Role-specific fallback split
 
-The final role split is:
+Fallbacks cross token-quota families. Codex 5.6 variants share quota, so a 5.6-primary role falls back to Spark rather than another 5.6 model. Spark-primary leaf roles fall back to Luna.
 
-- `task-orchestrator` → **Spark** primary, automatic fallback to **Sol** only for classified usage/quota/rate-limit failures.
-- `general`, `explore`, `verifier` → **Luna** primary, automatic fallback to **Spark** only for classified usage/quota/rate-limit failures.
-- `scout` → **Luna** primary, automatic fallback to **Terra** only for classified usage/quota/rate-limit failures.
-- `reviewer`, `investigator`, `security-reviewer` remain as configured (`Terra` in the baseline allocation).
+The role split is:
+
+- `task-orchestrator` → **Spark** primary, automatic fallback to **Sol**.
+- `general`, `explore`, `verifier`, `scout` → **Spark** primary, automatic fallback to **Luna**.
+- `architect`, `reviewer`, `investigator`, `security-reviewer` → their existing 5.6 primary, automatic fallback to **Spark**.
+- `build` → **Sol** primary, manual fallback to **Spark**.
 
 ## Main Orchestrator
 

@@ -2,7 +2,7 @@
 description: Usage-limit fallback for root-cause investigation
 mode: subagent
 hidden: true
-model: openai/gpt-5.6-sol
+model: openai/gpt-5.3-codex-spark
 permission:
   edit: deny
   task: deny

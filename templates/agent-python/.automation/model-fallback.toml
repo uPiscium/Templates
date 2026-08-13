@@ -29,14 +29,14 @@ non_fallback_markers = [
 primary_agent = "build"
 primary_model = "openai/gpt-5.6-sol"
 fallback_agents = ["build-fallback"]
-fallback_models = ["openai/gpt-5.6-terra"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = false
 
 [roles.architect]
 primary_agent = "architect"
 primary_model = "openai/gpt-5.6-sol"
 fallback_agents = ["architect-fallback"]
-fallback_models = ["openai/gpt-5.6-terra"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = true
 
 [roles.task-orchestrator]
@@ -48,49 +48,49 @@ automatic = true
 
 [roles.general]
 primary_agent = "general"
-primary_model = "openai/gpt-5.6-luna"
+primary_model = "openai/gpt-5.3-codex-spark"
 fallback_agents = ["general-fallback"]
-fallback_models = ["openai/gpt-5.3-codex-spark"]
+fallback_models = ["openai/gpt-5.6-luna"]
 automatic = true
 
 [roles.explore]
 primary_agent = "explore"
-primary_model = "openai/gpt-5.6-luna"
+primary_model = "openai/gpt-5.3-codex-spark"
 fallback_agents = ["explore-fallback"]
-fallback_models = ["openai/gpt-5.3-codex-spark"]
+fallback_models = ["openai/gpt-5.6-luna"]
 automatic = true
 
 [roles.verifier]
 primary_agent = "verifier"
-primary_model = "openai/gpt-5.6-luna"
+primary_model = "openai/gpt-5.3-codex-spark"
 fallback_agents = ["verifier-fallback"]
-fallback_models = ["openai/gpt-5.3-codex-spark"]
+fallback_models = ["openai/gpt-5.6-luna"]
 automatic = true
 
 [roles.reviewer]
 primary_agent = "reviewer"
 primary_model = "openai/gpt-5.6-terra"
 fallback_agents = ["reviewer-fallback"]
-fallback_models = ["openai/gpt-5.6-sol"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = true
 
 [roles.investigator]
 primary_agent = "investigator"
 primary_model = "openai/gpt-5.6-terra"
 fallback_agents = ["investigator-fallback"]
-fallback_models = ["openai/gpt-5.6-sol"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = true
 
 [roles.security-reviewer]
 primary_agent = "security-reviewer"
 primary_model = "openai/gpt-5.6-terra"
 fallback_agents = ["security-reviewer-fallback"]
-fallback_models = ["openai/gpt-5.6-sol"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = true
 
 [roles.scout]
 primary_agent = "scout"
-primary_model = "openai/gpt-5.6-luna"
+primary_model = "openai/gpt-5.3-codex-spark"
 fallback_agents = ["scout-fallback"]
-fallback_models = ["openai/gpt-5.6-terra"]
+fallback_models = ["openai/gpt-5.6-luna"]
 automatic = true

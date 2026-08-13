@@ -1,7 +1,7 @@
 ---
 description: Read-only repository exploration and reference tracing
 mode: subagent
-model: openai/gpt-5.6-luna
+model: openai/gpt-5.3-codex-spark
 permission:
   edit: deny
   task: deny
