@@ -26,6 +26,16 @@ class CppCMakeAdapterContractTest(unittest.TestCase):
         self.assertIn("build: configure cmake::build", text)
         self.assertIn("test: build tests::all", text)
 
+    def test_doctor_uses_configured_cxx_with_generic_fallback(self) -> None:
+        for adapter in (
+            ROOT / "components" / "adapters" / "cpp-cmake",
+            ROOT / "templates" / "agent-cpp-cmake",
+        ):
+            project = (adapter / "just" / "project" / "mod.just").read_text(encoding="utf-8")
+            self.assertIn('compiler="${CXX:-c++}"', project)
+            self.assertIn('command -v "$compiler"', project)
+            self.assertNotIn("command -v clang++", project)
+
     def test_worktree_local_build_and_no_clean_api(self) -> None:
         preset = json.loads((ROOT / "components" / "adapters" / "cpp-cmake" / "CMakePresets.json").read_text())
         self.assertEqual(preset["configurePresets"][0]["binaryDir"], "${sourceDir}/.build/default")
