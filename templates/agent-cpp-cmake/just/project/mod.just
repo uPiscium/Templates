@@ -15,7 +15,7 @@ doctor:
     @test -f CMakeLists.txt
     @command -v cmake >/dev/null
     @command -v ninja >/dev/null
-    @command -v clang++ >/dev/null
+    @compiler="${CXX:-c++}"; command -v "$compiler" >/dev/null
     @command -v clang-format >/dev/null
     @command -v clang-tidy >/dev/null
     @command -v ctest >/dev/null

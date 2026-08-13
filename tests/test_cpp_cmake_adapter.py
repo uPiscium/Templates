@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -25,6 +29,47 @@ class CppCMakeAdapterContractTest(unittest.TestCase):
         self.assertIn("lint: configure quality::lint", text)
         self.assertIn("build: configure cmake::build", text)
         self.assertIn("test: build tests::all", text)
+
+    def test_doctor_uses_configured_cxx_with_generic_fallback(self) -> None:
+        for adapter in (
+            ROOT / "components" / "adapters" / "cpp-cmake",
+            ROOT / "templates" / "agent-cpp-cmake",
+        ):
+            project = (adapter / "just" / "project" / "mod.just").read_text(encoding="utf-8")
+            self.assertIn('compiler="${CXX:-c++}"', project)
+            self.assertIn('command -v "$compiler"', project)
+            self.assertNotIn("command -v clang++", project)
+
+    def test_doctor_honors_configured_cxx_and_empty_value_fallback(self) -> None:
+        just = shutil.which("just")
+        self.assertIsNotNone(just, "just is required for the runtime adapter test")
+        assert just is not None
+
+        template = ROOT / "templates" / "agent-cpp-cmake"
+        for cxx, compiler in (("selected-cxx", "selected-cxx"), (None, "c++"), ("", "c++")):
+            with self.subTest(CXX=cxx), tempfile.TemporaryDirectory() as directory:
+                fake_bin = Path(directory)
+                (fake_bin / "sh").symlink_to("/bin/sh")
+                tools = ("cmake", "ninja", "clang-format", "clang-tidy", "ctest", compiler)
+                for tool in tools:
+                    shim = fake_bin / tool
+                    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    shim.chmod(0o755)
+
+                environment = os.environ.copy()
+                environment["PATH"] = str(fake_bin)
+                if cxx is None:
+                    environment.pop("CXX", None)
+                else:
+                    environment["CXX"] = cxx
+                result = subprocess.run(
+                    [just, "project::doctor"],
+                    cwd=template,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_worktree_local_build_and_no_clean_api(self) -> None:
         preset = json.loads((ROOT / "components" / "adapters" / "cpp-cmake" / "CMakePresets.json").read_text())
