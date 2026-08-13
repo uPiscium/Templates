@@ -79,6 +79,15 @@ jobs:
           cd "$target"
           nix develop --command just project::doctor
           nix develop --command just project::check
+          if [ "${{ matrix.template }}" = agent-cpp-cmake ]; then
+            nix develop --command env CXX=c++ just project::doctor
+            if nix develop --command env CXX=definitely-not-a-cxx-compiler just project::doctor; then
+              echo 'doctor unexpectedly accepted missing CXX' >&2
+              exit 1
+            fi
+            nix develop --command env -u CXX just project::doctor
+            nix develop --command env CXX= just project::doctor
+          fi
       - name: Python inherited worktree environment smoke
         if: matrix.template == 'agent-python'
         shell: bash
