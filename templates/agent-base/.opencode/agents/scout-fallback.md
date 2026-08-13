@@ -2,7 +2,7 @@
 description: Usage-limit fallback for external primary-source research
 mode: subagent
 hidden: true
-model: openai/gpt-5.6-terra
+model: openai/gpt-5.6-luna
 permission:
   edit: deny
   task: deny

@@ -2,7 +2,7 @@
 description: Manual usage-limit fallback for Main Orchestrator with identical authority
 mode: primary
 hidden: true
-model: openai/gpt-5.6-terra
+model: openai/gpt-5.3-codex-spark
 permission:
   edit: deny
   task:

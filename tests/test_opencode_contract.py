@@ -256,49 +256,49 @@ class OpenCodeContractTest(unittest.TestCase):
             "build.md": "openai/gpt-5.6-sol",
             "plan.md": "openai/gpt-5.6-sol",
             "task-orchestrator.md": "openai/gpt-5.3-codex-spark",
-            "general.md": "openai/gpt-5.6-luna",
-            "explore.md": "openai/gpt-5.6-luna",
-            "verifier.md": "openai/gpt-5.6-luna",
+            "general.md": "openai/gpt-5.3-codex-spark",
+            "explore.md": "openai/gpt-5.3-codex-spark",
+            "verifier.md": "openai/gpt-5.3-codex-spark",
             "reviewer.md": "openai/gpt-5.6-terra",
             "investigator.md": "openai/gpt-5.6-terra",
             "security-reviewer.md": "openai/gpt-5.6-terra",
-            "scout.md": "openai/gpt-5.6-luna",
+            "scout.md": "openai/gpt-5.3-codex-spark",
             "architect.md": "openai/gpt-5.6-sol",
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
 
-    def test_task_orchestrator_is_only_spark_primary(self) -> None:
+    def test_spark_primary_agents(self) -> None:
         spark_primaries = {
             path.name
             for path in AGENTS.glob("*.md")
             if not path.name.endswith("-fallback.md")
             and "model: openai/gpt-5.3-codex-spark" in frontmatter(path)
         }
-        self.assertEqual(spark_primaries, {"task-orchestrator.md"})
+        self.assertEqual(spark_primaries, {"task-orchestrator.md", "general.md", "explore.md", "verifier.md", "scout.md"})
 
-    def test_luna_primary_agents(self) -> None:
-        expected_luna = {
-            "general.md",
-            "explore.md",
-            "verifier.md",
-            "scout.md",
+    def test_spark_leaf_fallback_agents(self) -> None:
+        expected_luna_fallback = {
+            "general-fallback.md",
+            "explore-fallback.md",
+            "verifier-fallback.md",
+            "scout-fallback.md",
         }
-        for filename in expected_luna:
+        for filename in expected_luna_fallback:
             self.assertIn("model: openai/gpt-5.6-luna", frontmatter(AGENTS / filename), filename)
 
     def test_fallback_model_assignment_is_exact(self) -> None:
         expected = {
-            "build-fallback.md": "openai/gpt-5.6-terra",
-            "architect-fallback.md": "openai/gpt-5.6-terra",
+            "build-fallback.md": "openai/gpt-5.3-codex-spark",
+            "architect-fallback.md": "openai/gpt-5.3-codex-spark",
             "task-orchestrator-fallback.md": "openai/gpt-5.6-sol",
-            "general-fallback.md": "openai/gpt-5.3-codex-spark",
-            "explore-fallback.md": "openai/gpt-5.3-codex-spark",
-            "verifier-fallback.md": "openai/gpt-5.3-codex-spark",
-            "reviewer-fallback.md": "openai/gpt-5.6-sol",
-            "investigator-fallback.md": "openai/gpt-5.6-sol",
-            "security-reviewer-fallback.md": "openai/gpt-5.6-sol",
-            "scout-fallback.md": "openai/gpt-5.6-terra",
+            "general-fallback.md": "openai/gpt-5.6-luna",
+            "explore-fallback.md": "openai/gpt-5.6-luna",
+            "verifier-fallback.md": "openai/gpt-5.6-luna",
+            "reviewer-fallback.md": "openai/gpt-5.3-codex-spark",
+            "investigator-fallback.md": "openai/gpt-5.3-codex-spark",
+            "security-reviewer-fallback.md": "openai/gpt-5.3-codex-spark",
+            "scout-fallback.md": "openai/gpt-5.6-luna",
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
