@@ -1,6 +1,8 @@
 version = 1
 
 preserve_existing = [
+  "README.md",
+  ".envrc",
   "flake.nix",
   "flake.lock",
 ]

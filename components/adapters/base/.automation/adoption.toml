@@ -4,6 +4,7 @@ version = 1
 # language-neutral base adapter. Agent Core remains responsible for its own
 # automation files and public Just modules.
 preserve_existing = [
+  "README.md",
   "flake.nix",
   "flake.lock",
 ]
