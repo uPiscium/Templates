@@ -92,6 +92,47 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertFalse(result["pushPerformed"])
         self.assertFalse(result["mergePerformed"])
 
+    def test_cpp_cmake_apply_preserves_repository_readme_and_envrc(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        readme = "# Existing Project\n"
+        envrc = "use flake\n"
+        (repo / "CMakeLists.txt").write_text(
+            "cmake_minimum_required(VERSION 3.20)\nproject(existing)\n",
+            encoding="utf-8",
+        )
+        (repo / "README.md").write_text(readme, encoding="utf-8")
+        (repo / ".envrc").write_text(envrc, encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "cpp-cmake")
+        actions = {action["path"]: action["action"] for action in plan["actions"]}
+
+        self.assertEqual(actions["README.md"], "preserve")
+        self.assertEqual(actions[".envrc"], "preserve")
+        self.assertFalse(any("README.md" in blocker for blocker in plan["blockers"]))
+        self.assertFalse(any(".envrc" in blocker for blocker in plan["blockers"]))
+        self.assertTrue(plan["canApply"], plan["blockers"])
+
+        result = adopt_repository.apply_plan(ROOT, repo, "cpp-cmake")
+
+        self.assertTrue(result["applied"])
+        self.assertEqual((repo / "README.md").read_text(encoding="utf-8"), readme)
+        self.assertEqual((repo / ".envrc").read_text(encoding="utf-8"), envrc)
+        self.assertEqual((repo / ".automation" / "ADAPTER").read_text().strip(), "cpp-cmake")
+        self.assertTrue((repo / ".automation" / "VERSION").is_file())
+
+    def test_repository_owned_path_policy_is_consistent_across_adapters(self) -> None:
+        for adapter in ("base", "cpp-cmake", "python", "rust", "nix"):
+            with self.subTest(adapter=adapter):
+                policy = adopt_repository.load_policy(ROOT, adapter)
+                self.assertIn("README.md", policy["preserve_existing"])
+
+        for adapter in ("cpp-cmake", "python", "rust", "nix"):
+            with self.subTest(adapter=adapter):
+                policy = adopt_repository.load_policy(ROOT, adapter)
+                self.assertIn(".envrc", policy["preserve_existing"])
+
     def test_plan_reports_preserved_old_just_environment_prerequisite(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)

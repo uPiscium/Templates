@@ -1,11 +1,12 @@
 version = 1
 
 preserve_existing = [
+  "README.md",
+  ".envrc",
   "Cargo.toml",
   "Cargo.lock",
   "flake.nix",
   "flake.lock",
-  ".envrc",
   ".pre-commit-config.yaml",
 ]
 

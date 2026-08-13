@@ -1,6 +1,8 @@
 version = 1
 
 preserve_existing = [
+  "README.md",
+  ".envrc",
   "CMakeLists.txt",
   "CMakePresets.json",
   "cmake/**",
