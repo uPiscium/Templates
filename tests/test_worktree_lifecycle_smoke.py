@@ -100,11 +100,18 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.assertIn("project permission mismatch", project_authority_mismatch.stderr)
         main_config.write_text(original_main_config_text, encoding="utf-8")
 
-        task_policy_text = original_task_policy_text.replace(
-            'fallback_models = ["openai/gpt-5.6-luna"]',
+        general_policy = '''[roles.general]
+primary_agent = "general"
+primary_model = "openai/gpt-5.6-luna"
+fallback_agents = ["general-fallback"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
+automatic = true'''
+        terra_general_policy = general_policy.replace(
+            'fallback_models = ["openai/gpt-5.3-codex-spark"]',
             'fallback_models = ["openai/gpt-5.6-terra"]',
-            1,
         )
+        self.assertIn(general_policy, original_task_policy_text)
+        task_policy_text = original_task_policy_text.replace(general_policy, terra_general_policy)
         task_policy.write_text(task_policy_text, encoding="utf-8")
 
         mismatch = run(
@@ -130,7 +137,7 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         task_agent = worktree / ".opencode" / "agents" / "general-fallback.md"
         original_task_agent_text = task_agent.read_text(encoding="utf-8")
         task_agent.write_text(
-            original_task_agent_text.replace("model: openai/gpt-5.6-luna", "model: openai/gpt-5.6-terra"),
+            original_task_agent_text.replace("model: openai/gpt-5.3-codex-spark", "model: openai/gpt-5.6-terra"),
             encoding="utf-8",
         )
         main_mismatch = run(
@@ -140,7 +147,7 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.assertNotEqual(main_mismatch.returncode, 0)
         self.assertIn(f"root={self.repo}", main_mismatch.stderr)
         main_agent.write_text(
-            original_main_agent_text.replace("model: openai/gpt-5.6-luna", "model: openai/gpt-5.6-terra"),
+            original_main_agent_text.replace("model: openai/gpt-5.3-codex-spark", "model: openai/gpt-5.6-terra"),
             encoding="utf-8",
         )
         registered = run(
@@ -160,8 +167,8 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
         recovery = json.loads(started.stdout)
         self.assertEqual(recovery["routing"]["task-orchestrator"], "task-orchestrator-fallback")
-        self.assertEqual(recovery["routing"]["general"], "general-fallback")
-        self.assertEqual(recovery["routes"]["general"]["model"], "openai/gpt-5.6-terra")
+        self.assertEqual(recovery["routing"]["general"], "general")
+        self.assertEqual(recovery["routes"]["general"]["model"], "openai/gpt-5.6-luna")
         self.assertEqual(recovery["recoverable_work_units"][0]["id"], "WU-1")
         self.assertEqual(recovery["recoverable_work_units"][0]["objective"], "Implement the bounded recovery fixture")
         late_unit = run(
@@ -184,8 +191,8 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         task_route = run(
             "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=worktree, env=self.env
         )
-        self.assertEqual(json.loads(main_route.stdout)["selected"], "general-fallback")
-        self.assertEqual(json.loads(main_route.stdout)["model"], "openai/gpt-5.6-terra")
+        self.assertEqual(json.loads(main_route.stdout)["selected"], "general")
+        self.assertEqual(json.loads(main_route.stdout)["model"], "openai/gpt-5.6-luna")
         self.assertEqual(json.loads(task_route.stdout), json.loads(main_route.stdout))
         main_config.write_text(
             original_main_config_text.replace(
@@ -221,8 +228,8 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         route = run(
             "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
         )
-        self.assertEqual(json.loads(route.stdout)["selected"], "general-fallback")
-        self.assertEqual(json.loads(route.stdout)["model"], "openai/gpt-5.6-terra")
+        self.assertEqual(json.loads(route.stdout)["selected"], "general")
+        self.assertEqual(json.loads(route.stdout)["model"], "openai/gpt-5.6-luna")
         unknown_unit = run(
             "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-2",
             work_unit["semantic_sha256"], "completed", cwd=worktree, check=False, env=self.env,
@@ -266,8 +273,8 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
             work_unit["semantic_sha256"], "completed",
             cwd=worktree, env=self.env,
         )
-        self.assertEqual(json.loads(recorded.stdout)["selected_agent"], "general-fallback")
-        self.assertEqual(json.loads(recorded.stdout)["selected_model"], "openai/gpt-5.6-terra")
+        self.assertEqual(json.loads(recorded.stdout)["selected_agent"], "general")
+        self.assertEqual(json.loads(recorded.stdout)["selected_model"], "openai/gpt-5.6-luna")
         persisted_unit = run(
             "python3", str(self.script), "work-unit-status", "TASK-1", "WU-1", cwd=worktree, env=self.env
         )
@@ -279,17 +286,27 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.assertNotEqual(reopen.returncode, 0)
         self.assertIn("invalid Work Unit transition", reopen.stderr)
 
-        exhausted_policy = task_policy.read_text(encoding="utf-8").replace(
-            'fallback_agents = ["general-fallback"]',
+        verifier_policy = '''[roles.verifier]
+primary_agent = "verifier"
+primary_model = "openai/gpt-5.3-codex-spark"
+fallback_agents = ["verifier-fallback"]
+fallback_models = ["openai/gpt-5.6-luna"]
+automatic = true'''
+        exhausted_verifier_policy = verifier_policy.replace(
+            'fallback_agents = ["verifier-fallback"]',
             "fallback_agents = []",
         ).replace(
-            'fallback_models = ["openai/gpt-5.6-terra"]',
+            'fallback_models = ["openai/gpt-5.6-luna"]',
             "fallback_models = []",
-            1,
+        )
+        current_task_policy_text = task_policy.read_text(encoding="utf-8")
+        self.assertIn(verifier_policy, current_task_policy_text)
+        exhausted_policy = current_task_policy_text.replace(
+            verifier_policy, exhausted_verifier_policy
         )
         task_policy.write_text(exhausted_policy, encoding="utf-8")
         exhausted = run(
-            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+            "python3", str(self.script), "recovery-route", "TASK-1", "verifier", cwd=self.repo, env=self.env
         )
         self.assertEqual(json.loads(exhausted.stdout)["status"], "BLOCKED")
         task_policy.write_text(original_task_policy_text, encoding="utf-8")
