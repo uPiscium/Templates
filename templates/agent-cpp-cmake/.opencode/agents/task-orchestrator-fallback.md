@@ -29,6 +29,11 @@ permission:
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
     "just agent::fallback-record *": allow
+    "just agent::recovery-start *": deny
+    "just agent::recovery-status *": allow
+    "just agent::recovery-route *": allow
+    "just agent::recovery-record *": allow
+    "just agent::recovery-clear *": deny
     "just integrate::check *": deny
     "just integrate::merge *": deny
 ---
@@ -44,3 +49,5 @@ Fallback operates with the same escalation contract as `task-orchestrator`:
 - a user-rejected Depth-1 permission decision is final for that exact operation within the Task. Record the tool/permission result; never retry, rephrase, re-delegate, or substitute an equivalent operation to verify or bypass the rejection.
 - never report an unexecuted Work Unit, Ask, or permission decision as `PASS` evidence.
 - for `NEEDS_DECISION`, resolve from the Task Contract/evidence when possible; otherwise call `question` from this Depth-1 session with options, tradeoffs, known facts, and a recommendation, then apply the answer and continue.
+
+When recovery context is present, call the read-only `recovery-route` API before every leaf delegation and launch the exact selected variant directly. Never launch the unavailable-family primary first. For Spark-unavailable recovery, use the policy-selected general, explore, verifier, or scout fallback directly. Preserve the same Task, worktree, Work Unit semantic/ID, role authority, and constraints; record outcomes with guarded `recovery-record`. Unknown recovery state or chain exhaustion is BLOCKED. Never permission-launder.

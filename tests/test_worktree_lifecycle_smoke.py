@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import tempfile
@@ -65,11 +66,38 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
         self.assertNotEqual(duplicate.returncode, 0)
 
+        started = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark", cwd=self.repo, env=self.env
+        )
+        recovery = json.loads(started.stdout)
+        self.assertEqual(recovery["routing"]["task-orchestrator"], "task-orchestrator-fallback")
+        self.assertEqual(recovery["routing"]["general"], "general-fallback")
+        state_text = state.read_text(encoding="utf-8")
+        self.assertIn("operator-asserted usage-limit observation (runtime unverified)", state_text)
+        self.assertNotIn("reason=genuine usage-limit observation", state_text)
+        route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+        )
+        self.assertEqual(json.loads(route.stdout)["selected"], "general-fallback")
+        recovery_path = worktree / ".task-state" / "recovery.json"
+        tampered = json.loads(recovery_path.read_text(encoding="utf-8"))
+        tampered["routes"]["general"]["agent"] = "general"
+        recovery_path.write_text(json.dumps(tampered), encoding="utf-8")
+        route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+        )
+        self.assertEqual(json.loads(route.stdout)["selected"], "general-fallback")
+        run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1", "completed",
+            cwd=worktree, env=self.env,
+        )
+        run("python3", str(self.script), "recovery-clear", "TASK-1", cwd=self.repo, env=self.env)
+        self.assertFalse((worktree / ".task-state" / "recovery.json").exists())
+
         run("python3", str(self.script), "state-set", "TASK-1", "cancelled", cwd=worktree, env=self.env)
         cleanup = run("python3", str(self.script), "cleanup", "TASK-1", cwd=self.repo, env=self.env)
         self.assertIn('"taskStateDiscarded": true', cleanup.stdout)
         self.assertFalse(worktree.exists())
-
 
 if __name__ == "__main__":
     unittest.main()

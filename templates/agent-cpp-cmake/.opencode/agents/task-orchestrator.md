@@ -29,6 +29,11 @@ permission:
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
     "just agent::fallback-record *": allow
+    "just agent::recovery-start *": deny
+    "just agent::recovery-status *": allow
+    "just agent::recovery-route *": allow
+    "just agent::recovery-record *": allow
+    "just agent::recovery-clear *": deny
     "just integrate::check *": deny
     "just integrate::merge *": deny
 ---
@@ -54,5 +59,7 @@ On `NEEDS_APPROVAL` / `NEEDS_DECISION`, this orchestrator is the approval and de
 Route repository exploration and reference tracing to `explore`, bounded implementation to `general`, and project-standard verification to `verifier`. Do not spend long stretches executing implementation, exploration, or verification that a leaf can complete. Do not create unnecessary agent calls merely to shift model usage; preserve bounded, non-overlapping Work Unit granularity.
 
 When a leaf invocation fails because of a usage/quota/rate-limit condition listed in `.automation/model-fallback.toml`, retry the identical Work Unit once with the configured fallback agent variant. Record the failed model, classified reason, selected fallback model, and result in Task State. Do not fallback for authentication, permission, validation, context-window, tool, or safety failures. Do not invent a fallback not listed in policy; when the chain is exhausted, set the Task BLOCKED.
+
+Prompt-level retry is best-effort only. If an active recovery state exists, call the read-only `recovery-route` API and use its exact selected agent directly; do not launch the unavailable-family primary first. Recovery keeps the same Task, worktree, Work Unit semantic/ID, and role authority. Record each outcome with guarded `recovery-record`; unknown state or chain exhaustion is BLOCKED. Never permission-launder a leaf request.
 
 Never invoke another Task Orchestrator. Never merge. Never operate on sibling Task worktrees. Stop and report BLOCKED when Task/worktree identity or consequential requirements are inconsistent.

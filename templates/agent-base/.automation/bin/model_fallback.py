@@ -61,6 +61,27 @@ def role_chain(role: str, cfg: dict) -> dict:
     }
 
 
+def model_family(model: str, cfg: dict) -> str | None:
+    matches = [family for family, models in cfg.get("families", {}).items() if model in models]
+    return matches[0] if len(matches) == 1 else None
+
+
+def recovery_route(role: str, unavailable_family: str, cfg: dict) -> dict:
+    if unavailable_family not in cfg.get("families", {}):
+        chain = role_chain(role, cfg)
+        return {"status": "BLOCKED", "reason": "unknown model family", **chain}
+    chain = role_chain(role, cfg)
+    for agent, model in zip(chain["agents"], chain["models"]):
+        family = model_family(model, cfg)
+        if family is None:
+            return {"status": "BLOCKED", "reason": "unknown model family", **chain}
+        if family != unavailable_family:
+            return {"status": "fallback" if agent != chain["agents"][0] else "primary",
+                    "role": role, "agent": agent, "model": model,
+                    "family": family, "reason": f"{unavailable_family} unavailable", **chain}
+    return {"status": "BLOCKED", "reason": "fallback chain exhausted", **chain}
+
+
 def next_fallback(role: str, failed_agent: str, cfg: dict) -> dict:
     chain = role_chain(role, cfg)
     if not chain["automatic"]:
@@ -81,6 +102,17 @@ def next_fallback(role: str, failed_agent: str, cfg: dict) -> dict:
 
 
 def append_evidence(root: Path, role: str, failed_model: str, fallback_model: str, reason: str, outcome: str) -> None:
+    cfg = policy(root)
+    chain = role_chain(role, cfg)
+    if failed_model not in chain["models"] or fallback_model not in chain["models"]:
+        raise FallbackError("fallback evidence models must belong to the configured role chain")
+    failed_index = chain["models"].index(failed_model)
+    if failed_index + 1 >= len(chain["models"]) or chain["models"][failed_index + 1] != fallback_model:
+        raise FallbackError("fallback evidence models are not adjacent in the configured role chain")
+    classified = classify(reason, None, cfg)
+    if not classified["fallback"]:
+        raise FallbackError("fallback evidence reason is not a classified usage-limit condition")
+    reason_code = classified["reason"]
     state = root / ".task-state" / "task.md"
     if not state.is_file():
         raise FallbackError("Task State is required to record automatic fallback evidence")
@@ -88,7 +120,7 @@ def append_evidence(root: Path, role: str, failed_model: str, fallback_model: st
     heading = "### Model fallback"
     entry = (
         f"\n- Role: {role}; failed model: {failed_model}; fallback model: {fallback_model}; "
-        f"reason: {reason}; outcome: {outcome}\n"
+        f"reason: {reason_code}; outcome: {outcome}\n"
     )
     if heading in text:
         text = text.replace(heading, heading + entry, 1)
@@ -108,6 +140,9 @@ def parser() -> argparse.ArgumentParser:
     n = sub.add_parser("next")
     n.add_argument("role")
     n.add_argument("failed_agent")
+    rr = sub.add_parser("route")
+    rr.add_argument("role")
+    rr.add_argument("family")
     r = sub.add_parser("record")
     r.add_argument("role")
     r.add_argument("failed_model")
@@ -126,6 +161,8 @@ def main() -> int:
             print(json.dumps(classify(args.text, args.status, cfg)))
         elif args.command == "next":
             print(json.dumps(next_fallback(args.role, args.failed_agent, cfg)))
+        elif args.command == "route":
+            print(json.dumps(recovery_route(args.role, args.family, cfg)))
         elif args.command == "record":
             append_evidence(root, args.role, args.failed_model, args.fallback_model, args.reason, args.outcome)
             print(json.dumps({"recorded": True}))

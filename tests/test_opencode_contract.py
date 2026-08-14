@@ -612,6 +612,41 @@ global permissive plan
             expected_task_targets.add(f"{leaf}-fallback")
         self.assertEqual(set(task_permissions), expected_task_targets)
 
+    def test_recovery_contract_and_authority_parity(self) -> None:
+        primary = permission_for("task-orchestrator")
+        fallback = permission_for("task-orchestrator-fallback")
+        self.assertEqual(primary, fallback)
+        for command in (
+            "just agent::recovery-status *",
+            "just agent::recovery-route *",
+            "just agent::recovery-record *",
+        ):
+            self.assertEqual(primary["bash"].get(command), "allow", command)
+        for command in ("just agent::recovery-start *", "just agent::recovery-clear *"):
+            self.assertEqual(primary["bash"].get(command), "deny", command)
+
+        recover = (CORE / ".opencode" / "commands" / "task-recover.md").read_text()
+        self.assertIn("task-recovery", recover)
+        self.assertIn("$ARGUMENTS", recover)
+        self.assertNotIn("task-orchestrator", recover.lower())
+        skill = (CORE / ".opencode" / "skills" / "task-recovery" / "SKILL.md").read_text().lower()
+        for phrase in (
+            "recovery-start",
+            "recovery-status",
+            "recovery-route",
+            "recovery-record",
+            "same task/worktree",
+            "work unit semantic/id",
+            "never launch an unavailable-family primary first",
+            "integration-pending",
+            "blocked",
+        ):
+            self.assertIn(phrase, skill)
+        fallback_body = body_text("task-orchestrator-fallback").lower()
+        self.assertIn("before every leaf delegation", fallback_body)
+        self.assertIn("never launch the unavailable-family primary first", fallback_body)
+        self.assertIn("permission-launder", fallback_body)
+
 
 if __name__ == "__main__":
     unittest.main()

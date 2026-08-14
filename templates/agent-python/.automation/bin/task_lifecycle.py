@@ -2,15 +2,20 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import importlib.util
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+WORK_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+RECOVERY_OUTCOMES = {"completed", "blocked", "needs-approval", "needs-decision", "failed"}
 VALID_STATES = {
     "initialized",
     "researching",
@@ -211,6 +216,181 @@ def state_path(worktree: Path) -> Path:
     return worktree / ".task-state" / "task.md"
 
 
+def recovery_path(worktree: Path) -> Path:
+    return worktree / ".task-state" / "recovery.json"
+
+
+def fallback_module(root: Path):
+    path = root / ".automation" / "bin" / "model_fallback.py"
+    if not path.is_file():
+        raise LifecycleError(f"missing fallback policy helper: {path}")
+    spec = importlib.util.spec_from_file_location("model_fallback_recovery", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        json.dump(value, handle, sort_keys=True)
+        handle.write("\n")
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def append_recovery_evidence(path: Path, line: str) -> None:
+    text = path.read_text(encoding="utf-8")
+    heading = "### Model fallback recovery"
+    if heading in text:
+        text = text.replace(heading, heading + "\n- " + line, 1)
+    elif "## Evidence" in text:
+        text = text.replace("## Evidence", "## Evidence\n\n" + heading + "\n- " + line, 1)
+    else:
+        text += "\n## Evidence\n\n" + heading + "\n- " + line
+    path.write_text(text, encoding="utf-8")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def validate_recovery_identity(value: dict, record: WorktreeRecord, task: str) -> None:
+    expected = {
+        "task_id": task,
+        "worktree": str(record.path),
+        "branch": record.branch,
+        "active": True,
+        "reason": "usage_limit",
+        "source": "operator",
+    }
+    mismatches = [key for key, expected_value in expected.items() if value.get(key) != expected_value]
+    if mismatches:
+        raise LifecycleError("recovery state identity mismatch: " + ", ".join(mismatches))
+
+
+def recovery_start(root: Path, task: str, family: str) -> None:
+    require_main_worktree(root)
+    record = worktree_for_task(root, task)
+    assert_task_identity(record, task)
+    status = state_status(state_path(record.path))
+    if status in TERMINAL_STATES:
+        raise LifecycleError(f"recovery requires nonterminal Task State, found {status}")
+    cfg = fallback_module(root).policy(root)
+    if family not in cfg.get("families", {}):
+        raise LifecycleError(f"unknown model family: {family}")
+    path = recovery_path(record.path)
+    if path.exists():
+        raise LifecycleError(f"recovery state already exists for {task}; clear it explicitly first")
+    helper = fallback_module(root)
+    routes = {role: helper.recovery_route(role, family, cfg) for role in cfg.get("roles", {})}
+    orchestrator = routes.get("task-orchestrator")
+    if not orchestrator or orchestrator.get("status") == "BLOCKED":
+        raise LifecycleError("recovery Task Orchestrator route is BLOCKED")
+    now = utc_now()
+    value = {
+        "schema_version": 1,
+        "active": True,
+        "reason": "usage_limit",
+        "source": "operator",
+        "task_id": task,
+        "worktree": str(record.path),
+        "branch": record.branch,
+        "started_at": now,
+        "updated_at": now,
+        "unavailable_family": family,
+        "routing": {role: route.get("agent") for role, route in routes.items() if route.get("agent")},
+        "routes": routes,
+        "events": [],
+    }
+    atomic_json(path, value)
+    append_recovery_evidence(
+        state_path(record.path),
+        f"started task={task}; reason=operator-asserted usage-limit observation (runtime unverified); "
+        f"unavailable_family={family}; "
+        f"task_orchestrator={orchestrator['agent']}; model={orchestrator['model']}; routing="
+        + ",".join(f"{role}->{agent}" for role, agent in sorted(value["routing"].items())),
+    )
+    print(json.dumps(value, sort_keys=True))
+
+
+def recovery_read(root: Path, task: str) -> tuple[WorktreeRecord, dict]:
+    current, main = current_worktree(root), main_worktree(root)
+    record = worktree_for_task(root, task)
+    if current.path not in {main.path, record.path}:
+        raise LifecycleError(f"cannot inspect sibling Task worktree {record.path} from {current.path}")
+    assert_task_identity(record, task)
+    path = recovery_path(record.path)
+    if not path.is_file():
+        raise LifecycleError(f"no active recovery state for {task}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LifecycleError(f"invalid recovery state JSON: {path}") from exc
+    validate_recovery_identity(value, record, task)
+    return record, value
+
+
+def recovery_status(root: Path, task: str) -> None:
+    _, value = recovery_read(root, task)
+    if not value.get("active"):
+        raise LifecycleError(f"no active recovery state for {task}")
+    print(json.dumps(value, sort_keys=True))
+
+
+def recovery_route(root: Path, task: str, role: str) -> None:
+    _, value = recovery_read(root, task)
+    if not value.get("active"):
+        raise LifecycleError(f"no active recovery state for {task}")
+    helper = fallback_module(root)
+    try:
+        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(root))
+    except helper.FallbackError as exc:
+        raise LifecycleError(str(exc)) from exc
+    print(json.dumps({"role": role, "primary": route["agents"][0], "primary_model": route["models"][0], "selected": route.get("agent"),
+                      "model": route.get("model"), "reason": route.get("reason"),
+                      "status": route.get("status")}, sort_keys=True))
+
+
+def recovery_clear(root: Path, task: str) -> None:
+    require_main_worktree(root)
+    record, value = recovery_read(root, task)
+    append_recovery_evidence(state_path(record.path), f"cleared task={task}; reason={value.get('reason')}; source={value.get('source')}")
+    recovery_path(record.path).unlink()
+    print(json.dumps({"task": task, "cleared": True}))
+
+
+def recovery_record(root: Path, task: str, role: str, work_unit: str, outcome: str) -> None:
+    record = require_local_task(root, task)
+    if not WORK_UNIT_RE.fullmatch(work_unit):
+        raise LifecycleError(f"invalid Work Unit ID: {work_unit!r}")
+    if outcome not in RECOVERY_OUTCOMES:
+        raise LifecycleError(f"invalid recovery outcome: {outcome}")
+    path = recovery_path(record.path)
+    if not path.is_file():
+        raise LifecycleError(f"no active recovery state for {task}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not value.get("active"):
+        raise LifecycleError(f"no active recovery state for {task}")
+    validate_recovery_identity(value, record, task)
+    helper = fallback_module(root)
+    try:
+        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(root))
+    except helper.FallbackError as exc:
+        raise LifecycleError(str(exc)) from exc
+    if route.get("status") == "BLOCKED":
+        raise LifecycleError(f"no selected recovery agent for role {role}")
+    event = {"requested_role": role, "work_unit": work_unit, "selected_agent": route["agent"],
+             "selected_model": route["model"], "reason": value["reason"], "outcome": outcome}
+    value.setdefault("events", []).append(event)
+    value["updated_at"] = utc_now()
+    atomic_json(path, value)
+    append_recovery_evidence(state_path(record.path), "requested_role={requested_role}; selected_agent={selected_agent}; selected_model={selected_model}; reason={reason}; work_unit={work_unit}; outcome={outcome}".format(**event))
+    print(json.dumps({"recorded": True, **event}, sort_keys=True))
+
+
 def state_status(path: Path) -> str:
     if not path.is_file():
         raise LifecycleError(f"missing Task State: {path}")
@@ -372,6 +552,9 @@ def task_status(root: Path, task: str) -> None:
 def task_state_set(root: Path, task: str, status: str) -> None:
     record = require_local_task(root, task)
     set_state_status(state_path(record.path), status)
+    if status in TERMINAL_STATES and recovery_path(record.path).is_file():
+        append_recovery_evidence(state_path(record.path), f"discarded recovery on terminal state={status}")
+        recovery_path(record.path).unlink()
     print(json.dumps({"task": task, "status": status}))
 
 
@@ -449,6 +632,9 @@ def task_cleanup(root: Path, task: str) -> None:
             raise LifecycleError("cleanup refused: cancelled Task still has an open pull request")
 
     removed_path = str(record.path)
+    recovery_discarded = recovery_path(record.path).is_file()
+    if recovery_discarded:
+        append_recovery_evidence(state, "discarded recovery during cleanup")
     run(["git", "worktree", "remove", str(record.path)], cwd=root)
     run(["git", "branch", "-D", branch], cwd=root)
     print(
@@ -458,6 +644,7 @@ def task_cleanup(root: Path, task: str) -> None:
                 "removedWorktree": removed_path,
                 "removedBranch": branch,
                 "taskStateDiscarded": True,
+                "recoveryDiscarded": recovery_discarded,
             }
         )
     )
@@ -564,6 +751,21 @@ def parser() -> argparse.ArgumentParser:
     cleanup.add_argument("task")
     batch = sub.add_parser("batch-plan")
     batch.add_argument("tasks", nargs="+")
+    recovery_start_parser = sub.add_parser("recovery-start")
+    recovery_start_parser.add_argument("task")
+    recovery_start_parser.add_argument("family")
+    recovery_status_parser = sub.add_parser("recovery-status")
+    recovery_status_parser.add_argument("task")
+    recovery_route_parser = sub.add_parser("recovery-route")
+    recovery_route_parser.add_argument("task")
+    recovery_route_parser.add_argument("role")
+    recovery_clear_parser = sub.add_parser("recovery-clear")
+    recovery_clear_parser.add_argument("task")
+    recovery_record_parser = sub.add_parser("recovery-record")
+    recovery_record_parser.add_argument("task")
+    recovery_record_parser.add_argument("role")
+    recovery_record_parser.add_argument("work_unit")
+    recovery_record_parser.add_argument("outcome", choices=sorted(RECOVERY_OUTCOMES))
     return result
 
 
@@ -581,6 +783,16 @@ def main() -> int:
             task_cleanup(root, args.task)
         elif args.command == "batch-plan":
             batch_plan(root, args.tasks)
+        elif args.command == "recovery-start":
+            recovery_start(root, args.task, args.family)
+        elif args.command == "recovery-status":
+            recovery_status(root, args.task)
+        elif args.command == "recovery-route":
+            recovery_route(root, args.task, args.role)
+        elif args.command == "recovery-clear":
+            recovery_clear(root, args.task)
+        elif args.command == "recovery-record":
+            recovery_record(root, args.task, args.role, args.work_unit, args.outcome)
         else:  # pragma: no cover
             raise LifecycleError(f"unsupported command: {args.command}")
     except LifecycleError as exc:

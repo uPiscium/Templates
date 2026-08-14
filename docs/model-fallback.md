@@ -8,11 +8,11 @@ OpenCode does not currently expose first-class cross-model failover for an activ
 
 For that reason, this repository implements fallback as explicit alternate agent definitions. Each fallback agent keeps the same role, permission boundary, Work Unit, scope, and authority while changing only the configured model.
 
-## Automatic subagent fallback
+## Implemented policy and classification
 
-Automatic fallback is allowed only when the failed invocation is classified as a usage/quota/rate-limit failure, such as HTTP 429, `rate_limit_exceeded`, quota exhaustion, or usage-limit exhaustion.
+The implemented fallback classification applies only when the failed invocation is a usage/quota/rate-limit failure, such as HTTP 429, `rate_limit_exceeded`, quota exhaustion, or usage-limit exhaustion. This classification does not provide unavailable automatic same-turn cross-model failover.
 
-The parent agent retries the identical Task or Work Unit with the next named fallback agent in policy. Each configured model is attempted at most once. When the chain is exhausted, the Task becomes BLOCKED.
+The policy classifies failures and names explicit alternate agent definitions. Prompt-level retry is best-effort and is not genuine automatic same-turn cross-model failover: OpenCode cannot safely replace an active session today. Each configured model is attempted at most once; when the chain is exhausted, the Task becomes BLOCKED.
 
 The following failures do not trigger automatic fallback:
 
@@ -30,9 +30,9 @@ Fallbacks cross token-quota families. Codex 5.6 variants share quota, so a 5.6-p
 
 The role split is:
 
-- `task-orchestrator` → **Spark** primary, automatic fallback to **Sol**.
-- `general`, `explore`, `verifier`, `scout` → **Spark** primary, automatic fallback to **Luna**.
-- `architect`, `reviewer`, `investigator`, `security-reviewer` → their existing 5.6 primary, automatic fallback to **Spark**.
+- `task-orchestrator` → **Spark** primary, explicit policy fallback to **Sol**.
+- `general`, `explore`, `verifier`, `scout` → **Spark** primary, explicit policy fallback to **Luna**.
+- `architect`, `reviewer`, `investigator`, `security-reviewer` → their existing 5.6 primary, explicit policy fallback to **Spark**.
 - `build` → **Sol** primary, manual fallback to **Spark**.
 
 ## Main Orchestrator
@@ -40,6 +40,12 @@ The role split is:
 The active Main Orchestrator cannot be transparently replaced safely with the current OpenCode API. The policy therefore sets `roles.build.automatic = false` and provides `build-fallback` as a manual primary-agent fallback with the same authority.
 
 This boundary should be revisited when OpenCode adds native cross-model fallback or provides a stable plugin API that can replace the active primary model without replaying prompts, duplicating tool calls, or corrupting session state.
+
+## Explicit post-failure recovery
+
+`/task-recover TASK FAMILY` is the supported recovery workflow after a failure. It initializes Main, starts and inspects guarded recovery state, routes directly to the policy-selected orchestrator variant, and preserves the same Task, worktree, Work Unit semantic/ID, and role authority. A Spark-unavailable family skips its unavailable primary and routes directly to the selected general, explore, verifier, or scout fallback. The recovery orchestrator routes before every leaf delegation, records outcomes through guarded APIs, and runs to `integration-pending`. `/task-recover-clear` clears only an explicitly identified recovery state.
+
+Recovery activation is an explicit operator assertion that the named family is unavailable because of a genuine usage-limit observation; the repository cannot authenticate provider telemetry after a stopped OpenCode turn. Starting recovery never converts an artificial fixture or operator assertion into genuine runtime PASS evidence. The deterministic contract harness validates the recovery control path only; it is not genuine runtime verification. Native future migration should replace this explicit path only when OpenCode provides safe session-preserving cross-model failover.
 
 ## Evidence
 

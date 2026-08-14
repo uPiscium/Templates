@@ -73,6 +73,35 @@ class ModelFallbackTest(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertEqual(result["reason"], "fallback chain exhausted")
 
+    def test_recovery_routes_spark_roles_to_luna(self) -> None:
+        for role in ("task-orchestrator", "general", "explore", "verifier", "scout"):
+            result = fallback.recovery_route(role, "spark", self.cfg)
+            self.assertEqual(result["status"], "fallback", role)
+            self.assertEqual(result["family"], "gpt-5.6", role)
+
+    def test_recovery_keeps_spark_roles_primary_for_gpt_family(self) -> None:
+        for role in ("general", "explore", "verifier", "scout"):
+            result = fallback.recovery_route(role, "gpt-5.6", self.cfg)
+            self.assertEqual(result["status"], "primary", role)
+
+    def test_recovery_routes_gpt_roles_to_spark(self) -> None:
+        for role in ("architect", "reviewer"):
+            result = fallback.recovery_route(role, "gpt-5.6", self.cfg)
+            self.assertEqual(result["status"], "fallback", role)
+            self.assertEqual(result["family"], "spark", role)
+
+    def test_recovery_unknown_family_fails_closed(self) -> None:
+        result = fallback.recovery_route("general", "mystery", self.cfg)
+        self.assertEqual(result["status"], "BLOCKED")
+
+    def test_recovery_chain_exhaustion_is_machine_readable(self) -> None:
+        cfg = {"families": {"spark": ["spark-model"]}, "roles": {
+            "r": {"primary_agent": "a", "primary_model": "spark-model",
+                   "fallback_agents": [], "fallback_models": []}}}
+        result = fallback.recovery_route("r", "spark", cfg)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertEqual(result["reason"], "fallback chain exhausted")
+
     def test_main_fallback_is_not_automatic(self) -> None:
         result = fallback.next_fallback("build", "build", self.cfg)
         self.assertFalse(result["available"])
@@ -81,6 +110,9 @@ class ModelFallbackTest(unittest.TestCase):
     def test_fallback_evidence_is_recorded_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            automation = root / ".automation"
+            automation.mkdir()
+            (automation / "model-fallback.toml").write_bytes(self.policy_path.read_bytes())
             state_dir = root / ".task-state"
             state_dir.mkdir()
             state = state_dir / "task.md"
@@ -97,6 +129,22 @@ class ModelFallbackTest(unittest.TestCase):
             self.assertIn("### Model fallback", text)
             self.assertIn("usage limit", text)
             self.assertNotIn("api_key", text.lower())
+
+    def test_fallback_evidence_rejects_unclassified_or_unconfigured_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            automation = root / ".automation"
+            automation.mkdir()
+            (automation / "model-fallback.toml").write_bytes(self.policy_path.read_bytes())
+            state_dir = root / ".task-state"
+            state_dir.mkdir()
+            (state_dir / "task.md").write_text("## Evidence\n", encoding="utf-8")
+            with self.assertRaisesRegex(fallback.FallbackError, "classified usage-limit"):
+                fallback.append_evidence(root, "general", self.cfg["roles"]["general"]["primary_model"],
+                                         self.cfg["roles"]["general"]["fallback_models"][0],
+                                         "permission denied", "failed")
+            with self.assertRaisesRegex(fallback.FallbackError, "configured role chain"):
+                fallback.append_evidence(root, "general", "secret-model", "other-model", "usage limit", "failed")
 
     def test_generated_files_match_sources(self) -> None:
         pairs = [

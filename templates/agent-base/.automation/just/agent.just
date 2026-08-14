@@ -29,6 +29,26 @@ batch-plan +tasks:
     python3 {{quote(lifecycle)}} batch-plan {{tasks}}
 
 [working-directory: root]
+recovery-start task family:
+    python3 {{quote(lifecycle)}} recovery-start {{quote(task)}} {{quote(family)}}
+
+[working-directory: root]
+recovery-status task:
+    python3 {{quote(lifecycle)}} recovery-status {{quote(task)}}
+
+[working-directory: root]
+recovery-route task role:
+    python3 {{quote(lifecycle)}} recovery-route {{quote(task)}} {{quote(role)}}
+
+[working-directory: root]
+recovery-clear task:
+    python3 {{quote(lifecycle)}} recovery-clear {{quote(task)}}
+
+[working-directory: root]
+recovery-record task role work_unit outcome:
+    python3 {{quote(lifecycle)}} recovery-record {{quote(task)}} {{quote(role)}} {{quote(work_unit)}} {{quote(outcome)}}
+
+[working-directory: root]
 fallback-record role failed_model fallback_model reason outcome:
     python3 {{quote(fallback)}} record {{quote(role)}} {{quote(failed_model)}} {{quote(fallback_model)}} {{quote(reason)}} {{quote(outcome)}}
 

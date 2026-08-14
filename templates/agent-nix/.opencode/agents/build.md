@@ -24,6 +24,11 @@ permission:
     "just project::doctor": allow
     "just agent::task-start *": allow
     "just agent::batch-plan *": allow
+    "just agent::recovery-start *": allow
+    "just agent::recovery-status *": allow
+    "just agent::recovery-route *": allow
+    "just agent::recovery-record *": deny
+    "just agent::recovery-clear *": allow
     "just agent::commit *": deny
     "just agent::pr-create *": deny
     "just agent::pr-edit *": deny
