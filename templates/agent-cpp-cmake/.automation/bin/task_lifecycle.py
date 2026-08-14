@@ -373,6 +373,7 @@ def validate_policy_agent_bindings(helper, cfg: dict, task_root: Path, caller_ro
     if caller_root.resolve() != task_root.resolve():
         roots.append(caller_root)
     try:
+        helper.validate_project_permission_binding(roots)
         for role in cfg.get("roles", {}):
             helper.validate_agent_binding(role, cfg, roots)
     except helper.FallbackError as exc:
@@ -380,6 +381,7 @@ def validate_policy_agent_bindings(helper, cfg: dict, task_root: Path, caller_ro
 
 
 def validate_recovery_identity(value: dict, record: WorktreeRecord, task: str) -> None:
+    executable_root = main_worktree(record.path).path
     expected = {
         "task_id": task,
         "worktree": str(record.path),
@@ -387,6 +389,7 @@ def validate_recovery_identity(value: dict, record: WorktreeRecord, task: str) -
         "active": True,
         "reason": "usage_limit",
         "source": "operator",
+        "executable_root": str(executable_root),
     }
     mismatches = [key for key, expected_value in expected.items() if value.get(key) != expected_value]
     if mismatches:
@@ -423,6 +426,7 @@ def recovery_start(root: Path, task: str, family: str) -> None:
         "active": True,
         "reason": "usage_limit",
         "source": "operator",
+        "executable_root": str(root.resolve()),
         "task_id": task,
         "worktree": str(record.path),
         "branch": record.branch,
@@ -476,10 +480,14 @@ def recovery_route(root: Path, task: str, role: str) -> None:
     record, value = recovery_read(root, task)
     if not value.get("active"):
         raise LifecycleError(f"no active recovery state for {task}")
-    helper = fallback_module(root)
+    executable_root = Path(value["executable_root"]).resolve()
+    helper = fallback_module(executable_root)
+    cfg = helper.policy(record.path)
+    validate_policy_agent_bindings(
+        helper, cfg, record.path, executable_root
+    )
     try:
-        helper.validate_agent_binding(role, helper.policy(record.path), [record.path] + ([root] if root != record.path else []))
-        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(record.path))
+        route = helper.recovery_route(role, value["unavailable_family"], cfg)
     except helper.FallbackError as exc:
         raise LifecycleError(str(exc)) from exc
     print(json.dumps({"role": role, "primary": route["agents"][0], "primary_model": route["models"][0], "selected": route.get("agent"),
@@ -528,10 +536,14 @@ def recovery_record(root: Path, task: str, role: str, work_unit: str, semantic_s
         raise LifecycleError(f"Work Unit was not recoverable when recovery started: {work_unit}")
     if snapshot.get("requested_role") != role or snapshot.get("semantic_sha256") != semantic_sha256:
         raise LifecycleError(f"Work Unit recovery snapshot mismatch for {work_unit}")
-    helper = fallback_module(root)
+    executable_root = Path(value["executable_root"]).resolve()
+    helper = fallback_module(executable_root)
+    cfg = helper.policy(record.path)
+    validate_policy_agent_bindings(
+        helper, cfg, record.path, executable_root
+    )
     try:
-        helper.validate_agent_binding(role, helper.policy(record.path), [record.path])
-        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(record.path))
+        route = helper.recovery_route(role, value["unavailable_family"], cfg)
     except helper.FallbackError as exc:
         raise LifecycleError(str(exc)) from exc
     if route.get("status") == "BLOCKED":

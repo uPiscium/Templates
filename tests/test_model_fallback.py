@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import shutil
 import sys
 import tempfile
@@ -130,6 +131,34 @@ class ModelFallbackTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(fallback.FallbackError, "agent model mismatch"):
                 fallback.validate_agent_binding("general", self.cfg, [task_root])
+
+    def test_effective_permission_contract_drift_fails_closed(self) -> None:
+        core = ROOT / "components" / "agent-core"
+        with tempfile.TemporaryDirectory() as directory:
+            task_root = Path(directory) / "task"
+            main_root = Path(directory) / "main"
+            for root in (task_root, main_root):
+                agents = root / ".opencode" / "agents"
+                agents.mkdir(parents=True)
+                for name in ("general", "general-fallback"):
+                    shutil.copy2(core / ".opencode" / "agents" / f"{name}.md", agents / f"{name}.md")
+                shutil.copy2(core / "opencode.json", root / "opencode.json")
+            for name in ("general", "general-fallback"):
+                path = main_root / ".opencode" / "agents" / f"{name}.md"
+                path.write_text(
+                    path.read_text(encoding="utf-8").replace(
+                        '    "just project::build": allow', '    "just project::build": deny'
+                    ),
+                    encoding="utf-8",
+                )
+            with self.assertRaisesRegex(fallback.FallbackError, "cross-worktree authority mismatch"):
+                fallback.validate_agent_binding("general", self.cfg, [task_root, main_root])
+
+            config = json.loads((main_root / "opencode.json").read_text(encoding="utf-8"))
+            config["permission"]["bash"]["just project::build"] = "deny"
+            (main_root / "opencode.json").write_text(json.dumps(config), encoding="utf-8")
+            with self.assertRaisesRegex(fallback.FallbackError, "project permission mismatch"):
+                fallback.validate_project_permission_binding([task_root, main_root])
 
     def test_main_fallback_is_not_automatic(self) -> None:
         result = fallback.next_fallback("build", "build", self.cfg)

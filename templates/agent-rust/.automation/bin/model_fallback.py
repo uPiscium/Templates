@@ -86,7 +86,7 @@ def recovery_route(role: str, unavailable_family: str, cfg: dict) -> dict:
     return {"status": "BLOCKED", "reason": "fallback chain exhausted", **chain}
 
 
-def agent_model(root: Path, agent: str) -> str:
+def agent_frontmatter(root: Path, agent: str) -> tuple[Path, str]:
     path = root / ".opencode" / "agents" / f"{agent}.md"
     if not path.is_file():
         raise FallbackError(f"missing agent definition for {agent}: {path}")
@@ -94,22 +94,84 @@ def agent_model(root: Path, agent: str) -> str:
     frontmatter = re.match(r"\A---\n(.*?)\n---(?:\n|\Z)", text, re.DOTALL)
     if not frontmatter:
         raise FallbackError(f"invalid agent frontmatter for {agent}: {path}")
-    models = re.findall(r"(?m)^model:\s*(\S+)\s*$", frontmatter.group(1))
+    return path, frontmatter.group(1)
+
+
+def agent_contract(root: Path, agent: str) -> dict:
+    path, frontmatter = agent_frontmatter(root, agent)
+    models = re.findall(r"(?m)^model:\s*(\S+)\s*$", frontmatter)
     if len(models) != 1:
         raise FallbackError(f"agent definition must declare exactly one model for {agent}: {path}")
-    return models[0]
+    lines = frontmatter.splitlines()
+    try:
+        permission_index = lines.index("permission:")
+    except ValueError as exc:
+        raise FallbackError(f"agent definition is missing permission contract for {agent}: {path}") from exc
+    permission_lines: list[str] = []
+    for line in lines[permission_index + 1 :]:
+        if line and not line[0].isspace():
+            break
+        permission_lines.append(line.rstrip())
+    while permission_lines and not permission_lines[-1]:
+        permission_lines.pop()
+    if not permission_lines or any(line and not line.startswith("  ") for line in permission_lines):
+        raise FallbackError(f"invalid permission contract for {agent}: {path}")
+    return {"model": models[0], "permission": tuple(permission_lines)}
+
+
+def ordered_contract(value):
+    if isinstance(value, dict):
+        return tuple((key, ordered_contract(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return tuple(ordered_contract(item) for item in value)
+    return value
+
+
+def project_permission_contract(root: Path):
+    path = root / "opencode.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FallbackError(f"missing OpenCode configuration: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise FallbackError(f"invalid OpenCode configuration: {path}") from exc
+    if "permission" not in value:
+        raise FallbackError(f"OpenCode configuration is missing permission contract: {path}")
+    return ordered_contract(value["permission"])
 
 
 def validate_agent_binding(role: str, cfg: dict, roots: list[Path]) -> None:
     chain = role_chain(role, cfg)
+    root_contracts: list[dict[str, dict]] = []
     for agent, expected_model in zip(chain["agents"], chain["models"]):
         for root in roots:
-            actual_model = agent_model(root, agent)
-            if actual_model != expected_model:
+            contract = agent_contract(root, agent)
+            if contract["model"] != expected_model:
                 raise FallbackError(
                     f"agent model mismatch for {agent}: policy={expected_model}, "
-                    f"definition={actual_model}, root={root}"
+                    f"definition={contract['model']}, root={root}"
                 )
+    for root in roots:
+        contracts = {agent: agent_contract(root, agent) for agent in chain["agents"]}
+        primary_permission = contracts[chain["agents"][0]]["permission"]
+        for agent in chain["agents"][1:]:
+            if contracts[agent]["permission"] != primary_permission:
+                raise FallbackError(f"role authority mismatch for {role}: {agent}, root={root}")
+        root_contracts.append(contracts)
+    for agent in chain["agents"]:
+        expected_permission = root_contracts[0][agent]["permission"]
+        for root, contracts in zip(roots[1:], root_contracts[1:]):
+            if contracts[agent]["permission"] != expected_permission:
+                raise FallbackError(f"cross-worktree authority mismatch for {agent}: root={root}")
+
+
+def validate_project_permission_binding(roots: list[Path]) -> None:
+    if len(roots) < 2:
+        return
+    expected = project_permission_contract(roots[0])
+    for root in roots[1:]:
+        if project_permission_contract(root) != expected:
+            raise FallbackError(f"cross-worktree project permission mismatch: root={root}")
 
 
 def next_fallback(role: str, failed_agent: str, cfg: dict) -> dict:

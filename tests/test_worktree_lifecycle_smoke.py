@@ -68,6 +68,38 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
 
         task_policy = worktree / ".automation" / "model-fallback.toml"
         original_task_policy_text = task_policy.read_text(encoding="utf-8")
+        main_agent = self.repo / ".opencode" / "agents" / "general-fallback.md"
+        original_main_agent_text = main_agent.read_text(encoding="utf-8")
+        main_agent.write_text(
+            original_main_agent_text.replace(
+                '    "just project::build": allow', '    "just project::build": deny'
+            ),
+            encoding="utf-8",
+        )
+        authority_mismatch = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(authority_mismatch.returncode, 0)
+        self.assertIn("role authority mismatch for general", authority_mismatch.stderr)
+        main_agent.write_text(original_main_agent_text, encoding="utf-8")
+
+        main_config = self.repo / "opencode.json"
+        original_main_config_text = main_config.read_text(encoding="utf-8")
+        main_config.write_text(
+            original_main_config_text.replace(
+                '"just project::build": "allow"', '"just project::build": "deny"'
+            ),
+            encoding="utf-8",
+        )
+        project_authority_mismatch = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(project_authority_mismatch.returncode, 0)
+        self.assertIn("project permission mismatch", project_authority_mismatch.stderr)
+        main_config.write_text(original_main_config_text, encoding="utf-8")
+
         task_policy_text = original_task_policy_text.replace(
             'fallback_models = ["openai/gpt-5.6-luna"]',
             'fallback_models = ["openai/gpt-5.6-terra"]',
@@ -96,9 +128,7 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         task_policy.write_text(task_policy_text, encoding="utf-8")
 
         task_agent = worktree / ".opencode" / "agents" / "general-fallback.md"
-        main_agent = self.repo / ".opencode" / "agents" / "general-fallback.md"
         original_task_agent_text = task_agent.read_text(encoding="utf-8")
-        original_main_agent_text = main_agent.read_text(encoding="utf-8")
         task_agent.write_text(
             original_task_agent_text.replace("model: openai/gpt-5.6-luna", "model: openai/gpt-5.6-terra"),
             encoding="utf-8",
@@ -157,6 +187,33 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.assertEqual(json.loads(main_route.stdout)["selected"], "general-fallback")
         self.assertEqual(json.loads(main_route.stdout)["model"], "openai/gpt-5.6-terra")
         self.assertEqual(json.loads(task_route.stdout), json.loads(main_route.stdout))
+        main_config.write_text(
+            original_main_config_text.replace(
+                '"just project::build": "allow"', '"just project::build": "deny"'
+            ),
+            encoding="utf-8",
+        )
+        project_drifted_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(project_drifted_route.returncode, 0)
+        self.assertIn("project permission mismatch", project_drifted_route.stderr)
+        main_config.write_text(original_main_config_text, encoding="utf-8")
+        current_main_agent_text = main_agent.read_text(encoding="utf-8")
+        main_agent.write_text(
+            current_main_agent_text.replace(
+                '    "just project::build": allow', '    "just project::build": deny'
+            ),
+            encoding="utf-8",
+        )
+        drifted_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(drifted_route.returncode, 0)
+        self.assertIn("role authority mismatch for general", drifted_route.stderr)
+        main_agent.write_text(current_main_agent_text, encoding="utf-8")
         recovery_path = worktree / ".task-state" / "recovery.json"
         tampered = json.loads(recovery_path.read_text(encoding="utf-8"))
         tampered["routes"]["general"]["agent"] = "general"
@@ -178,6 +235,32 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
         self.assertNotEqual(semantic_mismatch.returncode, 0)
         self.assertIn("semantic mismatch", semantic_mismatch.stderr)
+        main_agent.write_text(
+            current_main_agent_text.replace(
+                '    "just project::build": allow', '    "just project::build": deny'
+            ),
+            encoding="utf-8",
+        )
+        drifted_record = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
+            work_unit["semantic_sha256"], "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(drifted_record.returncode, 0)
+        self.assertIn("role authority mismatch for general", drifted_record.stderr)
+        main_agent.write_text(current_main_agent_text, encoding="utf-8")
+        main_config.write_text(
+            original_main_config_text.replace(
+                '"just project::build": "allow"', '"just project::build": "deny"'
+            ),
+            encoding="utf-8",
+        )
+        project_drifted_record = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
+            work_unit["semantic_sha256"], "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(project_drifted_record.returncode, 0)
+        self.assertIn("project permission mismatch", project_drifted_record.stderr)
+        main_config.write_text(original_main_config_text, encoding="utf-8")
         recorded = run(
             "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
             work_unit["semantic_sha256"], "completed",
