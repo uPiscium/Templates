@@ -36,6 +36,13 @@ fallback_agents = ["build-fallback"]
 fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = false
 
+[roles.plan]
+primary_agent = "plan"
+primary_model = "openai/gpt-5.6-sol"
+fallback_agents = ["plan-fallback"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
+automatic = false
+
 [roles.architect]
 primary_agent = "architect"
 primary_model = "openai/gpt-5.6-sol"

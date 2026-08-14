@@ -296,6 +296,7 @@ class OpenCodeContractTest(unittest.TestCase):
     def test_fallback_model_assignment_is_exact(self) -> None:
         expected = {
             "build-fallback.md": "openai/gpt-5.3-codex-spark",
+            "plan-fallback.md": "openai/gpt-5.3-codex-spark",
             "architect-fallback.md": "openai/gpt-5.3-codex-spark",
             "task-orchestrator-fallback.md": "openai/gpt-5.6-sol",
             "general-fallback.md": "openai/gpt-5.3-codex-spark",
@@ -374,6 +375,40 @@ class OpenCodeContractTest(unittest.TestCase):
             "do not delegate to `task-orchestrator`",
         ):
             self.assertIn(phrase, lower)
+
+    def test_plan_fallback_preserves_repository_local_planning_authority(self) -> None:
+        primary_front = frontmatter(AGENTS / "plan.md")
+        fallback_front = frontmatter(AGENTS / "plan-fallback.md")
+
+        self.assertIn("mode: primary", primary_front)
+        self.assertIn("mode: primary", fallback_front)
+        self.assertIn("model: openai/gpt-5.6-sol", primary_front)
+        self.assertIn("model: openai/gpt-5.3-codex-spark", fallback_front)
+        self.assertIn("hidden: true", fallback_front)
+        self.assertEqual(permission_for("plan"), permission_for("plan-fallback"))
+        self.assertEqual(body_text("plan"), body_text("plan-fallback"))
+
+    def test_generated_plan_fallback_and_policy_match_source(self) -> None:
+        source_agent = CORE / ".opencode" / "agents" / "plan-fallback.md"
+        source_policy = CORE / ".automation" / "model-fallback.toml"
+        for template in (
+            "agent-base",
+            "agent-python",
+            "agent-rust",
+            "agent-nix",
+            "agent-cpp-cmake",
+        ):
+            generated = ROOT / "templates" / template
+            self.assertEqual(
+                source_agent.read_bytes(),
+                (generated / ".opencode" / "agents" / "plan-fallback.md").read_bytes(),
+                template,
+            )
+            self.assertEqual(
+                source_policy.read_bytes(),
+                (generated / ".automation" / "model-fallback.toml").read_bytes(),
+                template,
+            )
 
 
     def test_opencode_debug_agent_plan_effective_policy_when_cli_available(self) -> None:

@@ -35,12 +35,17 @@ The role split is:
 - `verifier`, `scout` → **Spark** primary, explicit policy fallback to **Luna**.
 - `architect`, `reviewer`, `investigator`, `security-reviewer` → their existing 5.6 primary, explicit policy fallback to **Spark**.
 - `build` → **Sol** primary, manual fallback to **Spark**.
+- `plan` → **Sol** primary, manual fallback to **Spark**.
 
 ## Main Orchestrator
 
 The active Main Orchestrator cannot be transparently replaced safely with the current OpenCode API. The policy therefore sets `roles.build.automatic = false` and provides `build-fallback` as a manual primary-agent fallback with the same authority.
 
 This boundary should be revisited when OpenCode adds native cross-model fallback or provides a stable plugin API that can replace the active primary model without replaying prompts, duplicating tool calls, or corrupting session state.
+
+## Planning agent
+
+The active repository-local planning session has the same transparent-replacement limitation. The policy sets `roles.plan.automatic = false` and provides `plan-fallback` as a hidden manual primary-agent fallback. It changes only the model from Sol to Spark: read-only permissions, allowed inspection delegation, initialization handoff semantics, execution prohibition, and planning output contract remain identical to `plan`.
 
 ## Explicit post-failure recovery
 

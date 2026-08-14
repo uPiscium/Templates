@@ -132,7 +132,7 @@ Adoption/migration never commits, pushes, merges, stashes, or resets the target 
 
 ## Planning Agent
 
-Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-5.6-sol`, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer` plus their configured fallbacks.
+Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-5.6-sol`, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer` plus their configured fallbacks. `plan-fallback` is a hidden manual primary-session fallback on `openai/gpt-5.3-codex-spark`; it preserves the same repository-local read-only authority and initialization handoff contract.
 
 `plan` never starts the Task lifecycle, edits Task State, runs executable doctor/check commands, or reports unexecuted verification as PASS. It reads `AGENTS.md`, `.automation/INIT.md`, adapter initialization guidance, and optional Task State, then returns confirmed facts, assumptions, open decisions, a bounded implementation plan, `execution_prerequisites`, and `verification_handoff` entries for an execution-capable workflow.
 

@@ -48,6 +48,7 @@ class ModelFallbackTest(unittest.TestCase):
 
     def test_primary_and_fallback_models_in_policy(self) -> None:
         expected = {
+            "plan": ("openai/gpt-5.6-sol", "openai/gpt-5.3-codex-spark"),
             "general": ("openai/gpt-5.6-luna", "openai/gpt-5.3-codex-spark"),
             "explore": ("openai/gpt-5.6-luna", "openai/gpt-5.3-codex-spark"),
             "verifier": ("openai/gpt-5.3-codex-spark", "openai/gpt-5.6-luna"),
@@ -188,6 +189,21 @@ class ModelFallbackTest(unittest.TestCase):
         self.assertFalse(result["available"])
         self.assertEqual(result["reason"], "automatic fallback disabled")
 
+    def test_plan_fallback_is_manual_and_cross_family(self) -> None:
+        role = self.cfg["roles"]["plan"]
+        self.assertEqual(role["primary_agent"], "plan")
+        self.assertEqual(role["primary_model"], "openai/gpt-5.6-sol")
+        self.assertEqual(role["fallback_agents"], ["plan-fallback"])
+        self.assertEqual(role["fallback_models"], ["openai/gpt-5.3-codex-spark"])
+        self.assertFalse(role["automatic"])
+        self.assertNotEqual(
+            fallback.model_family(role["primary_model"], self.cfg),
+            fallback.model_family(role["fallback_models"][0], self.cfg),
+        )
+        result = fallback.next_fallback("plan", "plan", self.cfg)
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "automatic fallback disabled")
+
     def test_fallback_evidence_is_recorded_without_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -256,7 +272,7 @@ class ModelFallbackTest(unittest.TestCase):
         source_agents = ROOT / "components" / "agent-core" / ".opencode" / "agents"
         generated_agents = ROOT / "templates" / "agent-base" / ".opencode" / "agents"
         fallback_agents = sorted(source_agents.glob("*-fallback.md"))
-        self.assertGreaterEqual(len(fallback_agents), 10)
+        self.assertGreaterEqual(len(fallback_agents), 11)
         for source in fallback_agents:
             generated = generated_agents / source.name
             self.assertTrue(generated.is_file(), generated.as_posix())
