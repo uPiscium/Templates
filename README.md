@@ -156,6 +156,8 @@ Main
 
 Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write path. Push, merge, cleanup, unknown Bash, and designated external paths require Ask.
 
+Model fallback is policy/classification based. Automatic same-turn cross-model failover is not available in OpenCode; prompt retry is best-effort. After a failure, use the supported explicit `/task-recover TASK FAMILY` workflow, which routes directly to the configured variant while preserving Task/worktree identity and runs to integration-pending. The contract harness is deterministic configuration coverage, not genuine runtime verification; native session-preserving migration remains future work.
+
 ## Project Adapter API
 
 Generated language/toolchain Adapters expose the one-time bootstrap API plus the stable validation/build API:

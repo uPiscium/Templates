@@ -10,7 +10,7 @@ Use this skill when the Main Orchestrator is asked to run a specific Task that a
 1. Resolve the explicit Task ID and assigned worktree.
 2. Confirm the Task is not already owned by another active Task Orchestrator.
 3. Launch exactly one `task-orchestrator` for that Task.
-4. Require the Task Orchestrator to operate only in the assigned worktree and to use bounded Work Units.
+4. Require the Task Orchestrator to operate only in the assigned worktree and to use bounded Work Units. Before each leaf delegation it must call guarded `work-unit-register` with a stable ID, requested role, and exact objective; never delegate an unregistered Work Unit.
 5. Require the Task Orchestrator to enforce leaf escalation-only status contract: Depth-2 units may only return `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`.
 6. Require the Task Orchestrator to treat `NEEDS_APPROVAL`/`NEEDS_DECISION` as its own decision point:
    - re-validate scope, authority, least privilege, safety, alternatives, and evidence;
@@ -21,10 +21,11 @@ Use this skill when the Main Orchestrator is asked to run a specific Task that a
    - for unresolved `NEEDS_DECISION`, use `question` from Depth 1 with concrete options, tradeoffs, known facts, and a recommendation; apply the answer rather than relaying the Leaf request or escalating it to Depth 0.
 7. If the Task Orchestrator invocation fails with a usage/quota/rate-limit condition explicitly listed in `.automation/model-fallback.toml`, retry the identical Task once with the configured `task-orchestrator-fallback` variant.
 8. Inside the Task, leaf Work Units may use the same controlled retry rule for their role-specific fallback variants. Do not fallback for authentication, permission, validation, context-window, tool, or safety errors.
-9. Record every attempted fallback in Task State evidence. When a configured chain is exhausted, mark the Task BLOCKED instead of inventing another model.
-10. Accept only evidence-backed completion: changed files, verification results, review results, commit/PR state, blockers, and unverified checks.
-11. Confirm the Task did not report PASS for any unexecuted command or unperformed Work Unit.
-12. Stop at integration-pending. Do not merge from this skill.
+9. Prompt-level retry is best-effort only. When an active recovery state exists, use the read-only `just agent::recovery-route` result directly and skip the unavailable-family primary; preserve the same Task/worktree and Work Unit semantic/ID.
+10. Record every attempted fallback in Task State evidence. When a configured chain is exhausted, mark the Task BLOCKED instead of inventing another model.
+11. Accept only evidence-backed completion: changed files, verification results, review results, commit/PR state, blockers, and unverified checks.
+12. Confirm the Task did not report PASS for any unexecuted command or unperformed Work Unit.
+13. Stop at integration-pending. Do not merge from this skill.
 
 Main Orchestrator fallback is not transparent: if the active `build` model hits a usage limit, switch manually to the explicitly configured `build-fallback` agent. OpenCode currently has no safe native cross-model failover for the already-active primary session.
 

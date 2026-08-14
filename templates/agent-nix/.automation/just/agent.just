@@ -29,6 +29,38 @@ batch-plan +tasks:
     python3 {{quote(lifecycle)}} batch-plan {{tasks}}
 
 [working-directory: root]
+recovery-start task family:
+    python3 {{quote(lifecycle)}} recovery-start {{quote(task)}} {{quote(family)}}
+
+[working-directory: root]
+recovery-status task:
+    python3 {{quote(lifecycle)}} recovery-status {{quote(task)}}
+
+[working-directory: root]
+recovery-route task role:
+    python3 {{quote(lifecycle)}} recovery-route {{quote(task)}} {{quote(role)}}
+
+[working-directory: root]
+recovery-clear task:
+    python3 {{quote(lifecycle)}} recovery-clear {{quote(task)}}
+
+[working-directory: root]
+recovery-record task role work_unit semantic_sha256 outcome:
+    python3 {{quote(lifecycle)}} recovery-record {{quote(task)}} {{quote(role)}} {{quote(work_unit)}} {{quote(semantic_sha256)}} {{quote(outcome)}}
+
+[working-directory: root]
+work-unit-register task work_unit role objective:
+    python3 {{quote(lifecycle)}} work-unit-register {{quote(task)}} {{quote(work_unit)}} {{quote(role)}} {{quote(objective)}}
+
+[working-directory: root]
+work-unit-status task work_unit:
+    python3 {{quote(lifecycle)}} work-unit-status {{quote(task)}} {{quote(work_unit)}}
+
+[working-directory: root]
+work-unit-state-set task work_unit status:
+    python3 {{quote(lifecycle)}} work-unit-state-set {{quote(task)}} {{quote(work_unit)}} {{quote(status)}}
+
+[working-directory: root]
 fallback-record role failed_model fallback_model reason outcome:
     python3 {{quote(fallback)}} record {{quote(role)}} {{quote(failed_model)}} {{quote(fallback_model)}} {{quote(reason)}} {{quote(outcome)}}
 

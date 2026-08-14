@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import tempfile
@@ -65,11 +66,242 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
         self.assertNotEqual(duplicate.returncode, 0)
 
+        task_policy = worktree / ".automation" / "model-fallback.toml"
+        original_task_policy_text = task_policy.read_text(encoding="utf-8")
+        main_agent = self.repo / ".opencode" / "agents" / "general-fallback.md"
+        original_main_agent_text = main_agent.read_text(encoding="utf-8")
+        main_agent.write_text(
+            original_main_agent_text.replace(
+                '    "just project::build": allow', '    "just project::build": deny'
+            ),
+            encoding="utf-8",
+        )
+        authority_mismatch = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(authority_mismatch.returncode, 0)
+        self.assertIn("role authority mismatch for general", authority_mismatch.stderr)
+        main_agent.write_text(original_main_agent_text, encoding="utf-8")
+
+        main_config = self.repo / "opencode.json"
+        original_main_config_text = main_config.read_text(encoding="utf-8")
+        main_config.write_text(
+            original_main_config_text.replace(
+                '"just project::build": "allow"', '"just project::build": "deny"'
+            ),
+            encoding="utf-8",
+        )
+        project_authority_mismatch = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(project_authority_mismatch.returncode, 0)
+        self.assertIn("project permission mismatch", project_authority_mismatch.stderr)
+        main_config.write_text(original_main_config_text, encoding="utf-8")
+
+        task_policy_text = original_task_policy_text.replace(
+            'fallback_models = ["openai/gpt-5.6-luna"]',
+            'fallback_models = ["openai/gpt-5.6-terra"]',
+            1,
+        )
+        task_policy.write_text(task_policy_text, encoding="utf-8")
+
+        mismatch = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("agent model mismatch for general-fallback", mismatch.stderr)
+
+        unknown_task_policy = task_policy_text.replace(
+            'spark = ["openai/gpt-5.3-codex-spark"]',
+            'task-spark = ["openai/gpt-5.3-codex-spark"]',
+        )
+        task_policy.write_text(unknown_task_policy, encoding="utf-8")
+        unknown = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("unknown model family", unknown.stderr)
+        task_policy.write_text(task_policy_text, encoding="utf-8")
+
+        task_agent = worktree / ".opencode" / "agents" / "general-fallback.md"
+        original_task_agent_text = task_agent.read_text(encoding="utf-8")
+        task_agent.write_text(
+            original_task_agent_text.replace("model: openai/gpt-5.6-luna", "model: openai/gpt-5.6-terra"),
+            encoding="utf-8",
+        )
+        main_mismatch = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(main_mismatch.returncode, 0)
+        self.assertIn(f"root={self.repo}", main_mismatch.stderr)
+        main_agent.write_text(
+            original_main_agent_text.replace("model: openai/gpt-5.6-luna", "model: openai/gpt-5.6-terra"),
+            encoding="utf-8",
+        )
+        registered = run(
+            "python3", str(self.script), "work-unit-register", "TASK-1", "WU-1", "general",
+            "Implement the bounded recovery fixture", cwd=worktree, env=self.env,
+        )
+        work_unit = json.loads(registered.stdout)
+        self.assertEqual(work_unit["state"], "in-flight")
+        failed_unit = run(
+            "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-1", "failed",
+            cwd=worktree, env=self.env,
+        )
+        self.assertEqual(json.loads(failed_unit.stdout)["state"], "failed")
+
+        started = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark", cwd=self.repo, env=self.env
+        )
+        recovery = json.loads(started.stdout)
+        self.assertEqual(recovery["routing"]["task-orchestrator"], "task-orchestrator-fallback")
+        self.assertEqual(recovery["routing"]["general"], "general-fallback")
+        self.assertEqual(recovery["routes"]["general"]["model"], "openai/gpt-5.6-terra")
+        self.assertEqual(recovery["recoverable_work_units"][0]["id"], "WU-1")
+        self.assertEqual(recovery["recoverable_work_units"][0]["objective"], "Implement the bounded recovery fixture")
+        late_unit = run(
+            "python3", str(self.script), "work-unit-register", "TASK-1", "WU-LATE", "general",
+            "A new unit created after recovery start", cwd=worktree, env=self.env,
+        )
+        late_digest = json.loads(late_unit.stdout)["semantic_sha256"]
+        late_record = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-LATE",
+            late_digest, "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(late_record.returncode, 0)
+        self.assertIn("not recoverable when recovery started", late_record.stderr)
+        state_text = state.read_text(encoding="utf-8")
+        self.assertIn("operator-asserted usage-limit observation (runtime unverified)", state_text)
+        self.assertNotIn("reason=genuine usage-limit observation", state_text)
+        main_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+        )
+        task_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=worktree, env=self.env
+        )
+        self.assertEqual(json.loads(main_route.stdout)["selected"], "general-fallback")
+        self.assertEqual(json.loads(main_route.stdout)["model"], "openai/gpt-5.6-terra")
+        self.assertEqual(json.loads(task_route.stdout), json.loads(main_route.stdout))
+        main_config.write_text(
+            original_main_config_text.replace(
+                '"just project::build": "allow"', '"just project::build": "deny"'
+            ),
+            encoding="utf-8",
+        )
+        project_drifted_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(project_drifted_route.returncode, 0)
+        self.assertIn("project permission mismatch", project_drifted_route.stderr)
+        main_config.write_text(original_main_config_text, encoding="utf-8")
+        current_main_agent_text = main_agent.read_text(encoding="utf-8")
+        main_agent.write_text(
+            current_main_agent_text.replace(
+                '    "just project::build": allow', '    "just project::build": deny'
+            ),
+            encoding="utf-8",
+        )
+        drifted_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(drifted_route.returncode, 0)
+        self.assertIn("role authority mismatch for general", drifted_route.stderr)
+        main_agent.write_text(current_main_agent_text, encoding="utf-8")
+        recovery_path = worktree / ".task-state" / "recovery.json"
+        tampered = json.loads(recovery_path.read_text(encoding="utf-8"))
+        tampered["routes"]["general"]["agent"] = "general"
+        recovery_path.write_text(json.dumps(tampered), encoding="utf-8")
+        route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+        )
+        self.assertEqual(json.loads(route.stdout)["selected"], "general-fallback")
+        self.assertEqual(json.loads(route.stdout)["model"], "openai/gpt-5.6-terra")
+        unknown_unit = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-2",
+            work_unit["semantic_sha256"], "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(unknown_unit.returncode, 0)
+        self.assertIn("unknown Work Unit", unknown_unit.stderr)
+        semantic_mismatch = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
+            "0" * 64, "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(semantic_mismatch.returncode, 0)
+        self.assertIn("semantic mismatch", semantic_mismatch.stderr)
+        main_agent.write_text(
+            current_main_agent_text.replace(
+                '    "just project::build": allow', '    "just project::build": deny'
+            ),
+            encoding="utf-8",
+        )
+        drifted_record = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
+            work_unit["semantic_sha256"], "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(drifted_record.returncode, 0)
+        self.assertIn("role authority mismatch for general", drifted_record.stderr)
+        main_agent.write_text(current_main_agent_text, encoding="utf-8")
+        main_config.write_text(
+            original_main_config_text.replace(
+                '"just project::build": "allow"', '"just project::build": "deny"'
+            ),
+            encoding="utf-8",
+        )
+        project_drifted_record = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
+            work_unit["semantic_sha256"], "completed", cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(project_drifted_record.returncode, 0)
+        self.assertIn("project permission mismatch", project_drifted_record.stderr)
+        main_config.write_text(original_main_config_text, encoding="utf-8")
+        recorded = run(
+            "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1",
+            work_unit["semantic_sha256"], "completed",
+            cwd=worktree, env=self.env,
+        )
+        self.assertEqual(json.loads(recorded.stdout)["selected_agent"], "general-fallback")
+        self.assertEqual(json.loads(recorded.stdout)["selected_model"], "openai/gpt-5.6-terra")
+        persisted_unit = run(
+            "python3", str(self.script), "work-unit-status", "TASK-1", "WU-1", cwd=worktree, env=self.env
+        )
+        self.assertEqual(json.loads(persisted_unit.stdout)["state"], "completed")
+        reopen = run(
+            "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-1", "in-flight",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(reopen.returncode, 0)
+        self.assertIn("invalid Work Unit transition", reopen.stderr)
+
+        exhausted_policy = task_policy.read_text(encoding="utf-8").replace(
+            'fallback_agents = ["general-fallback"]',
+            "fallback_agents = []",
+        ).replace(
+            'fallback_models = ["openai/gpt-5.6-terra"]',
+            "fallback_models = []",
+            1,
+        )
+        task_policy.write_text(exhausted_policy, encoding="utf-8")
+        exhausted = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+        )
+        self.assertEqual(json.loads(exhausted.stdout)["status"], "BLOCKED")
+        task_policy.write_text(original_task_policy_text, encoding="utf-8")
+        task_agent.write_text(original_task_agent_text, encoding="utf-8")
+        main_agent.write_text(original_main_agent_text, encoding="utf-8")
+        run("python3", str(self.script), "recovery-clear", "TASK-1", cwd=self.repo, env=self.env)
+        self.assertFalse((worktree / ".task-state" / "recovery.json").exists())
+
         run("python3", str(self.script), "state-set", "TASK-1", "cancelled", cwd=worktree, env=self.env)
         cleanup = run("python3", str(self.script), "cleanup", "TASK-1", cwd=self.repo, env=self.env)
         self.assertIn('"taskStateDiscarded": true', cleanup.stdout)
         self.assertFalse(worktree.exists())
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,9 @@
 version = 1
 
+[families]
+spark = ["openai/gpt-5.3-codex-spark"]
+"gpt-5.6" = ["openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai/gpt-5.6-terra"]
+
 [classification]
 retryable_http_status = [429]
 usage_markers = [
