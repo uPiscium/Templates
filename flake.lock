@@ -34,10 +34,31 @@
         "type": "github"
       }
     },
+    "opencodePolicy": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1786698952,
+        "narHash": "sha256-71KWm4YQV2PysPH9Np3IuMr2Fh1n0w7TuH5JfexQ6pE=",
+        "owner": "upiscium",
+        "repo": "OpenCodePolicy",
+        "rev": "e4ff446514c303fe275ba9eb3a4ab498caea7ac0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "upiscium",
+        "repo": "OpenCodePolicy",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "opencodePolicy": "opencodePolicy"
       }
     },
     "systems": {

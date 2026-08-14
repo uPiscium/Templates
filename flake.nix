@@ -4,20 +4,39 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    opencodePolicy = {
+      url = "github:upiscium/OpenCodePolicy";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, opencodePolicy }:
     flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = nixpkgs.legacyPackages.${system}; in {
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            just
-            python3
-            git
-            gh
-          ];
-        };
-      })
+      if system == "x86_64-darwin" then { }
+      else
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          isLinux = pkgs.stdenv.hostPlatform.isLinux;
+        in {
+          devShells.default = pkgs.mkShell {
+            packages = with pkgs; [
+              just
+              python3
+              git
+              gh
+            ];
+          };
+        } // nixpkgs.lib.optionalAttrs isLinux {
+          checks.opencode-policy = pkgs.runCommand "templates-opencode-policy" {
+            nativeBuildInputs = [ opencodePolicy.packages.${system}.opencode-policy ];
+          } ''
+            opencode-policy audit-consumer \
+              --profile agent-core \
+              --consumer ${self} \
+              --strict
+            touch "$out"
+          '';
+        })
     // {
     templates = {
       python = {
