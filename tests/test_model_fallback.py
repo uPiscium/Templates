@@ -96,11 +96,19 @@ class ModelFallbackTest(unittest.TestCase):
 
     def test_recovery_chain_exhaustion_is_machine_readable(self) -> None:
         cfg = {"families": {"spark": ["spark-model"]}, "roles": {
-            "r": {"primary_agent": "a", "primary_model": "spark-model",
+            "r": {"primary_agent": "r", "primary_model": "spark-model",
                    "fallback_agents": [], "fallback_models": []}}}
         result = fallback.recovery_route("r", "spark", cfg)
         self.assertEqual(result["status"], "BLOCKED")
         self.assertEqual(result["reason"], "fallback chain exhausted")
+
+    def test_cross_role_agent_substitution_fails_closed(self) -> None:
+        cfg = {"roles": {"general": {
+            "primary_agent": "general", "primary_model": "spark-model",
+            "fallback_agents": ["build"], "fallback_models": ["other-model"],
+        }}}
+        with self.assertRaisesRegex(fallback.FallbackError, "cross-role fallback agent"):
+            fallback.role_chain("general", cfg)
 
     def test_main_fallback_is_not_automatic(self) -> None:
         result = fallback.next_fallback("build", "build", self.cfg)

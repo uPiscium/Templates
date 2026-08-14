@@ -53,6 +53,10 @@ def role_chain(role: str, cfg: dict) -> dict:
         raise FallbackError(f"invalid fallback chain for {role}: agent/model length mismatch")
     if len(set(models)) != len(models):
         raise FallbackError(f"invalid fallback chain for {role}: duplicate model")
+    if agents[0] != role:
+        raise FallbackError(f"invalid fallback chain for {role}: primary agent must match role")
+    if any(agent != f"{role}-fallback" for agent in agents[1:]):
+        raise FallbackError(f"invalid fallback chain for {role}: cross-role fallback agent")
     return {
         "role": role,
         "automatic": bool(entry.get("automatic", False)),

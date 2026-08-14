@@ -66,19 +66,47 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
         self.assertNotEqual(duplicate.returncode, 0)
 
+        task_policy = worktree / ".automation" / "model-fallback.toml"
+        original_task_policy_text = task_policy.read_text(encoding="utf-8")
+        task_policy_text = original_task_policy_text.replace(
+            'fallback_models = ["openai/gpt-5.6-luna"]',
+            'fallback_models = ["openai/gpt-5.6-terra"]',
+            1,
+        )
+        task_policy.write_text(task_policy_text, encoding="utf-8")
+
+        unknown_task_policy = task_policy_text.replace(
+            'spark = ["openai/gpt-5.3-codex-spark"]',
+            'task-spark = ["openai/gpt-5.3-codex-spark"]',
+        )
+        task_policy.write_text(unknown_task_policy, encoding="utf-8")
+        unknown = run(
+            "python3", str(self.script), "recovery-start", "TASK-1", "spark",
+            cwd=self.repo, check=False, env=self.env,
+        )
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("unknown model family", unknown.stderr)
+        task_policy.write_text(task_policy_text, encoding="utf-8")
+
         started = run(
             "python3", str(self.script), "recovery-start", "TASK-1", "spark", cwd=self.repo, env=self.env
         )
         recovery = json.loads(started.stdout)
         self.assertEqual(recovery["routing"]["task-orchestrator"], "task-orchestrator-fallback")
         self.assertEqual(recovery["routing"]["general"], "general-fallback")
+        self.assertEqual(recovery["routes"]["general"]["model"], "openai/gpt-5.6-terra")
         state_text = state.read_text(encoding="utf-8")
         self.assertIn("operator-asserted usage-limit observation (runtime unverified)", state_text)
         self.assertNotIn("reason=genuine usage-limit observation", state_text)
-        route = run(
+        main_route = run(
             "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
         )
-        self.assertEqual(json.loads(route.stdout)["selected"], "general-fallback")
+        task_route = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=worktree, env=self.env
+        )
+        self.assertEqual(json.loads(main_route.stdout)["selected"], "general-fallback")
+        self.assertEqual(json.loads(main_route.stdout)["model"], "openai/gpt-5.6-terra")
+        self.assertEqual(json.loads(task_route.stdout), json.loads(main_route.stdout))
         recovery_path = worktree / ".task-state" / "recovery.json"
         tampered = json.loads(recovery_path.read_text(encoding="utf-8"))
         tampered["routes"]["general"]["agent"] = "general"
@@ -87,10 +115,28 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
             "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
         )
         self.assertEqual(json.loads(route.stdout)["selected"], "general-fallback")
-        run(
+        self.assertEqual(json.loads(route.stdout)["model"], "openai/gpt-5.6-terra")
+        recorded = run(
             "python3", str(self.script), "recovery-record", "TASK-1", "general", "WU-1", "completed",
             cwd=worktree, env=self.env,
         )
+        self.assertEqual(json.loads(recorded.stdout)["selected_agent"], "general-fallback")
+        self.assertEqual(json.loads(recorded.stdout)["selected_model"], "openai/gpt-5.6-terra")
+
+        exhausted_policy = task_policy.read_text(encoding="utf-8").replace(
+            'fallback_agents = ["general-fallback"]',
+            "fallback_agents = []",
+        ).replace(
+            'fallback_models = ["openai/gpt-5.6-terra"]',
+            "fallback_models = []",
+            1,
+        )
+        task_policy.write_text(exhausted_policy, encoding="utf-8")
+        exhausted = run(
+            "python3", str(self.script), "recovery-route", "TASK-1", "general", cwd=self.repo, env=self.env
+        )
+        self.assertEqual(json.loads(exhausted.stdout)["status"], "BLOCKED")
+        task_policy.write_text(original_task_policy_text, encoding="utf-8")
         run("python3", str(self.script), "recovery-clear", "TASK-1", cwd=self.repo, env=self.env)
         self.assertFalse((worktree / ".task-state" / "recovery.json").exists())
 

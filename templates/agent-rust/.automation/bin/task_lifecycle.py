@@ -278,14 +278,19 @@ def recovery_start(root: Path, task: str, family: str) -> None:
     status = state_status(state_path(record.path))
     if status in TERMINAL_STATES:
         raise LifecycleError(f"recovery requires nonterminal Task State, found {status}")
-    cfg = fallback_module(root).policy(root)
+    # Execute only the guarded caller worktree's helper code. The target Task's
+    # policy data is authoritative, but must not become executable Main code.
+    helper = fallback_module(root)
+    cfg = helper.policy(record.path)
     if family not in cfg.get("families", {}):
         raise LifecycleError(f"unknown model family: {family}")
     path = recovery_path(record.path)
     if path.exists():
         raise LifecycleError(f"recovery state already exists for {task}; clear it explicitly first")
-    helper = fallback_module(root)
-    routes = {role: helper.recovery_route(role, family, cfg) for role in cfg.get("roles", {})}
+    try:
+        routes = {role: helper.recovery_route(role, family, cfg) for role in cfg.get("roles", {})}
+    except helper.FallbackError as exc:
+        raise LifecycleError(str(exc)) from exc
     orchestrator = routes.get("task-orchestrator")
     if not orchestrator or orchestrator.get("status") == "BLOCKED":
         raise LifecycleError("recovery Task Orchestrator route is BLOCKED")
@@ -341,12 +346,12 @@ def recovery_status(root: Path, task: str) -> None:
 
 
 def recovery_route(root: Path, task: str, role: str) -> None:
-    _, value = recovery_read(root, task)
+    record, value = recovery_read(root, task)
     if not value.get("active"):
         raise LifecycleError(f"no active recovery state for {task}")
     helper = fallback_module(root)
     try:
-        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(root))
+        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(record.path))
     except helper.FallbackError as exc:
         raise LifecycleError(str(exc)) from exc
     print(json.dumps({"role": role, "primary": route["agents"][0], "primary_model": route["models"][0], "selected": route.get("agent"),
@@ -377,7 +382,7 @@ def recovery_record(root: Path, task: str, role: str, work_unit: str, outcome: s
     validate_recovery_identity(value, record, task)
     helper = fallback_module(root)
     try:
-        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(root))
+        route = helper.recovery_route(role, value["unavailable_family"], helper.policy(record.path))
     except helper.FallbackError as exc:
         raise LifecycleError(str(exc)) from exc
     if route.get("status") == "BLOCKED":
