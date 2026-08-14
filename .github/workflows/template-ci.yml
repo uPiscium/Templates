@@ -17,6 +17,11 @@ jobs:
         run: python3 -m unittest discover -s tests -v
       - name: Generated template drift
         run: python3 tools/render_templates.py check
+      - uses: cachix/install-nix-action@v31
+      - name: Evaluate all flake systems
+        run: nix flake check --all-systems --no-build --no-update-lock-file
+      - name: OpenCodePolicy contract
+        run: nix build .#checks.x86_64-linux.opencode-policy --no-link --no-update-lock-file
 
   generated-template-smoke:
     runs-on: ubuntu-latest

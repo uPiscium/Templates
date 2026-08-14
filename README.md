@@ -226,6 +226,23 @@ Then require the repository CI/smoke suite. Automation Core changes must be revi
 
 ## Template development
 
+### OpenCodePolicy dependency
+
+The Templates source repository pins [`upiscium/OpenCodePolicy`](https://github.com/upiscium/OpenCodePolicy) through the root `flake.lock` and audits this checkout against the explicit `agent-core` profile. OpenCodePolicy owns the shared policy and compatibility contract; Templates remains the Agent Core implementation and distribution owner.
+
+The dependency is a Templates development and validation gate only. It is not rendered into generated templates, does not change `.automation/UPSTREAM`, and does not generate OpenCode configuration.
+
+Policy revisions advance only through an explicit dependency update:
+
+```sh
+nix flake update opencodePolicy
+nix flake check --no-update-lock-file
+python3 -m unittest discover -s tests -v
+just template::check
+```
+
+Review the resulting `flake.lock` diff and policy audit before merging. OpenCodePolicy `main` moving does not change Templates until this lockfile is deliberately updated.
+
 ```sh
 just template::render agent-base
 just template::render agent-python
