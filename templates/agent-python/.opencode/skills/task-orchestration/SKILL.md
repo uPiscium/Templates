@@ -10,7 +10,7 @@ Use this skill when the Main Orchestrator is asked to run a specific Task that a
 1. Resolve the explicit Task ID and assigned worktree.
 2. Confirm the Task is not already owned by another active Task Orchestrator.
 3. Launch exactly one `task-orchestrator` for that Task.
-4. Require the Task Orchestrator to operate only in the assigned worktree and to use bounded Work Units.
+4. Require the Task Orchestrator to operate only in the assigned worktree and to use bounded Work Units. Before each leaf delegation it must call guarded `work-unit-register` with a stable ID, requested role, and exact objective; never delegate an unregistered Work Unit.
 5. Require the Task Orchestrator to enforce leaf escalation-only status contract: Depth-2 units may only return `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`.
 6. Require the Task Orchestrator to treat `NEEDS_APPROVAL`/`NEEDS_DECISION` as its own decision point:
    - re-validate scope, authority, least privilege, safety, alternatives, and evidence;

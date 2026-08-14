@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 import tempfile
 import tomllib
@@ -109,6 +110,26 @@ class ModelFallbackTest(unittest.TestCase):
         }}}
         with self.assertRaisesRegex(fallback.FallbackError, "cross-role fallback agent"):
             fallback.role_chain("general", cfg)
+
+    def test_policy_models_are_bound_to_agent_frontmatter(self) -> None:
+        core = ROOT / "components" / "agent-core"
+        for role in self.cfg["roles"]:
+            fallback.validate_agent_binding(role, self.cfg, [core])
+        with tempfile.TemporaryDirectory() as directory:
+            task_root = Path(directory)
+            agents = task_root / ".opencode" / "agents"
+            agents.mkdir(parents=True)
+            for name in ("general", "general-fallback"):
+                shutil.copy2(core / ".opencode" / "agents" / f"{name}.md", agents / f"{name}.md")
+            fallback_agent = agents / "general-fallback.md"
+            fallback_agent.write_text(
+                fallback_agent.read_text(encoding="utf-8").replace(
+                    "model: openai/gpt-5.6-luna", "model: openai/gpt-5.6-terra"
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(fallback.FallbackError, "agent model mismatch"):
+                fallback.validate_agent_binding("general", self.cfg, [task_root])
 
     def test_main_fallback_is_not_automatic(self) -> None:
         result = fallback.next_fallback("build", "build", self.cfg)

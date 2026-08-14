@@ -613,6 +613,7 @@ global permissive plan
         self.assertEqual(set(task_permissions), expected_task_targets)
 
     def test_recovery_contract_and_authority_parity(self) -> None:
+        self.assertEqual(permission_for("build"), permission_for("build-fallback"))
         primary = permission_for("task-orchestrator")
         fallback = permission_for("task-orchestrator-fallback")
         self.assertEqual(primary, fallback)
@@ -620,6 +621,9 @@ global permissive plan
             "just agent::recovery-status *",
             "just agent::recovery-route *",
             "just agent::recovery-record *",
+            "just agent::work-unit-register *",
+            "just agent::work-unit-status *",
+            "just agent::work-unit-state-set *",
         ):
             self.assertEqual(primary["bash"].get(command), "allow", command)
         for command in ("just agent::recovery-start *", "just agent::recovery-clear *"):
@@ -642,6 +646,8 @@ global permissive plan
             "blocked",
         ):
             self.assertIn(phrase, skill)
+        self.assertLess(skill.index("work-unit-status"), skill.index("next call `recovery-route`"))
+        self.assertLess(skill.index("next call `recovery-route`"), skill.index("may the orchestrator delegate"))
         fallback_body = body_text("task-orchestrator-fallback").lower()
         self.assertIn("before every leaf delegation", fallback_body)
         self.assertIn("never launch the unavailable-family primary first", fallback_body)

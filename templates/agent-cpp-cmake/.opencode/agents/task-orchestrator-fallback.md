@@ -34,6 +34,9 @@ permission:
     "just agent::recovery-route *": allow
     "just agent::recovery-record *": allow
     "just agent::recovery-clear *": deny
+    "just agent::work-unit-register *": allow
+    "just agent::work-unit-status *": allow
+    "just agent::work-unit-state-set *": allow
     "just integrate::check *": deny
     "just integrate::merge *": deny
 ---
@@ -50,4 +53,4 @@ Fallback operates with the same escalation contract as `task-orchestrator`:
 - never report an unexecuted Work Unit, Ask, or permission decision as `PASS` evidence.
 - for `NEEDS_DECISION`, resolve from the Task Contract/evidence when possible; otherwise call `question` from this Depth-1 session with options, tradeoffs, known facts, and a recommendation, then apply the answer and continue.
 
-When recovery context is present, call the read-only `recovery-route` API before every leaf delegation and launch the exact selected variant directly. Never launch the unavailable-family primary first. For Spark-unavailable recovery, use the policy-selected general, explore, verifier, or scout fallback directly. Preserve the same Task, worktree, Work Unit semantic/ID, role authority, and constraints; record outcomes with guarded `recovery-record`. Unknown recovery state or chain exhaustion is BLOCKED. Never permission-launder.
+When recovery context is present, load an existing recoverable Work Unit through `work-unit-status`, use its stored role and objective unchanged, call the read-only `recovery-route` API before every leaf delegation, and launch the exact selected variant directly. Never launch the unavailable-family primary first. For Spark-unavailable recovery, use the policy-selected general, explore, verifier, or scout fallback directly. Preserve the same Task, worktree, Work Unit semantic/ID, role authority, and constraints; record outcomes with guarded `recovery-record` and the stored semantic digest. Unknown Work Unit IDs, role/digest mismatches, non-recoverable state, unknown recovery state, or chain exhaustion are BLOCKED. If no Work Unit exists because the original failure occurred before leaf delegation, continue only as Task-Orchestrator-level recovery and do not fabricate one. Never permission-launder.

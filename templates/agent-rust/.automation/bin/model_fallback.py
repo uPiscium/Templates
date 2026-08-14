@@ -86,6 +86,32 @@ def recovery_route(role: str, unavailable_family: str, cfg: dict) -> dict:
     return {"status": "BLOCKED", "reason": "fallback chain exhausted", **chain}
 
 
+def agent_model(root: Path, agent: str) -> str:
+    path = root / ".opencode" / "agents" / f"{agent}.md"
+    if not path.is_file():
+        raise FallbackError(f"missing agent definition for {agent}: {path}")
+    text = path.read_text(encoding="utf-8")
+    frontmatter = re.match(r"\A---\n(.*?)\n---(?:\n|\Z)", text, re.DOTALL)
+    if not frontmatter:
+        raise FallbackError(f"invalid agent frontmatter for {agent}: {path}")
+    models = re.findall(r"(?m)^model:\s*(\S+)\s*$", frontmatter.group(1))
+    if len(models) != 1:
+        raise FallbackError(f"agent definition must declare exactly one model for {agent}: {path}")
+    return models[0]
+
+
+def validate_agent_binding(role: str, cfg: dict, roots: list[Path]) -> None:
+    chain = role_chain(role, cfg)
+    for agent, expected_model in zip(chain["agents"], chain["models"]):
+        for root in roots:
+            actual_model = agent_model(root, agent)
+            if actual_model != expected_model:
+                raise FallbackError(
+                    f"agent model mismatch for {agent}: policy={expected_model}, "
+                    f"definition={actual_model}, root={root}"
+                )
+
+
 def next_fallback(role: str, failed_agent: str, cfg: dict) -> dict:
     chain = role_chain(role, cfg)
     if not chain["automatic"]:
