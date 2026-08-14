@@ -26,12 +26,13 @@ The following failures do not trigger automatic fallback:
 
 ## Role-specific fallback split
 
-Fallbacks cross token-quota families. Codex 5.6 variants share quota, so a 5.6-primary role falls back to Spark rather than another 5.6 model. Spark-primary leaf roles fall back to Luna.
+Fallbacks cross token-quota families. Codex 5.6 variants share quota, so a 5.6-primary role falls back to Spark rather than another 5.6 model. Luna-primary roles fall back to Spark, while Spark-primary leaf roles fall back to Luna.
 
 The role split is:
 
 - `task-orchestrator` → **Spark** primary, explicit policy fallback to **Sol**.
-- `general`, `explore`, `verifier`, `scout` → **Spark** primary, explicit policy fallback to **Luna**.
+- `general`, `explore` → **Luna** primary, explicit policy fallback to **Spark**.
+- `verifier`, `scout` → **Spark** primary, explicit policy fallback to **Luna**.
 - `architect`, `reviewer`, `investigator`, `security-reviewer` → their existing 5.6 primary, explicit policy fallback to **Spark**.
 - `build` → **Sol** primary, manual fallback to **Spark**.
 
@@ -43,7 +44,7 @@ This boundary should be revisited when OpenCode adds native cross-model fallback
 
 ## Explicit post-failure recovery
 
-`/task-recover TASK FAMILY` is the supported recovery workflow after a failure. It initializes Main, starts and inspects guarded recovery state, routes directly to the policy-selected orchestrator variant, and preserves the same Task, worktree, Work Unit semantic/ID, and role authority. A Spark-unavailable family skips its unavailable primary and routes directly to the selected general, explore, verifier, or scout fallback. The recovery orchestrator routes before every leaf delegation, records outcomes through guarded APIs, and runs to `integration-pending`. `/task-recover-clear` clears only an explicitly identified recovery state.
+`/task-recover TASK FAMILY` is the supported recovery workflow after a failure. It initializes Main, starts and inspects guarded recovery state, routes directly to the policy-selected orchestrator variant, and preserves the same Task, worktree, Work Unit semantic/ID, and role authority. For every Work Unit, recovery derives the selected primary or fallback variant from the Task-scoped policy and skips every model in the unavailable family. The recovery orchestrator routes before every leaf delegation, records outcomes through guarded APIs, and runs to `integration-pending`. `/task-recover-clear` clears only an explicitly identified recovery state.
 
 The assigned Task worktree's `.automation/model-fallback.toml` is authoritative for start, route, and evidence selection, even when Main invokes the guarded command. Main resolves and validates the registered Task worktree first; it never substitutes its own potentially newer policy for the Task's role/model contract. The guarded command executes only its caller worktree's trusted helper code and treats the target Task policy strictly as data, preventing a Task-local helper edit from becoming executable Main code. Every route call recomputes from the Task-scoped policy, so the Main and Task-worktree views remain identical for the versioned policy contract and a stale or tampered routing snapshot is not authoritative. Policy chains must keep the primary agent equal to the requested role and fallback agent equal to that role's statically configured `<role>-fallback` variant; arbitrary or nonexistent variants fail closed.
 

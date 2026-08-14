@@ -52,16 +52,16 @@ automatic = true
 
 [roles.general]
 primary_agent = "general"
-primary_model = "openai/gpt-5.3-codex-spark"
+primary_model = "openai/gpt-5.6-luna"
 fallback_agents = ["general-fallback"]
-fallback_models = ["openai/gpt-5.6-luna"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = true
 
 [roles.explore]
 primary_agent = "explore"
-primary_model = "openai/gpt-5.3-codex-spark"
+primary_model = "openai/gpt-5.6-luna"
 fallback_agents = ["explore-fallback"]
-fallback_models = ["openai/gpt-5.6-luna"]
+fallback_models = ["openai/gpt-5.3-codex-spark"]
 automatic = true
 
 [roles.verifier]

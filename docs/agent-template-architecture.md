@@ -663,10 +663,11 @@ The intended initial model allocation is:
 | --- | --- | --- |
 | Main Orchestrator / planning / architecture | GPT-5.6 Sol | decomposition, orchestration, integration decisions |
 | Task Orchestrator | GPT-5.3 Codex Spark | fast bounded Task orchestration |
-| general / explore / verifier / scout | GPT-5.6 Luna | implementation, discovery, verification, external research |
+| general / explore | GPT-5.6 Luna | implementation and discovery |
+| verifier / scout | GPT-5.3 Codex Spark | deterministic verification and lightweight external research |
 | reviewer / investigator / security-reviewer | GPT-5.6 Terra | analysis, diagnosis, review |
 
-This is the final split: `task-orchestrator` is the only Spark primary, while all listed leaf execution/research roles use Luna-first allocation.
+This split keeps `task-orchestrator`, `verifier`, and `scout` Spark-primary, while `general` and `explore` use Luna-first allocation. The configured fallback for each role crosses model families without changing its authority contract.
 High-quality analysis roles remain as configured (reviewer/investigator/security-reviewer on Terra).
 
 Exact provider model IDs are validated at implementation time. Missing model IDs must not be silently substituted with similar names.

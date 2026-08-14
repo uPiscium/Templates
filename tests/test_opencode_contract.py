@@ -256,8 +256,8 @@ class OpenCodeContractTest(unittest.TestCase):
             "build.md": "openai/gpt-5.6-sol",
             "plan.md": "openai/gpt-5.6-sol",
             "task-orchestrator.md": "openai/gpt-5.3-codex-spark",
-            "general.md": "openai/gpt-5.3-codex-spark",
-            "explore.md": "openai/gpt-5.3-codex-spark",
+            "general.md": "openai/gpt-5.6-luna",
+            "explore.md": "openai/gpt-5.6-luna",
             "verifier.md": "openai/gpt-5.3-codex-spark",
             "reviewer.md": "openai/gpt-5.6-terra",
             "investigator.md": "openai/gpt-5.6-terra",
@@ -275,12 +275,18 @@ class OpenCodeContractTest(unittest.TestCase):
             if not path.name.endswith("-fallback.md")
             and "model: openai/gpt-5.3-codex-spark" in frontmatter(path)
         }
-        self.assertEqual(spark_primaries, {"task-orchestrator.md", "general.md", "explore.md", "verifier.md", "scout.md"})
+        self.assertEqual(spark_primaries, {"task-orchestrator.md", "verifier.md", "scout.md"})
+
+    def test_luna_primary_agents(self) -> None:
+        luna_primaries = {
+            path.name for path in AGENTS.glob("*.md")
+            if not path.name.endswith("-fallback.md")
+            and "model: openai/gpt-5.6-luna" in frontmatter(path)
+        }
+        self.assertEqual(luna_primaries, {"general.md", "explore.md"})
 
     def test_spark_leaf_fallback_agents(self) -> None:
         expected_luna_fallback = {
-            "general-fallback.md",
-            "explore-fallback.md",
             "verifier-fallback.md",
             "scout-fallback.md",
         }
@@ -292,8 +298,8 @@ class OpenCodeContractTest(unittest.TestCase):
             "build-fallback.md": "openai/gpt-5.3-codex-spark",
             "architect-fallback.md": "openai/gpt-5.3-codex-spark",
             "task-orchestrator-fallback.md": "openai/gpt-5.6-sol",
-            "general-fallback.md": "openai/gpt-5.6-luna",
-            "explore-fallback.md": "openai/gpt-5.6-luna",
+            "general-fallback.md": "openai/gpt-5.3-codex-spark",
+            "explore-fallback.md": "openai/gpt-5.3-codex-spark",
             "verifier-fallback.md": "openai/gpt-5.6-luna",
             "reviewer-fallback.md": "openai/gpt-5.3-codex-spark",
             "investigator-fallback.md": "openai/gpt-5.3-codex-spark",
@@ -650,7 +656,8 @@ global permissive plan
         self.assertLess(skill.index("next call `recovery-route`"), skill.index("may the orchestrator delegate"))
         fallback_body = body_text("task-orchestrator-fallback").lower()
         self.assertIn("before every leaf delegation", fallback_body)
-        self.assertIn("never launch the unavailable-family primary first", fallback_body)
+        self.assertIn("never launch an unavailable-family model first", fallback_body)
+        self.assertIn("derive routing from a hardcoded role set", fallback_body)
         self.assertIn("permission-launder", fallback_body)
 
 
