@@ -277,6 +277,37 @@ def validate_failure_field(name: str, value: str, maximum: int) -> None:
         )
 
 
+def configured_agent_model(worktree: Path, role: str) -> str:
+    if role not in WORK_UNIT_ROLES:
+        raise LifecycleError(f"invalid persisted Work Unit role: {role!r}")
+    path = worktree / ".opencode" / "agents" / f"{role}.md"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise LifecycleError(f"cannot read configured agent for role {role}: {path}") from exc
+    if not lines or lines[0] != "---":
+        raise LifecycleError(f"configured agent has invalid frontmatter: {path}")
+    try:
+        frontmatter_end = lines.index("---", 1)
+    except ValueError as exc:
+        raise LifecycleError(f"configured agent has invalid frontmatter: {path}") from exc
+    declarations = []
+    for line in lines[1:frontmatter_end]:
+        match = re.fullmatch(r"model:\s*(.*?)\s*", line)
+        if match is not None:
+            declarations.append(match.group(1))
+    if len(declarations) != 1:
+        raise LifecycleError(
+            f"configured agent must declare exactly one model for role {role}: {path}"
+        )
+    configured = declarations[0]
+    if len(configured) >= 2 and configured[0] == configured[-1] and configured[0] in {'"', "'"}:
+        configured = configured[1:-1]
+    if not re.fullmatch(r"[^\s/]+/[^\s/]+", configured):
+        raise LifecycleError(f"configured agent has invalid model for role {role}: {path}")
+    return configured
+
+
 def empty_work_units(record: WorktreeRecord, task: str) -> dict:
     return {
         "schema_version": 1,
@@ -376,6 +407,15 @@ def work_unit_state_set(
         return
     if status not in WORK_UNIT_TRANSITIONS.get(previous, set()):
         raise LifecycleError(f"invalid Work Unit transition: {previous} -> {status}")
+    if all(supplied_failure_fields):
+        assert provider is not None and model is not None
+        configured = configured_agent_model(record.path, unit.get("requested_role"))
+        reported = f"{provider}/{model}"
+        if reported != configured:
+            raise LifecycleError(
+                "provider failure model does not match configured Work Unit role: "
+                f"role={unit.get('requested_role')}, configured={configured}, reported={reported}"
+            )
     now = utc_now()
     transition = {
         "from": previous,

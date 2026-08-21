@@ -140,11 +140,42 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
 
         run(
-            "python3", str(self.script), "work-unit-register", "TASK-1", "WU-3", "general",
+            "python3", str(self.script), "work-unit-register", "TASK-1", "WU-3", "verifier",
+            "Reject mismatched provider model evidence", cwd=worktree, env=self.env,
+        )
+        work_units_path = worktree / ".task-state" / "work-units.json"
+        state_before_rejections = state.read_text(encoding="utf-8")
+        work_units_before_rejections = work_units_path.read_text(encoding="utf-8")
+        mismatched = run(
+            "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-3", "blocked",
+            "Reported model did not match the configured verifier model",
+            "--provider", "openai", "--model", "gpt-5.6-terra", "--error", "model unavailable",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertIn("does not match configured Work Unit role", mismatched.stderr)
+        self.assertEqual(work_units_before_rejections, work_units_path.read_text(encoding="utf-8"))
+        self.assertEqual(state_before_rejections, state.read_text(encoding="utf-8"))
+        unchanged = json.loads(work_units_path.read_text(encoding="utf-8"))["units"]["WU-3"]
+        self.assertEqual("in-flight", unchanged["state"])
+        self.assertEqual([], unchanged["transitions"])
+
+        partial = run(
+            "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-3", "blocked",
+            "Partial provider failure evidence", "--provider", "openai",
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertIn("requires provider, model, and error together", partial.stderr)
+        self.assertEqual(work_units_before_rejections, work_units_path.read_text(encoding="utf-8"))
+        self.assertEqual(state_before_rejections, state.read_text(encoding="utf-8"))
+
+        run(
+            "python3", str(self.script), "work-unit-register", "TASK-1", "WU-4", "general",
             "Reject contradictory completion evidence", cwd=worktree, env=self.env,
         )
         contradictory = run(
-            "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-3", "completed",
+            "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-4", "completed",
             "Contradictory provider failure",
             "--provider", "openai", "--model", "gpt-5.6-luna", "--error", "model unavailable",
             cwd=worktree, check=False, env=self.env,
@@ -152,7 +183,7 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.assertNotEqual(contradictory.returncode, 0)
         self.assertIn("only valid for a blocked Work Unit", contradictory.stderr)
         unchanged = run(
-            "python3", str(self.script), "work-unit-status", "TASK-1", "WU-3",
+            "python3", str(self.script), "work-unit-status", "TASK-1", "WU-4",
             cwd=worktree, env=self.env,
         )
         self.assertEqual("in-flight", json.loads(unchanged.stdout)["state"])

@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-SUPPORTED_AGENT_CORE_VERSION = "2"
+SUPPORTED_AGENT_CORE_VERSION = "3"
 TASK_ID_RE = re.compile(r"(?m)^- Task ID: (.+)$")
 BRANCH_RE = re.compile(r"(?m)^- Branch: (.+)$")
 WORKTREE_RE = re.compile(r"(?m)^- Worktree: (.+)$")
