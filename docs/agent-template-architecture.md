@@ -255,10 +255,10 @@ plan
 ├── question = allow
 ├── bash = deny
 └── delegation
-    ├── explore / explore-fallback
-    ├── architect / architect-fallback
-    ├── reviewer / reviewer-fallback
-    └── security-reviewer / security-reviewer-fallback
+    ├── explore
+    ├── architect
+    ├── reviewer
+    └── security-reviewer
 ```
 
 `plan` may use native reads and approved read-only leaves to produce requirements analysis and implementation sequencing. It must not delegate to `general`, `verifier`, `investigator`, `task-orchestrator`, or any implementation/execution-capable agent. It must not start Task lifecycle, edit `.task-state/**`, run raw Git/GitHub mutation, or run project-controlled commands.
@@ -662,12 +662,12 @@ The intended initial model allocation is:
 | Role | Model family | Responsibility |
 | --- | --- | --- |
 | Main Orchestrator / planning / architecture | GPT-5.6 Sol | decomposition, orchestration, integration decisions |
-| Task Orchestrator | GPT-5.3 Codex Spark | fast bounded Task orchestration |
+| Task Orchestrator | GPT-5.6 Sol | bounded Task orchestration |
 | general / explore | GPT-5.6 Luna | implementation and discovery |
-| verifier / scout | GPT-5.3 Codex Spark | deterministic verification and lightweight external research |
+| verifier / scout | GPT-5.6 Luna | deterministic verification and lightweight external research |
 | reviewer / investigator / security-reviewer | GPT-5.6 Terra | analysis, diagnosis, review |
 
-This split keeps `task-orchestrator`, `verifier`, and `scout` Spark-primary, while `general` and `explore` use Luna-first allocation. The configured fallback for each role crosses model families without changing its authority contract.
+This split assigns Sol to orchestration and architecture, Luna to bounded implementation/reconnaissance/verification/research, and Terra to review/investigation/security. Each role has one fixed model; unavailable execution returns `BLOCKED` without model substitution.
 High-quality analysis roles remain as configured (reviewer/investigator/security-reviewer on Terra).
 
 Exact provider model IDs are validated at implementation time. Missing model IDs must not be silently substituted with similar names.
@@ -720,7 +720,7 @@ Where safe, Task ID should be used as a namespace. If a safe namespace cannot be
 
 Generated repositories own their development policy through repository-local configuration.
 
-Global OpenCode configuration should be limited to user-level concerns such as provider configuration, credentials integration, TUI preferences, and conservative fallbacks.
+Global OpenCode configuration should be limited to user-level concerns such as provider configuration, credentials integration, and TUI preferences.
 
 Repository-local configuration owns:
 
@@ -764,7 +764,7 @@ This architecture does not require:
 
 This contract changes leaf execution semantics and advances Agent Core from version 1 to version 2. Existing generated repositories must apply this as a dedicated Automation Maintenance upgrade rather than copying individual prompts or permission rules into an ordinary implementation Task:
 
-1. Deploy the new Task Orchestrator and Task Orchestrator fallback prompts (including exact status contract and escalation re-check rules) to every generated repository path that carries these agents.
+1. Deploy the Task Orchestrator prompt (including exact status contract and escalation re-check rules) to every generated repository path that carries it.
 2. Update leaf agent instructions and any agent templates so Depth-2 units are non-interactive and return only `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`.
 3. Add/validate tooling checks that treat any unrecognized leaf status as invalid evidence and block the Task.
 4. Require depth-1 re-evaluation on `NEEDS_APPROVAL`/`NEEDS_DECISION`, including explicit checks for:
@@ -774,7 +774,7 @@ This contract changes leaf execution semantics and advances Agent Core from vers
    - alternative actions
    - current evidence quality.
 5. Enforce that leaf-to-depth-1 escalation is a release gate; only completion evidence or explicit `BLOCKED` with rationale passes the boundary.
-6. Preserve existing lifecycle invariants: initialization contract, fallback policy behavior, no merge from depth-1, no sibling worktree access.
+6. Preserve existing lifecycle invariants: initialization contract, fixed-model fail-closed behavior, no merge from depth-1, no sibling worktree access.
 7. Run `docs/opencode-depth2-ask-smoke.md` as an upstream compatibility canary, but treat it as non-gating for release.
 
 ## 28. Follow-up implementation mapping

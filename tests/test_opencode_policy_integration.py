@@ -31,6 +31,10 @@ class OpenCodePolicyIntegrationTest(unittest.TestCase):
         node = self.lock["nodes"]["opencodePolicy"]
         self.assertEqual("upiscium", node["locked"]["owner"])
         self.assertEqual("OpenCodePolicy", node["locked"]["repo"])
+        self.assertEqual(
+            "103b47b67a7e650835ac277ed192dbc92d1639c4",
+            node["locked"]["rev"],
+        )
         self.assertRegex(node["locked"]["rev"], r"^[0-9a-f]{40}$")
         self.assertEqual(["nixpkgs"], node["inputs"]["nixpkgs"])
         self.assertEqual("opencodePolicy", self.lock["nodes"]["root"]["inputs"]["opencodePolicy"])
@@ -57,9 +61,9 @@ class OpenCodePolicyIntegrationTest(unittest.TestCase):
             flake = ROOT / "templates" / template / "flake.nix"
             self.assertNotIn("opencodePolicy", flake.read_text(encoding="utf-8"), template)
 
-    def test_agent_core_version_and_upstream_are_unchanged(self) -> None:
+    def test_agent_core_version_and_upstream_are_expected(self) -> None:
         core = ROOT / "components" / "agent-core" / ".automation"
-        self.assertEqual("2\n", (core / "VERSION").read_text(encoding="utf-8"))
+        self.assertEqual("3\n", (core / "VERSION").read_text(encoding="utf-8"))
         self.assertEqual(
             'repository = "github:upiscium/Templates"\nref = "main"\n'
             'component = "components/agent-core"\n',

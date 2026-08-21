@@ -30,7 +30,6 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             "smoke-escalation issue='issue-41'",
             "smoke-escalation-reject issue='issue-41'",
             "validate-escalation issue='issue-41'",
-            "smoke-fallback issue='issue-41'",
             "direct-leaf issue='issue-41'",
             "export-session session issue='issue-41'",
         ):
@@ -53,7 +52,6 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 ("SMOKE-ASK", "depth2-ask"),
                 ("SMOKE-ESCALATION", "leaf-escalation"),
                 ("SMOKE-ESCALATION-PERMISSION", "leaf-escalation-permission"),
-                ("SMOKE-FALLBACK", "model-fallback"),
             },
         )
 
@@ -111,20 +109,6 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("do not retry", reject_scope)
         self.assertIn("Task Orchestrator session", reject_acceptance)
         self.assertIn("command does not execute", reject_acceptance)
-
-        smoke_fallback = next(
-            definition
-            for definition in runtime.TASK_DEFINITIONS
-            if definition[0] == "SMOKE-FALLBACK"
-        )
-        fallback_scope = " ".join(smoke_fallback[3])
-        fallback_acceptance = " ".join(smoke_fallback[4])
-        self.assertIn("run only `git status --short` once", fallback_scope)
-        self.assertIn(
-            "retry the identical `git status --short` Work Unit",
-            fallback_scope,
-        )
-        self.assertIn("same diagnostic permission profile", fallback_acceptance)
 
     def test_task_contract_replaces_unresolved_template_content(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -357,7 +341,7 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                         }
                     )
                 )
-            self.assertEqual(profiles[0], profiles[1])
+            self.assertEqual(1, len(profiles))
 
     def test_runtime_canary_extends_future_noninteractive_leaf_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -370,36 +354,17 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 '    "just project::check": allow\n---\n',
                 encoding="utf-8",
             )
-            (agents / "general-fallback.md").write_text(
-                "---\npermission:\n  task: deny\n  question: deny\n  bash:\n"
-                '    "*": deny\n'
-                '    "just agent::fallback-record *": deny\n---\n',
-                encoding="utf-8",
-            )
-
             runtime.harden_runtime_leaf_permissions(repo)
 
             primary = (agents / "general.md").read_text(encoding="utf-8")
-            fallback = (agents / "general-fallback.md").read_text(encoding="utf-8")
-            for name, text in (("primary", primary), ("fallback", fallback)):
-                self.assertEqual(1, text.count('    "*": deny\n'), name)
-                self.assertIn(
-                    '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
-                    text,
-                    name,
-                )
-                self.assertNotIn(
-                    '    "printf \'leaf-escalation-approved\\\\n\'": ask\n',
-                    text,
-                    name,
-                )
-                self.assertNotIn(
-                    '    "git push origin HEAD:main": ask\n',
-                    text,
-                    name,
-                )
+            self.assertEqual(1, primary.count('    "*": deny\n'))
+            self.assertIn(
+                '    "printf \'depth2-ask-approved\\\\n\'": ask\n',
+                primary,
+            )
+            self.assertNotIn('    "printf \'leaf-escalation-approved\\\\n\'": ask\n', primary)
+            self.assertNotIn('    "git push origin HEAD:main": ask\n', primary)
             self.assertIn('    "just project::check": allow\n', primary)
-            self.assertIn('    "just agent::fallback-record *": deny\n', fallback)
 
     def test_runtime_canary_rejects_interactive_leaf_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -411,11 +376,6 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 '    "*": ask\n---\n',
                 encoding="utf-8",
             )
-            (agents / "general-fallback.md").write_text(
-                "---\npermission:\n  task: deny\n  bash:\n---\n",
-                encoding="utf-8",
-            )
-
             with self.assertRaisesRegex(
                 runtime.RuntimeSmokeError,
                 "non-deny question permission",
@@ -635,7 +595,6 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                     "git",
                     "add",
                     ".opencode/agents/general.md",
-                    ".opencode/agents/general-fallback.md",
                 ],
                 commands,
             )
@@ -673,7 +632,8 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertIn("Ask origin is Task Orchestrator session", report)
         self.assertIn("`runtime::validate-escalation`", report)
         self.assertIn("must remain INCOMPLETE", report)
-        self.assertIn("primary/fallback diagnostic permission parity", report)
+        self.assertIn("configured fixed model", report)
+        self.assertIn("no model substitution", report)
         self.assertIn("PASS / FAIL / INCOMPLETE", report)
         self.assertIn("Do not infer PASS", report)
 

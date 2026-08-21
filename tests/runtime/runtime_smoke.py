@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ROOT = ROOT / ".runtime-smoke"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-RUNTIME_GENERAL_AGENTS = ("general.md", "general-fallback.md")
+RUNTIME_GENERAL_AGENTS = ("general.md",)
 LEAF_ESCALATION_COMMANDS = (
     "printf 'leaf-escalation-approved\\n'",
     "git push origin HEAD:main",
@@ -100,26 +100,6 @@ TASK_DEFINITIONS = (
             "No retry, replacement command, permission laundering, or false PASS occurs after rejection.",
         ],
         ["Run from Main TUI with `/task-run SMOKE-ESCALATION-PERMISSION` under `just runtime::smoke-escalation-reject`; the release operator rejects the surfaced Ask."],
-    ),
-    (
-        "SMOKE-FALLBACK",
-        "model-fallback",
-        "Observe genuine usage/quota/rate-limit fallback behavior without manufacturing a provider failure.",
-        [
-            "Task Orchestrator must delegate exactly one Work Unit to `general`: run only `git status --short` once and return the result.",
-            "If and only if `general` has a classified eligible usage-limit failure, retry the identical `git status --short` Work Unit once with `general-fallback`.",
-            "Neither primary nor fallback may choose another command or operation.",
-            "Do not intentionally consume quota or damage credentials/model configuration.",
-            "If no genuine usage-limit condition occurs, record runtime fallback as INCOMPLETE.",
-        ],
-        [
-            "Any genuine eligible failure is classified before fallback.",
-            "Only the configured fallback variant is selected.",
-            "Primary and fallback use the same diagnostic permission profile and exact Work Unit.",
-            "`git status --short` completes without a permission denial on whichever variant runs.",
-            "No genuine trigger is reported as INCOMPLETE rather than PASS.",
-        ],
-        ["Run from Main TUI with `/task-run SMOKE-FALLBACK` under `just runtime::smoke-fallback`."],
     ),
 )
 
@@ -384,6 +364,7 @@ def report_template(issue: str, metadata: dict) -> str:
 - OpenCode version: `{metadata['opencodeVersion']}`
 - Template: `{metadata['template']}`
 - Fixture: `{metadata['smokeRepo']}`
+- Model selection: configured fixed model; no model substitution
 - Created: {metadata['createdAt']}
 
 ## Preparation
@@ -395,7 +376,6 @@ def report_template(issue: str, metadata: dict) -> str:
 - SMOKE-ASK contract: READY
 - SMOKE-ESCALATION contract: READY
 - SMOKE-ESCALATION-PERMISSION contract: READY
-- SMOKE-FALLBACK contract: READY
 
 ## Ask-free nested control
 
@@ -463,14 +443,6 @@ def report_template(issue: str, metadata: dict) -> str:
 - approval propagation: PASS / FAIL / INCOMPLETE
 - rejection propagation: PASS / FAIL / INCOMPLETE
 - result: PASS / FAIL / INCOMPLETE
-
-## Model fallback observation
-
-- deterministic preflight: PASS / FAIL / INCOMPLETE
-- primary/fallback diagnostic permission parity: PASS / FAIL / INCOMPLETE
-- exact `git status --short` Work Unit preserved: PASS / FAIL / INCOMPLETE
-- genuine usage-limit observed: YES / NO
-- runtime fallback: PASS / FAIL / INCOMPLETE
 
 ## Diagnosis
 
@@ -593,7 +565,7 @@ def prepare(issue: str, template: str) -> dict:
     ask_repo = repo / ".worktrees" / "SMOKE-ASK-depth2-ask"
     harden_runtime_leaf_permissions(ask_repo)
     run_logged(
-        ["git", "add", ".opencode/agents/general.md", ".opencode/agents/general-fallback.md"],
+        ["git", "add", ".opencode/agents/general.md"],
         cwd=ask_repo,
         log=prepare_log,
     )

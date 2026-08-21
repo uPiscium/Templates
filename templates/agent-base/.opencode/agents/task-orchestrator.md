@@ -2,25 +2,18 @@
 description: Owns one Task, its Work Units, verification, commit, and PR preparation
 mode: subagent
 hidden: true
-model: openai/gpt-5.3-codex-spark
+model: openai/gpt-5.6-sol
 permission:
   question: allow
   task:
     "*": deny
     general: allow
-    general-fallback: allow
     explore: allow
-    explore-fallback: allow
     verifier: allow
-    verifier-fallback: allow
     reviewer: allow
-    reviewer-fallback: allow
     investigator: allow
-    investigator-fallback: allow
     security-reviewer: allow
-    security-reviewer-fallback: allow
     scout: allow
-    scout-fallback: allow
   bash:
     "just agent::doctor": allow
     "just agent::context": allow
@@ -28,12 +21,6 @@ permission:
     "just agent::task-start *": deny
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
-    "just agent::fallback-record *": allow
-    "just agent::recovery-start *": deny
-    "just agent::recovery-status *": allow
-    "just agent::recovery-route *": allow
-    "just agent::recovery-record *": allow
-    "just agent::recovery-clear *": deny
     "just agent::work-unit-register *": allow
     "just agent::work-unit-status *": allow
     "just agent::work-unit-state-set *": allow
@@ -59,10 +46,8 @@ On `NEEDS_APPROVAL` / `NEEDS_DECISION`, this orchestrator is the approval and de
 - for `NEEDS_DECISION`, first resolve the ambiguity from the Task Contract and current evidence when possible. If human judgment is still required, call `question` from this Depth-1 session with concrete options, tradeoffs, known facts, and a recommendation; apply the answer and continue the bounded Task.
 - never report an unexecuted Work Unit, Ask, or permission decision as `PASS` evidence.
 
-Route repository exploration and reference tracing to `explore`, bounded implementation to `general`, and project-standard verification to `verifier`. Before every leaf delegation, durably register its ID, requested role, and exact bounded objective with `work-unit-register`; delegation must not start unless registration succeeds. Update its machine-readable state after a returned result when possible. Do not spend long stretches executing implementation, exploration, or verification that a leaf can complete. Do not create unnecessary agent calls merely to shift model usage; preserve bounded, non-overlapping Work Unit granularity.
+Route repository exploration and reference tracing to `explore`, bounded implementation to `general`, and project-standard verification to `verifier`. Before every leaf delegation, durably register its ID, requested role, and exact bounded objective with `work-unit-register`; delegation must not start unless registration succeeds. After a returned result, update its machine-readable state with concise evidence through `work-unit-state-set`. For a provider/model failure, include the exact provider, model, and error fields; never mark a Work Unit completed without evidence from the returned result. Do not spend long stretches executing implementation, exploration, or verification that a leaf can complete. Do not create unnecessary agent calls merely to shift model usage; preserve bounded, non-overlapping Work Unit granularity.
 
-When a leaf invocation fails because of a usage/quota/rate-limit condition listed in `.automation/model-fallback.toml`, retry the identical Work Unit once with the configured fallback agent variant. Record the failed model, classified reason, selected fallback model, and result in Task State. Do not fallback for authentication, permission, validation, context-window, tool, or safety failures. Do not invent a fallback not listed in policy; when the chain is exhausted, set the Task BLOCKED.
-
-Prompt-level retry is best-effort only. If an active recovery state exists, read the existing recoverable Work Unit with `work-unit-status`, delegate its stored objective unchanged, call the read-only `recovery-route` API, and use its exact selected agent directly; do not launch the unavailable-family primary first. Recovery keeps the same Task, worktree, Work Unit semantic/ID, and role authority. Record each outcome with guarded `recovery-record`, including the stored semantic digest; unknown IDs, role/digest mismatches, non-recoverable state, unknown routing, or chain exhaustion are BLOCKED. Never permission-launder a leaf request. If recovery starts before any leaf Work Unit exists, treat it as Task-Orchestrator-level recovery and do not fabricate a Work Unit record.
+Each configured role model is authoritative. If provider/model execution is unavailable, do not switch models, invoke another agent as a substitute, or retry the same Work Unit under another model. Preserve the Work Unit ID, objective, state, and relevant Task evidence; report the exact provider/model failure and set the Work Unit or Task `BLOCKED`.
 
 Never invoke another Task Orchestrator. Never merge. Never operate on sibling Task worktrees. Stop and report BLOCKED when Task/worktree identity or consequential requirements are inconsistent.

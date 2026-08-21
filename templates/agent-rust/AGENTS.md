@@ -20,7 +20,7 @@ This repository is designed for hierarchical agent-driven development.
 - A user-rejected Depth-1 permission decision is final for that exact operation within the Task. It must not be retried, rephrased, re-delegated, or replaced by an equivalent operation; use recorded permission evidence and a safe alternative or BLOCKED result.
 - A command or check that was not executed must never be reported as PASS.
 - Unresolved leaf requests must not be inferred as approval. For `NEEDS_DECISION`, the Task Orchestrator resolves from the Task Contract/evidence when possible; if human judgment remains necessary, it asks from Depth 1 with options, tradeoffs, known facts, and a recommendation, then applies the answer.
-- Do not substitute a different model ID when an explicitly configured model is unavailable. Use only explicitly configured fallback policy where applicable.
+- Each configured role model is authoritative. If it is unavailable, do not substitute another model or retry the same objective under another model; preserve relevant evidence, report the exact provider/model failure, and return `BLOCKED`.
 
 ## Initialization layers
 

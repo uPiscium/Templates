@@ -85,15 +85,15 @@ class RenderTemplatesTest(unittest.TestCase):
         (output / "core.txt").write_text("changed")
         self.assertEqual(check_template(self.root, self.spec()), ["changed: core.txt"])
 
-    def test_check_detects_missing_generated_plan_fallback(self) -> None:
+    def test_check_detects_missing_generated_agent(self) -> None:
         source = self.root / "components" / "agent-core" / ".opencode" / "agents"
         source.mkdir(parents=True)
-        (source / "plan-fallback.md").write_text("fallback", encoding="utf-8")
+        (source / "plan.md").write_text("plan", encoding="utf-8")
         output = render_template(self.root, self.spec())
-        (output / ".opencode" / "agents" / "plan-fallback.md").unlink()
+        (output / ".opencode" / "agents" / "plan.md").unlink()
         self.assertEqual(
             check_template(self.root, self.spec()),
-            ["missing: .opencode/agents/plan-fallback.md"],
+            ["missing: .opencode/agents/plan.md"],
         )
 
     def test_minimum_just_version_stays_in_sync(self) -> None:

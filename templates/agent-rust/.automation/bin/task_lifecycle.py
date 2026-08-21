@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
-import importlib.util
 import json
 import re
 import subprocess
@@ -16,10 +15,8 @@ from pathlib import Path
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 WORK_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-RECOVERY_OUTCOMES = {"completed", "blocked", "needs-approval", "needs-decision", "failed"}
 WORK_UNIT_ROLES = {"general", "explore", "verifier", "reviewer", "investigator", "security-reviewer", "scout"}
 WORK_UNIT_STATES = {"in-flight", "failed", "completed", "blocked", "needs-approval", "needs-decision"}
-RECOVERABLE_WORK_UNIT_STATES = {"in-flight", "failed"}
 WORK_UNIT_TRANSITIONS = {
     "in-flight": {"failed", "completed", "blocked", "needs-approval", "needs-decision"},
     "failed": set(),
@@ -27,10 +24,6 @@ WORK_UNIT_TRANSITIONS = {
     "blocked": set(),
     "needs-approval": set(),
     "needs-decision": set(),
-}
-RECOVERY_WORK_UNIT_TRANSITIONS = {
-    "in-flight": RECOVERY_OUTCOMES,
-    "failed": RECOVERY_OUTCOMES,
 }
 VALID_STATES = {
     "initialized",
@@ -232,24 +225,8 @@ def state_path(worktree: Path) -> Path:
     return worktree / ".task-state" / "task.md"
 
 
-def recovery_path(worktree: Path) -> Path:
-    return worktree / ".task-state" / "recovery.json"
-
-
 def work_units_path(worktree: Path) -> Path:
     return worktree / ".task-state" / "work-units.json"
-
-
-def fallback_module(root: Path):
-    path = root / ".automation" / "bin" / "model_fallback.py"
-    if not path.is_file():
-        raise LifecycleError(f"missing fallback policy helper: {path}")
-    spec = importlib.util.spec_from_file_location("model_fallback_recovery", path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -261,11 +238,13 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def append_recovery_evidence(path: Path, line: str) -> None:
+def append_task_evidence(path: Path, heading: str, line: str) -> None:
     text = path.read_text(encoding="utf-8")
-    heading = "### Model fallback recovery"
-    if heading in text:
-        text = text.replace(heading, heading + "\n- " + line, 1)
+    placeholder = heading + "\n\nNone yet."
+    if placeholder in text:
+        text = text.replace(placeholder, heading + "\n\n- " + line, 1)
+    elif heading in text:
+        text = text.replace(heading, heading + "\n\n- " + line, 1)
     elif "## Evidence" in text:
         text = text.replace("## Evidence", "## Evidence\n\n" + heading + "\n- " + line, 1)
     else:
@@ -284,6 +263,49 @@ def semantic_digest(objective: str) -> str:
 def validate_objective(objective: str) -> None:
     if not objective or len(objective) > 2000 or any(ord(char) < 32 for char in objective):
         raise LifecycleError("Work Unit objective must be a non-empty single line of at most 2000 characters")
+
+
+def validate_evidence(evidence: str) -> None:
+    if not evidence or len(evidence) > 4000 or any(ord(char) < 32 for char in evidence):
+        raise LifecycleError("Work Unit evidence must be a non-empty single line of at most 4000 characters")
+
+
+def validate_failure_field(name: str, value: str, maximum: int) -> None:
+    if not value or len(value) > maximum or any(ord(char) < 32 for char in value):
+        raise LifecycleError(
+            f"provider failure {name} must be a non-empty single line of at most {maximum} characters"
+        )
+
+
+def configured_agent_model(worktree: Path, role: str) -> str:
+    if role not in WORK_UNIT_ROLES:
+        raise LifecycleError(f"invalid persisted Work Unit role: {role!r}")
+    path = worktree / ".opencode" / "agents" / f"{role}.md"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise LifecycleError(f"cannot read configured agent for role {role}: {path}") from exc
+    if not lines or lines[0] != "---":
+        raise LifecycleError(f"configured agent has invalid frontmatter: {path}")
+    try:
+        frontmatter_end = lines.index("---", 1)
+    except ValueError as exc:
+        raise LifecycleError(f"configured agent has invalid frontmatter: {path}") from exc
+    declarations = []
+    for line in lines[1:frontmatter_end]:
+        match = re.fullmatch(r"model:\s*(.*?)\s*", line)
+        if match is not None:
+            declarations.append(match.group(1))
+    if len(declarations) != 1:
+        raise LifecycleError(
+            f"configured agent must declare exactly one model for role {role}: {path}"
+        )
+    configured = declarations[0]
+    if len(configured) >= 2 and configured[0] == configured[-1] and configured[0] in {'"', "'"}:
+        configured = configured[1:-1]
+    if not re.fullmatch(r"[^\s/]+/[^\s/]+", configured):
+        raise LifecycleError(f"configured agent has invalid model for role {role}: {path}")
+    return configured
 
 
 def empty_work_units(record: WorktreeRecord, task: str) -> dict:
@@ -328,13 +350,15 @@ def work_unit_register(root: Path, task: str, work_unit: str, role: str, objecti
         "objective": objective,
         "semantic_sha256": semantic_digest(objective),
         "state": "in-flight",
+        "transitions": [],
         "created_at": now,
         "updated_at": now,
     }
     value["units"][work_unit] = unit
     atomic_json(work_units_path(record.path), value)
-    append_recovery_evidence(
+    append_task_evidence(
         state_path(record.path),
+        "## Work Units",
         f"work_unit_registered={work_unit}; requested_role={role}; semantic_sha256={unit['semantic_sha256']}; state=in-flight",
     )
     print(json.dumps(unit, sort_keys=True))
@@ -348,10 +372,31 @@ def work_unit_status(root: Path, task: str, work_unit: str) -> None:
     print(json.dumps(unit, sort_keys=True))
 
 
-def work_unit_state_set(root: Path, task: str, work_unit: str, status: str) -> None:
+def work_unit_state_set(
+    root: Path,
+    task: str,
+    work_unit: str,
+    status: str,
+    evidence: str,
+    provider: str | None,
+    model: str | None,
+    error: str | None,
+) -> None:
     record = require_local_task(root, task)
     if status not in WORK_UNIT_STATES:
         raise LifecycleError(f"invalid Work Unit state: {status}")
+    validate_evidence(evidence)
+    failure_fields = (provider, model, error)
+    supplied_failure_fields = tuple(value is not None for value in failure_fields)
+    if any(supplied_failure_fields) and not all(supplied_failure_fields):
+        raise LifecycleError("provider failure evidence requires provider, model, and error together")
+    if all(supplied_failure_fields):
+        if status != "blocked":
+            raise LifecycleError("provider failure evidence is only valid for a blocked Work Unit")
+        assert provider is not None and model is not None and error is not None
+        validate_failure_field("provider", provider, 200)
+        validate_failure_field("model", model, 200)
+        validate_failure_field("error", error, 4000)
     value = read_work_units(record, task)
     unit = value["units"].get(work_unit)
     if unit is None:
@@ -362,202 +407,39 @@ def work_unit_state_set(root: Path, task: str, work_unit: str, status: str) -> N
         return
     if status not in WORK_UNIT_TRANSITIONS.get(previous, set()):
         raise LifecycleError(f"invalid Work Unit transition: {previous} -> {status}")
-    unit["state"] = status
-    unit["updated_at"] = utc_now()
-    atomic_json(work_units_path(record.path), value)
-    print(json.dumps(unit, sort_keys=True))
-
-
-def validate_policy_agent_bindings(helper, cfg: dict, task_root: Path, caller_root: Path) -> None:
-    roots = [task_root]
-    if caller_root.resolve() != task_root.resolve():
-        roots.append(caller_root)
-    try:
-        helper.validate_project_permission_binding(roots)
-        for role in cfg.get("roles", {}):
-            helper.validate_agent_binding(role, cfg, roots)
-    except helper.FallbackError as exc:
-        raise LifecycleError(str(exc)) from exc
-
-
-def validate_recovery_identity(value: dict, record: WorktreeRecord, task: str) -> None:
-    executable_root = main_worktree(record.path).path
-    expected = {
-        "task_id": task,
-        "worktree": str(record.path),
-        "branch": record.branch,
-        "active": True,
-        "reason": "usage_limit",
-        "source": "operator",
-        "executable_root": str(executable_root),
-    }
-    mismatches = [key for key, expected_value in expected.items() if value.get(key) != expected_value]
-    if mismatches:
-        raise LifecycleError("recovery state identity mismatch: " + ", ".join(mismatches))
-
-
-def recovery_start(root: Path, task: str, family: str) -> None:
-    require_main_worktree(root)
-    record = worktree_for_task(root, task)
-    assert_task_identity(record, task)
-    status = state_status(state_path(record.path))
-    if status in TERMINAL_STATES:
-        raise LifecycleError(f"recovery requires nonterminal Task State, found {status}")
-    # Execute only the guarded caller worktree's helper code. The target Task's
-    # policy data is authoritative, but must not become executable Main code.
-    helper = fallback_module(root)
-    cfg = helper.policy(record.path)
-    if family not in cfg.get("families", {}):
-        raise LifecycleError(f"unknown model family: {family}")
-    validate_policy_agent_bindings(helper, cfg, record.path, root)
-    path = recovery_path(record.path)
-    if path.exists():
-        raise LifecycleError(f"recovery state already exists for {task}; clear it explicitly first")
-    try:
-        routes = {role: helper.recovery_route(role, family, cfg) for role in cfg.get("roles", {})}
-    except helper.FallbackError as exc:
-        raise LifecycleError(str(exc)) from exc
-    orchestrator = routes.get("task-orchestrator")
-    if not orchestrator or orchestrator.get("status") == "BLOCKED":
-        raise LifecycleError("recovery Task Orchestrator route is BLOCKED")
+    if all(supplied_failure_fields):
+        assert provider is not None and model is not None
+        configured = configured_agent_model(record.path, unit.get("requested_role"))
+        reported = f"{provider}/{model}"
+        if reported != configured:
+            raise LifecycleError(
+                "provider failure model does not match configured Work Unit role: "
+                f"role={unit.get('requested_role')}, configured={configured}, reported={reported}"
+            )
     now = utc_now()
-    value = {
-        "schema_version": 1,
-        "active": True,
-        "reason": "usage_limit",
-        "source": "operator",
-        "executable_root": str(root.resolve()),
-        "task_id": task,
-        "worktree": str(record.path),
-        "branch": record.branch,
-        "started_at": now,
-        "updated_at": now,
-        "unavailable_family": family,
-        "routing": {role: route.get("agent") for role, route in routes.items() if route.get("agent")},
-        "routes": routes,
-        "events": [],
-        "recoverable_work_units": [
-            unit for unit in read_work_units(record, task)["units"].values()
-            if unit.get("state") in RECOVERABLE_WORK_UNIT_STATES
-        ],
+    transition = {
+        "from": previous,
+        "to": status,
+        "evidence": evidence,
+        "evidence_sha256": semantic_digest(evidence),
+        "recorded_at": now,
     }
-    atomic_json(path, value)
-    append_recovery_evidence(
+    if all(supplied_failure_fields):
+        transition["provider_failure"] = {
+            "provider": provider,
+            "model": model,
+            "error": error,
+        }
+    unit["state"] = status
+    unit.setdefault("transitions", []).append(transition)
+    unit["updated_at"] = now
+    atomic_json(work_units_path(record.path), value)
+    append_task_evidence(
         state_path(record.path),
-        f"started task={task}; reason=operator-asserted usage-limit observation (runtime unverified); "
-        f"unavailable_family={family}; "
-        f"task_orchestrator={orchestrator['agent']}; model={orchestrator['model']}; routing="
-        + ",".join(f"{role}->{agent}" for role, agent in sorted(value["routing"].items())),
+        "## Work Units",
+        f"work_unit_state={work_unit}; previous={previous}; state={status}; evidence_sha256={transition['evidence_sha256']}; evidence={json.dumps(evidence)}",
     )
-    print(json.dumps(value, sort_keys=True))
-
-
-def recovery_read(root: Path, task: str) -> tuple[WorktreeRecord, dict]:
-    current, main = current_worktree(root), main_worktree(root)
-    record = worktree_for_task(root, task)
-    if current.path not in {main.path, record.path}:
-        raise LifecycleError(f"cannot inspect sibling Task worktree {record.path} from {current.path}")
-    assert_task_identity(record, task)
-    path = recovery_path(record.path)
-    if not path.is_file():
-        raise LifecycleError(f"no active recovery state for {task}")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise LifecycleError(f"invalid recovery state JSON: {path}") from exc
-    validate_recovery_identity(value, record, task)
-    return record, value
-
-
-def recovery_status(root: Path, task: str) -> None:
-    _, value = recovery_read(root, task)
-    if not value.get("active"):
-        raise LifecycleError(f"no active recovery state for {task}")
-    print(json.dumps(value, sort_keys=True))
-
-
-def recovery_route(root: Path, task: str, role: str) -> None:
-    record, value = recovery_read(root, task)
-    if not value.get("active"):
-        raise LifecycleError(f"no active recovery state for {task}")
-    executable_root = Path(value["executable_root"]).resolve()
-    helper = fallback_module(executable_root)
-    cfg = helper.policy(record.path)
-    validate_policy_agent_bindings(
-        helper, cfg, record.path, executable_root
-    )
-    try:
-        route = helper.recovery_route(role, value["unavailable_family"], cfg)
-    except helper.FallbackError as exc:
-        raise LifecycleError(str(exc)) from exc
-    print(json.dumps({"role": role, "primary": route["agents"][0], "primary_model": route["models"][0], "selected": route.get("agent"),
-                      "model": route.get("model"), "reason": route.get("reason"),
-                      "status": route.get("status")}, sort_keys=True))
-
-
-def recovery_clear(root: Path, task: str) -> None:
-    require_main_worktree(root)
-    record, value = recovery_read(root, task)
-    append_recovery_evidence(state_path(record.path), f"cleared task={task}; reason={value.get('reason')}; source={value.get('source')}")
-    recovery_path(record.path).unlink()
-    print(json.dumps({"task": task, "cleared": True}))
-
-
-def recovery_record(root: Path, task: str, role: str, work_unit: str, semantic_sha256: str, outcome: str) -> None:
-    record = require_local_task(root, task)
-    if not WORK_UNIT_RE.fullmatch(work_unit):
-        raise LifecycleError(f"invalid Work Unit ID: {work_unit!r}")
-    if outcome not in RECOVERY_OUTCOMES:
-        raise LifecycleError(f"invalid recovery outcome: {outcome}")
-    work_units = read_work_units(record, task)
-    unit = work_units["units"].get(work_unit)
-    if unit is None:
-        raise LifecycleError(f"unknown Work Unit: {work_unit}")
-    if unit.get("requested_role") != role:
-        raise LifecycleError(f"Work Unit role mismatch for {work_unit}")
-    if unit.get("semantic_sha256") != semantic_sha256:
-        raise LifecycleError(f"Work Unit semantic mismatch for {work_unit}")
-    if unit.get("state") not in RECOVERABLE_WORK_UNIT_STATES:
-        raise LifecycleError(f"Work Unit is not recoverable: {work_unit} ({unit.get('state')})")
-    if outcome not in RECOVERY_WORK_UNIT_TRANSITIONS[unit["state"]]:
-        raise LifecycleError(f"invalid recovery Work Unit transition: {unit['state']} -> {outcome}")
-    path = recovery_path(record.path)
-    if not path.is_file():
-        raise LifecycleError(f"no active recovery state for {task}")
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not value.get("active"):
-        raise LifecycleError(f"no active recovery state for {task}")
-    validate_recovery_identity(value, record, task)
-    snapshot = next(
-        (candidate for candidate in value.get("recoverable_work_units", []) if candidate.get("id") == work_unit),
-        None,
-    )
-    if snapshot is None:
-        raise LifecycleError(f"Work Unit was not recoverable when recovery started: {work_unit}")
-    if snapshot.get("requested_role") != role or snapshot.get("semantic_sha256") != semantic_sha256:
-        raise LifecycleError(f"Work Unit recovery snapshot mismatch for {work_unit}")
-    executable_root = Path(value["executable_root"]).resolve()
-    helper = fallback_module(executable_root)
-    cfg = helper.policy(record.path)
-    validate_policy_agent_bindings(
-        helper, cfg, record.path, executable_root
-    )
-    try:
-        route = helper.recovery_route(role, value["unavailable_family"], cfg)
-    except helper.FallbackError as exc:
-        raise LifecycleError(str(exc)) from exc
-    if route.get("status") == "BLOCKED":
-        raise LifecycleError(f"no selected recovery agent for role {role}")
-    event = {"requested_role": role, "work_unit": work_unit, "semantic_sha256": semantic_sha256, "selected_agent": route["agent"],
-             "selected_model": route["model"], "reason": value["reason"], "outcome": outcome}
-    value.setdefault("events", []).append(event)
-    value["updated_at"] = utc_now()
-    atomic_json(path, value)
-    unit["state"] = outcome
-    unit["updated_at"] = utc_now()
-    atomic_json(work_units_path(record.path), work_units)
-    append_recovery_evidence(state_path(record.path), "requested_role={requested_role}; selected_agent={selected_agent}; selected_model={selected_model}; reason={reason}; work_unit={work_unit}; semantic_sha256={semantic_sha256}; outcome={outcome}".format(**event))
-    print(json.dumps({"recorded": True, **event}, sort_keys=True))
+    print(json.dumps(unit, sort_keys=True))
 
 
 def state_status(path: Path) -> str:
@@ -721,9 +603,6 @@ def task_status(root: Path, task: str) -> None:
 def task_state_set(root: Path, task: str, status: str) -> None:
     record = require_local_task(root, task)
     set_state_status(state_path(record.path), status)
-    if status in TERMINAL_STATES and recovery_path(record.path).is_file():
-        append_recovery_evidence(state_path(record.path), f"discarded recovery on terminal state={status}")
-        recovery_path(record.path).unlink()
     print(json.dumps({"task": task, "status": status}))
 
 
@@ -801,9 +680,6 @@ def task_cleanup(root: Path, task: str) -> None:
             raise LifecycleError("cleanup refused: cancelled Task still has an open pull request")
 
     removed_path = str(record.path)
-    recovery_discarded = recovery_path(record.path).is_file()
-    if recovery_discarded:
-        append_recovery_evidence(state, "discarded recovery during cleanup")
     run(["git", "worktree", "remove", str(record.path)], cwd=root)
     run(["git", "branch", "-D", branch], cwd=root)
     print(
@@ -813,7 +689,6 @@ def task_cleanup(root: Path, task: str) -> None:
                 "removedWorktree": removed_path,
                 "removedBranch": branch,
                 "taskStateDiscarded": True,
-                "recoveryDiscarded": recovery_discarded,
             }
         )
     )
@@ -920,22 +795,6 @@ def parser() -> argparse.ArgumentParser:
     cleanup.add_argument("task")
     batch = sub.add_parser("batch-plan")
     batch.add_argument("tasks", nargs="+")
-    recovery_start_parser = sub.add_parser("recovery-start")
-    recovery_start_parser.add_argument("task")
-    recovery_start_parser.add_argument("family")
-    recovery_status_parser = sub.add_parser("recovery-status")
-    recovery_status_parser.add_argument("task")
-    recovery_route_parser = sub.add_parser("recovery-route")
-    recovery_route_parser.add_argument("task")
-    recovery_route_parser.add_argument("role")
-    recovery_clear_parser = sub.add_parser("recovery-clear")
-    recovery_clear_parser.add_argument("task")
-    recovery_record_parser = sub.add_parser("recovery-record")
-    recovery_record_parser.add_argument("task")
-    recovery_record_parser.add_argument("role")
-    recovery_record_parser.add_argument("work_unit")
-    recovery_record_parser.add_argument("semantic_sha256")
-    recovery_record_parser.add_argument("outcome", choices=sorted(RECOVERY_OUTCOMES))
     work_unit_register_parser = sub.add_parser("work-unit-register")
     work_unit_register_parser.add_argument("task")
     work_unit_register_parser.add_argument("work_unit")
@@ -948,6 +807,10 @@ def parser() -> argparse.ArgumentParser:
     work_unit_state_parser.add_argument("task")
     work_unit_state_parser.add_argument("work_unit")
     work_unit_state_parser.add_argument("status", choices=sorted(WORK_UNIT_STATES))
+    work_unit_state_parser.add_argument("evidence")
+    work_unit_state_parser.add_argument("--provider")
+    work_unit_state_parser.add_argument("--model")
+    work_unit_state_parser.add_argument("--error")
     return result
 
 
@@ -965,22 +828,21 @@ def main() -> int:
             task_cleanup(root, args.task)
         elif args.command == "batch-plan":
             batch_plan(root, args.tasks)
-        elif args.command == "recovery-start":
-            recovery_start(root, args.task, args.family)
-        elif args.command == "recovery-status":
-            recovery_status(root, args.task)
-        elif args.command == "recovery-route":
-            recovery_route(root, args.task, args.role)
-        elif args.command == "recovery-clear":
-            recovery_clear(root, args.task)
-        elif args.command == "recovery-record":
-            recovery_record(root, args.task, args.role, args.work_unit, args.semantic_sha256, args.outcome)
         elif args.command == "work-unit-register":
             work_unit_register(root, args.task, args.work_unit, args.role, args.objective)
         elif args.command == "work-unit-status":
             work_unit_status(root, args.task, args.work_unit)
         elif args.command == "work-unit-state-set":
-            work_unit_state_set(root, args.task, args.work_unit, args.status)
+            work_unit_state_set(
+                root,
+                args.task,
+                args.work_unit,
+                args.status,
+                args.evidence,
+                args.provider,
+                args.model,
+                args.error,
+            )
         else:  # pragma: no cover
             raise LifecycleError(f"unsupported command: {args.command}")
     except LifecycleError as exc:

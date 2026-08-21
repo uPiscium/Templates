@@ -60,18 +60,14 @@ class OpenCodeDiscoverySmokeTest(unittest.TestCase):
             "architect",
         )
         for leaf in leaves:
-            for suffix in ("", "-fallback"):
-                path = CORE / "agents" / f"{leaf}{suffix}.md"
-                if not path.exists():
-                    continue
-                text = path.read_text(encoding="utf-8")
-                self.assertRegex(text, r"(?m)^\s{2}task:\s*deny\s*$", path.name)
+            path = CORE / "agents" / f"{leaf}.md"
+            text = path.read_text(encoding="utf-8")
+            self.assertRegex(text, r"(?m)^\s{2}task:\s*deny\s*$", path.name)
 
     def test_task_orchestrator_cannot_call_itself(self) -> None:
         text = (CORE / "agents" / "task-orchestrator.md").read_text(encoding="utf-8")
         edges = set(TASK_EDGE_RE.findall(text))
         self.assertNotIn("task-orchestrator", edges)
-        self.assertNotIn("task-orchestrator-fallback", edges)
 
 
 if __name__ == "__main__":

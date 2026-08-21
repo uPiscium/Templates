@@ -132,7 +132,7 @@ Adoption/migration never commits, pushes, merges, stashes, or resets the target 
 
 ## Planning Agent
 
-Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-5.6-sol`, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer` plus their configured fallbacks. `plan-fallback` is a hidden manual primary-session fallback on `openai/gpt-5.3-codex-spark`; it preserves the same repository-local read-only authority and initialization handoff contract.
+Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-5.6-sol`, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer`.
 
 `plan` never starts the Task lifecycle, edits Task State, runs executable doctor/check commands, or reports unexecuted verification as PASS. It reads `AGENTS.md`, `.automation/INIT.md`, adapter initialization guidance, and optional Task State, then returns confirmed facts, assumptions, open decisions, a bounded implementation plan, `execution_prerequisites`, and `verification_handoff` entries for an execution-capable workflow.
 
@@ -156,7 +156,7 @@ Main
 
 Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write path. Push, merge, cleanup, unknown Bash, and designated external paths require Ask.
 
-Model fallback is policy/classification based. Automatic same-turn cross-model failover is not available in OpenCode; prompt retry is best-effort. After a failure, use the supported explicit `/task-recover TASK FAMILY` workflow, which routes directly to the configured variant while preserving Task/worktree identity and runs to integration-pending. The contract harness is deterministic configuration coverage, not genuine runtime verification; native session-preserving migration remains future work.
+Each role uses one fixed GPT-5.6 model. Agent Core does not substitute models or retry an objective under another model. If the configured provider/model is unavailable, preserve Task and Work Unit evidence, report the exact failure, and return `BLOCKED`.
 
 ## Project Adapter API
 
@@ -260,4 +260,4 @@ just template::distribution-verify
 
 ## OpenCode hierarchy
 
-The default Main agent orchestrates Tasks; Task Orchestrators own one Task; leaf agents perform bounded work and cannot re-delegate. Model fallback is role-scoped and only automatic for classified usage/quota/rate-limit failures. Depth-2 Ask behavior has a separate reproducible manual smoke procedure under `docs/opencode-depth2-ask-smoke.md` and is not represented as PASS until executed.
+The default Main agent orchestrates Tasks; Task Orchestrators own one Task; leaf agents perform bounded work and cannot re-delegate. Configured role models are fixed and fail closed when unavailable. Depth-2 Ask behavior has a separate reproducible manual smoke procedure under `docs/opencode-depth2-ask-smoke.md` and is not represented as PASS until executed.

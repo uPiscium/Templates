@@ -34,7 +34,6 @@ just runtime::status issue-41
 - `SMOKE-ASK`: Depth-2 approval/rejection probe
 - `SMOKE-ESCALATION`: release-gating durable leaf escalation probe
 - `SMOKE-ESCALATION-PERMISSION`: neutral Depth-1 Main-TUI permission-result probe; the release operator rejects its Ask
-- `SMOKE-FALLBACK`: genuine usage-limit observation only
 
 Preparation refuses to overwrite an existing `.runtime-smoke/<issue>/` workspace. Preserve existing evidence or remove the directory explicitly before requesting a genuinely fresh run.
 
@@ -88,7 +87,7 @@ The canary contract requires the Task Orchestrator to pass one exact bounded Wor
 
 The leaf must call Bash for the first printf immediately, and it must wait for that permission resolution before making any second request. A `question` event before the first Bash permission means the run is non-deterministic for this harness and must be treated as **INCOMPLETE/invalid** for this diagnostic.
 
-To keep the canary independent from production Leaf policy, `runtime::prepare` installs a diagnostic-only commit in the `SMOKE-ASK` worktree alone: `question` is denied, Bash defaults to deny, `git status --short` remains available for controls, and only the two exact canary `printf` commands use Ask. The `SMOKE-ESCALATION` worktree and all other fixtures retain the unmodified generated Leaf profile. This profile does not change generated template source or production permissions.
+To keep the canary independent from production Leaf policy, `runtime::prepare` hardens and stages only `general.md` in the `SMOKE-ASK` worktree: `question` is denied, Bash defaults to deny, `git status --short` remains available for controls, and only the two exact canary `printf` commands use Ask. The configured model remains fixed and no model substitution is performed. The `SMOKE-ESCALATION` worktree and all other fixtures retain the unmodified generated Leaf profile. This profile does not change generated template source or production permissions.
 
 Approve the first request once and reject the second. If the run is incomplete due to ordering/classification mismatch, stop and re-run `/task-run SMOKE-ASK` (new session) to collect a fresh, retryable observation.
 
@@ -147,22 +146,6 @@ just runtime::validate-escalation issue-51-final
 
 Do not mark the release gate PASS unless this command returns `status: PASS`.
 The validator, rather than model-authored acceptance-checkbox state, is authoritative for this gate. It checks ordered Leaf completions, the approved and user-rejected Ask paths, that both Ask origins match their Task Orchestrator session IDs, that rejection returns control to the parent Main session, and that the sanitized Task Orchestrator session export records the exact originating Bash tool part as `status: error` with an explicit user-permission rejection rather than completion. It also checks absence of Leaf interaction, absence of any push Bash/permission event, no rejection retry, and exact approval-leg Task-State evidence. Read-only lifecycle/status commands after the rejection do not count as retries of the rejected operation.
-
-## Model fallback observation
-
-```sh
-just runtime::smoke-fallback issue-41
-```
-
-Then run:
-
-```text
-/task-run SMOKE-FALLBACK
-```
-
-The Task Orchestrator must give `general` exactly one Work Unit: run `git status --short` once and return. Only a genuine classified usage/quota/rate-limit failure may retry that identical Work Unit with `general-fallback`. Both variants receive the same diagnostic default-deny profile and explicit status allow, so permission selection cannot contaminate the fallback observation.
-
-Do not manufacture a quota condition. If no genuine usage/quota/rate-limit failure occurs, runtime fallback remains `INCOMPLETE`.
 
 ## Session evidence
 

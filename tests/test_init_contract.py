@@ -17,6 +17,14 @@ spec.loader.exec_module(init)
 
 
 class InitContractTest(unittest.TestCase):
+    def test_runtime_version_matches_agent_core_version(self) -> None:
+        version = (
+            ROOT / "components" / "agent-core" / ".automation" / "VERSION"
+        ).read_text(encoding="utf-8").strip()
+        self.assertEqual("3", version)
+        self.assertEqual("3", init.SUPPORTED_AGENT_CORE_VERSION)
+        self.assertEqual(version, init.SUPPORTED_AGENT_CORE_VERSION)
+
     def test_default_branch_rejects_task_state(self) -> None:
         with self.assertRaisesRegex(init.InitError, "Task State must not exist"):
             init.validate_identity(Path("."), "main", "main", {"taskId": "TASK-1"})

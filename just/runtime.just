@@ -40,11 +40,6 @@ validate-escalation issue='issue-41':
     python3 {{quote(runner)}} validate-escalation --issue {{quote(issue)}}
 
 [working-directory: root]
-smoke-fallback issue='issue-41':
-    @echo "Fallback observation: in the TUI run /task-run SMOKE-FALLBACK"
-    bash {{quote(debug_runner)}} {{quote(issue)}} fallback
-
-[working-directory: root]
 direct-leaf issue='issue-41':
     bash {{quote(direct_runner)}} {{quote(issue)}}
 
