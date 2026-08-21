@@ -21,6 +21,24 @@ SPEC.loader.exec_module(upgrade)
 
 class AutomationUpgradeContractTest(unittest.TestCase):
     TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake")
+    V3_REMOVED_PATHS = (
+        ".automation/model-fallback.toml",
+        ".automation/bin/model_fallback.py",
+        ".opencode/commands/task-recover.md",
+        ".opencode/commands/task-recover-clear.md",
+        ".opencode/skills/task-recovery/SKILL.md",
+        ".opencode/agents/architect-fallback.md",
+        ".opencode/agents/build-fallback.md",
+        ".opencode/agents/explore-fallback.md",
+        ".opencode/agents/general-fallback.md",
+        ".opencode/agents/investigator-fallback.md",
+        ".opencode/agents/plan-fallback.md",
+        ".opencode/agents/reviewer-fallback.md",
+        ".opencode/agents/scout-fallback.md",
+        ".opencode/agents/security-reviewer-fallback.md",
+        ".opencode/agents/task-orchestrator-fallback.md",
+        ".opencode/agents/verifier-fallback.md",
+    )
 
     def _write_file(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -580,13 +598,64 @@ mod project 'just/project/mod.just'
                     upgrade.apply(repo, tmp)
             self.assertEqual((repo / ".automation" / "ADAPTER").read_text(), "base\n")
 
-    def test_current_v2_bridge_source_contains_no_delete_actions(self) -> None:
+    def test_current_v2_to_v3_migration_removes_obsolete_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             shutil.copytree(ROOT / "templates/agent-base", repo, symlinks=True)
+            (repo / ".automation" / "VERSION").write_text("2\n", encoding="utf-8")
+            for path in self.V3_REMOVED_PATHS:
+                self._write_file(repo / path, "obsolete\n")
             plan = upgrade.build_plan(repo, ROOT)
-            self.assertFalse(any(item["action"] == "delete" for item in plan["actions"]))
-            self.assertEqual([], upgrade.load_migrations(ROOT / "components/agent-core"))
+            self.assertTrue(plan["canApply"], plan["blockers"])
+            for path in self.V3_REMOVED_PATHS:
+                self.assertEqual("delete", self._plan_action(plan, path)["action"], path)
+
+            migrations = upgrade.load_migrations(ROOT / "components/agent-core")
+            self.assertEqual(1, len(migrations))
+            migration = migrations[0]
+            self.assertEqual((2, 3), (migration.from_version, migration.to_version))
+            self.assertEqual(tuple(map(Path, self.V3_REMOVED_PATHS)), migration.remove_paths)
+            self.assertEqual((Path(".task-state/recovery.json"),), migration.require_absent_paths)
+
+            with mock.patch.object(upgrade, "require_maintenance"):
+                upgrade.apply(repo, ROOT)
+            for path in self.V3_REMOVED_PATHS:
+                self.assertFalse((repo / path).exists(), path)
+            self.assertEqual("3\n", (repo / ".automation" / "VERSION").read_text())
+
+    def test_current_v2_to_v3_active_recovery_blocks_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            shutil.copytree(ROOT / "templates/agent-base", repo, symlinks=True)
+            (repo / ".automation" / "VERSION").write_text("2\n", encoding="utf-8")
+            obsolete = repo / self.V3_REMOVED_PATHS[0]
+            self._write_file(obsolete, "obsolete\n")
+            recovery = repo / ".task-state" / "recovery.json"
+            self._write_file(recovery, "{}\n")
+
+            plan = upgrade.build_plan(repo, ROOT)
+            self.assertFalse(plan["canApply"])
+            self.assertIn(".task-state/recovery.json", "\n".join(plan["blockers"]))
+            with mock.patch.object(upgrade, "require_maintenance"):
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.apply(repo, ROOT)
+            self.assertTrue(obsolete.is_file())
+            self.assertTrue(recovery.is_file())
+            self.assertEqual("2\n", (repo / ".automation" / "VERSION").read_text())
+
+    def test_current_v3_catches_up_obsolete_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            shutil.copytree(ROOT / "templates/agent-base", repo, symlinks=True)
+            obsolete = repo / self.V3_REMOVED_PATHS[-1]
+            self._write_file(obsolete, "obsolete\n")
+            plan = upgrade.build_plan(repo, ROOT)
+            self.assertTrue(plan["canApply"], plan["blockers"])
+            self.assertEqual("delete", self._plan_action(plan, self.V3_REMOVED_PATHS[-1])["action"])
+            with mock.patch.object(upgrade, "require_maintenance"):
+                upgrade.apply(repo, ROOT)
+            self.assertFalse(obsolete.exists())
+            self.assertEqual("3\n", (repo / ".automation" / "VERSION").read_text())
 
     def test_template_migrations_and_upgrade_script_parity_after_render(self) -> None:
         for template in self.TEMPLATE_NAMES:

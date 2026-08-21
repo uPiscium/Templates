@@ -255,60 +255,37 @@ class OpenCodeContractTest(unittest.TestCase):
         expected = {
             "build.md": "openai/gpt-5.6-sol",
             "plan.md": "openai/gpt-5.6-sol",
-            "task-orchestrator.md": "openai/gpt-5.3-codex-spark",
+            "task-orchestrator.md": "openai/gpt-5.6-sol",
             "general.md": "openai/gpt-5.6-luna",
             "explore.md": "openai/gpt-5.6-luna",
-            "verifier.md": "openai/gpt-5.3-codex-spark",
+            "verifier.md": "openai/gpt-5.6-luna",
             "reviewer.md": "openai/gpt-5.6-terra",
             "investigator.md": "openai/gpt-5.6-terra",
             "security-reviewer.md": "openai/gpt-5.6-terra",
-            "scout.md": "openai/gpt-5.3-codex-spark",
+            "scout.md": "openai/gpt-5.6-luna",
             "architect.md": "openai/gpt-5.6-sol",
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
 
-    def test_spark_primary_agents(self) -> None:
-        spark_primaries = {
+    def test_fixed_model_groups_are_exact(self) -> None:
+        sol_agents = {
             path.name
             for path in AGENTS.glob("*.md")
-            if not path.name.endswith("-fallback.md")
-            and "model: openai/gpt-5.3-codex-spark" in frontmatter(path)
+            if "model: openai/gpt-5.6-sol" in frontmatter(path)
         }
-        self.assertEqual(spark_primaries, {"task-orchestrator.md", "verifier.md", "scout.md"})
-
-    def test_luna_primary_agents(self) -> None:
-        luna_primaries = {
+        luna_agents = {
             path.name for path in AGENTS.glob("*.md")
-            if not path.name.endswith("-fallback.md")
-            and "model: openai/gpt-5.6-luna" in frontmatter(path)
+            if "model: openai/gpt-5.6-luna" in frontmatter(path)
         }
-        self.assertEqual(luna_primaries, {"general.md", "explore.md"})
-
-    def test_spark_leaf_fallback_agents(self) -> None:
-        expected_luna_fallback = {
-            "verifier-fallback.md",
-            "scout-fallback.md",
+        terra_agents = {
+            path.name for path in AGENTS.glob("*.md")
+            if "model: openai/gpt-5.6-terra" in frontmatter(path)
         }
-        for filename in expected_luna_fallback:
-            self.assertIn("model: openai/gpt-5.6-luna", frontmatter(AGENTS / filename), filename)
-
-    def test_fallback_model_assignment_is_exact(self) -> None:
-        expected = {
-            "build-fallback.md": "openai/gpt-5.3-codex-spark",
-            "plan-fallback.md": "openai/gpt-5.3-codex-spark",
-            "architect-fallback.md": "openai/gpt-5.3-codex-spark",
-            "task-orchestrator-fallback.md": "openai/gpt-5.6-sol",
-            "general-fallback.md": "openai/gpt-5.3-codex-spark",
-            "explore-fallback.md": "openai/gpt-5.3-codex-spark",
-            "verifier-fallback.md": "openai/gpt-5.6-luna",
-            "reviewer-fallback.md": "openai/gpt-5.3-codex-spark",
-            "investigator-fallback.md": "openai/gpt-5.3-codex-spark",
-            "security-reviewer-fallback.md": "openai/gpt-5.3-codex-spark",
-            "scout-fallback.md": "openai/gpt-5.6-luna",
-        }
-        for filename, model in expected.items():
-            self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
+        self.assertEqual(sol_agents, {"build.md", "plan.md", "task-orchestrator.md", "architect.md"})
+        self.assertEqual(luna_agents, {"general.md", "explore.md", "verifier.md", "scout.md"})
+        self.assertEqual(terra_agents, {"reviewer.md", "investigator.md", "security-reviewer.md"})
+        self.assertFalse(list(AGENTS.glob("*-fallback.md")))
 
 
     def test_plan_agent_repository_local_read_only_contract(self) -> None:
@@ -334,27 +311,18 @@ class OpenCodeContractTest(unittest.TestCase):
             allowed,
             {
                 "explore",
-                "explore-fallback",
                 "architect",
-                "architect-fallback",
                 "reviewer",
-                "reviewer-fallback",
                 "security-reviewer",
-                "security-reviewer-fallback",
             },
         )
         self.assertEqual(task.get("*"), "deny")
         for forbidden in (
             "general",
-            "general-fallback",
             "verifier",
-            "verifier-fallback",
             "investigator",
-            "investigator-fallback",
             "task-orchestrator",
-            "task-orchestrator-fallback",
             "scout",
-            "scout-fallback",
         ):
             self.assertEqual(task.get(forbidden), "deny", forbidden)
 
@@ -376,21 +344,7 @@ class OpenCodeContractTest(unittest.TestCase):
         ):
             self.assertIn(phrase, lower)
 
-    def test_plan_fallback_preserves_repository_local_planning_authority(self) -> None:
-        primary_front = frontmatter(AGENTS / "plan.md")
-        fallback_front = frontmatter(AGENTS / "plan-fallback.md")
-
-        self.assertIn("mode: primary", primary_front)
-        self.assertIn("mode: primary", fallback_front)
-        self.assertIn("model: openai/gpt-5.6-sol", primary_front)
-        self.assertIn("model: openai/gpt-5.3-codex-spark", fallback_front)
-        self.assertIn("hidden: true", fallback_front)
-        self.assertEqual(permission_for("plan"), permission_for("plan-fallback"))
-        self.assertEqual(body_text("plan"), body_text("plan-fallback"))
-
-    def test_generated_plan_fallback_and_policy_match_source(self) -> None:
-        source_agent = CORE / ".opencode" / "agents" / "plan-fallback.md"
-        source_policy = CORE / ".automation" / "model-fallback.toml"
+    def test_generated_templates_have_no_fallback_or_recovery_surfaces(self) -> None:
         for template in (
             "agent-base",
             "agent-python",
@@ -399,16 +353,15 @@ class OpenCodeContractTest(unittest.TestCase):
             "agent-cpp-cmake",
         ):
             generated = ROOT / "templates" / template
-            self.assertEqual(
-                source_agent.read_bytes(),
-                (generated / ".opencode" / "agents" / "plan-fallback.md").read_bytes(),
-                template,
-            )
-            self.assertEqual(
-                source_policy.read_bytes(),
-                (generated / ".automation" / "model-fallback.toml").read_bytes(),
-                template,
-            )
+            self.assertFalse(list((generated / ".opencode" / "agents").glob("*-fallback.md")), template)
+            for path in (
+                ".automation/model-fallback.toml",
+                ".automation/bin/model_fallback.py",
+                ".opencode/commands/task-recover.md",
+                ".opencode/commands/task-recover-clear.md",
+                ".opencode/skills/task-recovery/SKILL.md",
+            ):
+                self.assertFalse((generated / path).exists(), f"{template}: {path}")
 
 
     def test_opencode_debug_agent_plan_effective_policy_when_cli_available(self) -> None:
@@ -489,26 +442,17 @@ global permissive plan
         self.assertEqual(last_action("task"), "deny")
         for allowed in (
             "explore",
-            "explore-fallback",
             "architect",
-            "architect-fallback",
             "reviewer",
-            "reviewer-fallback",
             "security-reviewer",
-            "security-reviewer-fallback",
         ):
             self.assertEqual(last_action("task", allowed), "allow", allowed)
         for denied in (
             "general",
-            "general-fallback",
             "verifier",
-            "verifier-fallback",
             "investigator",
-            "investigator-fallback",
             "task-orchestrator",
-            "task-orchestrator-fallback",
             "scout",
-            "scout-fallback",
         ):
             self.assertEqual(last_action("task", denied), "deny", denied)
 
@@ -519,55 +463,37 @@ global permissive plan
     def test_leaf_agents_have_authority_contract(self) -> None:
         for leaf in LEAF_PRIMARY_AGENTS:
             primary = permission_for(leaf)
-            fallback = permission_for(f"{leaf}-fallback")
 
             self.assertTrue(permission_entries_are_scalar_lines(primary), leaf)
-            self.assertTrue(permission_entries_are_scalar_lines(fallback), f"{leaf}-fallback")
 
             self.assertEqual(primary.get("task"), "deny", leaf)
-            self.assertEqual(fallback.get("task"), "deny", f"{leaf}-fallback")
 
             self.assertEqual(primary.get("question"), "deny", leaf)
-            self.assertEqual(fallback.get("question"), "deny", f"{leaf}-fallback")
 
             self.assertEqual(primary.get("external_directory"), "deny", leaf)
-            self.assertEqual(fallback.get("external_directory"), "deny", f"{leaf}-fallback")
 
             self.assertEqual(primary.get("doom_loop"), "deny", leaf)
-            self.assertEqual(fallback.get("doom_loop"), "deny", f"{leaf}-fallback")
 
             for action in _iter_permission_values(primary):
                 self.assertNotEqual(action, "ask", leaf)
-            for action in _iter_permission_values(fallback):
-                self.assertNotEqual(action, "ask", f"{leaf}-fallback")
 
             if leaf == "scout":
                 self.assertEqual(primary.get("webfetch"), "allow", leaf)
                 self.assertEqual(primary.get("websearch"), "allow", leaf)
-                self.assertEqual(fallback.get("webfetch"), "allow", f"{leaf}-fallback")
-                self.assertEqual(fallback.get("websearch"), "allow", f"{leaf}-fallback")
             else:
                 self.assertEqual(primary.get("webfetch"), "deny", leaf)
                 self.assertEqual(primary.get("websearch"), "deny", leaf)
-                self.assertEqual(fallback.get("webfetch"), "deny", f"{leaf}-fallback")
-                self.assertEqual(fallback.get("websearch"), "deny", f"{leaf}-fallback")
 
             if leaf != "general":
                 self.assertEqual(primary.get("edit"), "deny", leaf)
-                self.assertEqual(fallback.get("edit"), "deny", f"{leaf}-fallback")
 
             primary_bash = primary.get("bash", {})
-            fallback_bash = fallback.get("bash", {})
             self.assertIsInstance(primary_bash, dict, leaf)
-            self.assertIsInstance(fallback_bash, dict, f"{leaf}-fallback")
 
             self.assertEqual(primary_bash.get("*"), "deny", leaf)
-            self.assertEqual(fallback_bash.get("*"), "deny", f"{leaf}-fallback")
 
             primary_allowed = {cmd for cmd, action in primary_bash.items() if action == "allow"}
-            fallback_allowed = {cmd for cmd, action in fallback_bash.items() if action == "allow"}
             self.assertEqual(primary_allowed, LEAF_ALLOWED_BASH[leaf], leaf)
-            self.assertEqual(fallback_allowed, LEAF_ALLOWED_BASH[leaf], f"{leaf}-fallback")
 
             for command, action in primary_bash.items():
                 if action == "allow":
@@ -578,41 +504,18 @@ global permissive plan
                         r"integrate::status|project::commit|project::publish|project::release)",
                         leaf,
                     )
-            for command, action in fallback_bash.items():
-                if action == "allow":
-                    self.assertNotRegex(
-                        command,
-                        r"(agent::task-start|agent::state-set|agent::batch-plan|agent::commit|agent::push|agent::pr-"
-                        r"create|agent::pr-edit|agent::pr-ready|agent::cleanup|integrate::check|integrate::merge|"
-                        r"integrate::status|project::commit|project::publish|project::release)",
-                        f"{leaf}-fallback",
-                    )
-
-            # Primary/fallback authority parity; metadata/model differences are not part of this assertion.
-            self.assertEqual(primary, fallback, leaf)
-
     def test_leaf_prompts_expose_completion_status_contract(self) -> None:
         for leaf in LEAF_PRIMARY_AGENTS:
-            for agent_name in (leaf, f"{leaf}-fallback"):
-                assert_prompt_contract_for_leaf_statuses(self, body_text(agent_name), agent_name)
+            assert_prompt_contract_for_leaf_statuses(self, body_text(leaf), leaf)
 
-    def test_task_orchestrator_fallback_policy_contracts(self) -> None:
+    def test_task_orchestrator_fixed_model_policy_contracts(self) -> None:
         primary_text = body_text("task-orchestrator").lower()
-        fallback_text = body_text("task-orchestrator-fallback").lower()
-        self.assertIn("retry the identical work unit once", primary_text)
-        self.assertIn("do not fallback for authentication", primary_text)
-        self.assertIn("authentication, permission", primary_text)
-        self.assertIn("when the chain is exhausted, set the task blocked", primary_text)
-        self.assertIn("record the failed model, classified reason, selected fallback model", primary_text)
-
-        self.assertIn("same authority and constraints", fallback_text)
-        self.assertIn("explicit model fallback policy", fallback_text)
-        self.assertIn("classified usage/quota/rate-limit failure", fallback_text)
-
         primary_permissions = permission_for("task-orchestrator")
-        fallback_permissions = permission_for("task-orchestrator-fallback")
-        self.assertEqual(primary_permissions, fallback_permissions)
         self.assertEqual(primary_permissions.get("question"), "allow")
+        self.assertIn("configured role model is authoritative", primary_text)
+        self.assertIn("do not switch models", primary_text)
+        self.assertIn("exact provider/model failure", primary_text)
+        self.assertIn("work unit or task `blocked`", primary_text)
 
         self.assertIn("blocked", primary_text)
         self.assertIn("continue", primary_text)
@@ -622,10 +525,7 @@ global permissive plan
             "launder" in primary_text,
             "task-orchestrator should contain anti-laundering language",
         )
-        for text, name in (
-            (primary_text, "task-orchestrator"),
-            (fallback_text, "task-orchestrator-fallback"),
-        ):
+        for text, name in ((primary_text, "task-orchestrator"),):
             self.assertIn("needs_decision", text, name)
             self.assertIn("task contract", text, name)
             self.assertIn("question", text, name)
@@ -643,57 +543,22 @@ global permissive plan
         self.assertEqual(task_permissions.get("*"), "deny")
         for leaf in TASK_ORCHESTRATOR_LEAVES:
             self.assertEqual(task_permissions.get(leaf), "allow", leaf)
-            self.assertEqual(task_permissions.get(f"{leaf}-fallback"), "allow", f"{leaf}-fallback")
 
         self.assertNotIn("task-orchestrator", task_permissions)
-        self.assertNotIn("task-orchestrator-fallback", task_permissions)
-        expected_task_targets = {"*"}
-        for leaf in TASK_ORCHESTRATOR_LEAVES:
-            expected_task_targets.add(leaf)
-            expected_task_targets.add(f"{leaf}-fallback")
+        expected_task_targets = {"*", *TASK_ORCHESTRATOR_LEAVES}
         self.assertEqual(set(task_permissions), expected_task_targets)
 
-    def test_recovery_contract_and_authority_parity(self) -> None:
-        self.assertEqual(permission_for("build"), permission_for("build-fallback"))
+    def test_work_unit_contract_has_no_recovery_commands(self) -> None:
         primary = permission_for("task-orchestrator")
-        fallback = permission_for("task-orchestrator-fallback")
-        self.assertEqual(primary, fallback)
         for command in (
-            "just agent::recovery-status *",
-            "just agent::recovery-route *",
-            "just agent::recovery-record *",
             "just agent::work-unit-register *",
             "just agent::work-unit-status *",
             "just agent::work-unit-state-set *",
         ):
             self.assertEqual(primary["bash"].get(command), "allow", command)
-        for command in ("just agent::recovery-start *", "just agent::recovery-clear *"):
-            self.assertEqual(primary["bash"].get(command), "deny", command)
-
-        recover = (CORE / ".opencode" / "commands" / "task-recover.md").read_text()
-        self.assertIn("task-recovery", recover)
-        self.assertIn("$ARGUMENTS", recover)
-        self.assertNotIn("task-orchestrator", recover.lower())
-        skill = (CORE / ".opencode" / "skills" / "task-recovery" / "SKILL.md").read_text().lower()
-        for phrase in (
-            "recovery-start",
-            "recovery-status",
-            "recovery-route",
-            "recovery-record",
-            "same task/worktree",
-            "work unit semantic/id",
-            "never launch an unavailable-family primary first",
-            "integration-pending",
-            "blocked",
-        ):
-            self.assertIn(phrase, skill)
-        self.assertLess(skill.index("work-unit-status"), skill.index("next call `recovery-route`"))
-        self.assertLess(skill.index("next call `recovery-route`"), skill.index("may the orchestrator delegate"))
-        fallback_body = body_text("task-orchestrator-fallback").lower()
-        self.assertIn("before every leaf delegation", fallback_body)
-        self.assertIn("never launch an unavailable-family model first", fallback_body)
-        self.assertIn("derive routing from a hardcoded role set", fallback_body)
-        self.assertIn("permission-launder", fallback_body)
+        self.assertFalse(any("recovery" in command for command in primary["bash"]))
+        self.assertFalse((CORE / ".opencode" / "commands" / "task-recover.md").exists())
+        self.assertFalse((CORE / ".opencode" / "skills" / "task-recovery" / "SKILL.md").exists())
 
 
 if __name__ == "__main__":
