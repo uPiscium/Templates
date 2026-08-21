@@ -232,6 +232,8 @@ def migration_actions(
     for migration in migrations:
         transition = f"{migration.from_version} -> {migration.to_version}"
         for relative in migration.require_absent_paths:
+            if relative in deleted:
+                continue
             ancestor = symlink_ancestor(repo, relative)
             if ancestor is not None:
                 blockers.append(
@@ -387,7 +389,7 @@ def build_plan(repo: Path, source: Path) -> dict:
     selected = [
         migration
         for migration in migrations
-        if local_number < migration.to_version <= remote_number
+        if migration.to_version <= remote_number
     ]
     actions, blockers, deleted = migration_actions(repo, selected)
     if remote_number < local_number:

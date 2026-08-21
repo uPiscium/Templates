@@ -385,6 +385,23 @@ mod project 'just/project/mod.just'
             self.assertEqual("delete", self._plan_action(plan, ".automation/one")["action"])
             self.assertEqual("delete", self._plan_action(plan, ".automation/two")["action"])
 
+    def test_later_precondition_accepts_path_planned_for_earlier_deletion(self) -> None:
+        first = self._migration_manifest(1, 2, remove_paths=(".automation/old",)).split("\n\n", 1)[1]
+        second = self._migration_manifest(
+            2,
+            3,
+            require_absent_paths=(".automation/old",),
+        ).split("\n\n", 1)[1]
+        manifest = "schema_version = 1\n\n" + first + "\n" + second
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self._destination_repo(root / "repo", version=1)
+            self._write_file(repo / ".automation/old", "old\n")
+            self._core_root_source(root, version=3, migrations=manifest)
+            plan = upgrade.build_plan(repo, root)
+            self.assertTrue(plan["canApply"], plan["blockers"])
+            self.assertEqual("delete", self._plan_action(plan, ".automation/old")["action"])
+
     def test_build_plan_rejects_downgrade(self) -> None:
         self._require_migration_api()
         with tempfile.TemporaryDirectory() as directory:
@@ -407,6 +424,26 @@ mod project 'just/project/mod.just'
                 result = upgrade.apply(repo, root)
             self.assertIn(".automation/stale.py", result["changedPaths"])
             self.assertFalse((repo / ".automation/stale.py").exists())
+
+    def test_migration_catches_up_residue_after_version_already_advanced(self) -> None:
+        manifest = self._migration_manifest(remove_paths=(".automation/legacy.py",))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self._destination_repo(root / "repo", version=3)
+            self._write_file(repo / ".automation/legacy.py", "legacy\n")
+            self._write_file(repo / "opencode.json", "before\n")
+            source = self._core_root_source(root, version=3, migrations=manifest)
+            self._write_file(source / "opencode.json", "after\n")
+
+            plan = upgrade.build_plan(repo, root)
+            self.assertTrue(plan["canApply"], plan["blockers"])
+            self.assertEqual("delete", self._plan_action(plan, ".automation/legacy.py")["action"])
+
+            with mock.patch.object(upgrade, "require_maintenance"):
+                upgrade.apply(repo, root)
+            self.assertFalse((repo / ".automation/legacy.py").exists())
+            self.assertEqual("3\n", (repo / ".automation/VERSION").read_text())
+            self.assertEqual("after\n", (repo / "opencode.json").read_text())
 
     def test_apply_symlink_removed_without_deleting_target(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
