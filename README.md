@@ -99,7 +99,7 @@ nix flake init ...
 
 `/init` is read-only. It validates Agent Core version, Adapter identity, branch/worktree/Task State, tools, project doctor, HEAD, and Git status. It never bootstraps, repairs, installs packages, changes Task State, rewrites `AGENTS.md`, or mutates GitHub repository settings.
 
-For bootstrap, adoption, or upgrade diagnostics that need only runtime readiness, run `just agent::preflight` from the root of a generated or trusted installed Agent Core. It checks required tools/files, Agent Core version, and Adapter readability without resolving or relaxing branch/Task identity. Preflight is read-only, but it executes the installed Agent Core runtime and is not an integrity validator for untrusted checkout content. `preflight = PASS` does not mean the checkout is a valid Agent session: `/init`, `agent::doctor`, and `agent::context` remain strict and may intentionally block a non-default branch without registered Task State.
+For bootstrap, adoption, or upgrade diagnostics that need only runtime readiness, run `just agent::preflight` from the root of an installed Agent Core. It checks required tools/files, Agent Core version, and a non-empty Adapter marker without resolving or relaxing branch/Task identity. Preflight is read-only, but `preflight = PASS` does not mean the checkout is a valid Agent session: `/init`, `agent::doctor`, and `agent::context` remain strict and may intentionally block a non-default branch without registered Task State.
 
 Existing-repository adoption and Agent Core upgrade are separate mutating workflows from generated-project bootstrap.
 

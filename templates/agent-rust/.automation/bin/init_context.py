@@ -10,7 +10,6 @@ import sys
 from pathlib import Path
 
 SUPPORTED_AGENT_CORE_VERSION = "3"
-ADAPTER_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REQUIRED_TOOLS = ("git", "gh", "just", "python3")
 REQUIRED_FILES = (
     "AGENTS.md",
@@ -86,17 +85,9 @@ def common_git_dir(root: Path) -> Path:
 
 
 def read_required(path: Path, label: str) -> str:
-    if path.is_symlink():
-        raise InitError(f"{label} must not be a symlink: {path}")
     if not path.is_file():
         raise InitError(f"missing {label}: {path}")
-    try:
-        value = path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise InitError(f"cannot read {label}: {path}: {exc}") from exc
-    if not value:
-        raise InitError(f"empty {label}: {path}")
-    return value
+    return path.read_text(encoding="utf-8").strip()
 
 
 def task_state(root: Path) -> dict | None:
@@ -147,24 +138,25 @@ def validate_identity(root: Path, branch: str, base: str, state: dict | None) ->
     return task_id
 
 
-def preflight(root: Path) -> dict:
+def check_runtime_prerequisites(root: Path) -> None:
     missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
     if missing:
         raise InitError("missing required tools: " + ", ".join(missing))
     for relative in REQUIRED_FILES:
-        path = root / relative
-        if path.is_symlink():
-            raise InitError(f"required repository file must not be a symlink: {relative}")
-        if not path.is_file():
+        if not (root / relative).is_file():
             raise InitError(f"missing required repository file: {relative}")
+
+
+def preflight(root: Path) -> dict:
+    check_runtime_prerequisites(root)
     version = read_required(root / ".automation" / "VERSION", "Agent Core VERSION")
     if version != SUPPORTED_AGENT_CORE_VERSION:
         raise InitError(
             f"unsupported Agent Core version: repository={version}, runtime={SUPPORTED_AGENT_CORE_VERSION}"
         )
     adapter = read_required(root / ".automation" / "ADAPTER", "Project Adapter marker")
-    if ADAPTER_RE.fullmatch(adapter) is None:
-        raise InitError(f"invalid Project Adapter marker: {adapter!r}")
+    if not adapter:
+        raise InitError(f"empty Project Adapter marker: {root / '.automation' / 'ADAPTER'}")
     return {
         "status": "PASS",
         "readOnly": True,
@@ -200,7 +192,7 @@ def context(root: Path) -> dict:
 
 
 def doctor(root: Path) -> dict:
-    preflight(root)
+    check_runtime_prerequisites(root)
     data = context(root)
     return {"status": "PASS", "readOnly": True, **data}
 

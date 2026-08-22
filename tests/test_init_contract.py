@@ -251,10 +251,15 @@ class InitContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.create_runtime(root, adapter="")
-            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), self.assertRaisesRegex(
-                init.InitError, "empty Project Adapter marker"
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+                init, "current_branch", return_value="main"
+            ), mock.patch.object(init, "default_branch", return_value="main"), mock.patch.object(
+                init, "git", side_effect=self.context_git
             ):
-                init.preflight(root)
+                with self.assertRaisesRegex(init.InitError, "empty Project Adapter marker"):
+                    init.preflight(root)
+                self.assertEqual("", init.context(root)["adapter"])
+                self.assertEqual("PASS", init.doctor(root)["status"])
 
     def test_preflight_rejects_missing_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -265,26 +270,12 @@ class InitContractTest(unittest.TestCase):
             ):
                 init.preflight(root)
 
-    def test_preflight_rejects_invalid_adapter(self) -> None:
+    def test_preflight_does_not_impose_adapter_naming_grammar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.create_runtime(root, adapter="../../secret")
-            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), self.assertRaisesRegex(
-                init.InitError, "invalid Project Adapter marker"
-            ):
-                init.preflight(root)
-
-    def test_preflight_rejects_symlinked_required_file(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self.create_runtime(root)
-            adapter = root / ".automation" / "ADAPTER"
-            adapter.unlink()
-            adapter.symlink_to(root / "AGENTS.md")
-            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), self.assertRaisesRegex(
-                init.InitError, "must not be a symlink"
-            ):
-                init.preflight(root)
+            self.create_runtime(root, adapter="Legacy_Adapter.v1")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"):
+                self.assertEqual("Legacy_Adapter.v1", init.preflight(root)["adapter"])
 
     def test_preflight_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
