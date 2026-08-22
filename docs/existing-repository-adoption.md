@@ -18,6 +18,8 @@ nix develop --command just template::adapter-migrate-plan /path/to/repository cp
 
 `adopt-apply` performs no commit, push, or merge. It refuses to run when the target working tree is dirty or when the plan contains unresolved collisions.
 
+After applying Agent Core on an existing bootstrap/adoption branch, `just agent::preflight` can verify tools, required files, VERSION, and Adapter readiness without requiring fabricated Task State. This is not full initialization: `just agent::doctor`, `just agent::context`, and `/init` retain strict branch/Task identity requirements and may intentionally block until the repository is on its default branch or in a registered Task worktree.
+
 ## Adapter selection
 
 Explicit `--adapter <id>` always wins when the Adapter exists.

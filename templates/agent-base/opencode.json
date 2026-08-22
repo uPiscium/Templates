@@ -60,6 +60,7 @@
       "gh run view *": "allow",
       "gh run list *": "allow",
       "gh repo view *": "allow",
+      "just agent::preflight": "allow",
       "just project::doctor": "allow",
       "just project::eval": "allow",
       "just project::format-check": "allow",

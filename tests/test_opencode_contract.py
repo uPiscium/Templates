@@ -238,6 +238,17 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(bash["just agent::push *"], "ask")
         self.assertEqual(bash["just integrate::merge *"], "ask")
 
+    def test_runtime_preflight_is_narrowly_allowlisted(self) -> None:
+        self.assertEqual(
+            "allow", self.config["permission"]["bash"]["just agent::preflight"]
+        )
+        for agent in ("build", "task-orchestrator"):
+            self.assertEqual(
+                "allow",
+                permission_for(agent)["bash"].get("just agent::preflight"),
+                agent,
+            )
+
     def test_automation_core_is_not_editable(self) -> None:
         edit = self.config["permission"]["edit"]
         for path in (

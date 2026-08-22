@@ -537,7 +537,13 @@ def prepare(issue: str, template: str) -> dict:
         log=prepare_log,
     )
 
-    for recipe in ("agent::doctor", "agent::context", "project::doctor", "project::check"):
+    for recipe in (
+        "agent::preflight",
+        "agent::doctor",
+        "agent::context",
+        "project::doctor",
+        "project::check",
+    ):
         run_logged(
             ["nix", "develop", "--command", "just", recipe],
             cwd=repo,
