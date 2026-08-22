@@ -30,6 +30,9 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             "smoke-escalation issue='issue-41'",
             "smoke-escalation-reject issue='issue-41'",
             "validate-escalation issue='issue-41'",
+            "smoke-leaf-completed issue='issue-41'",
+            "smoke-leaf-blocked issue='issue-41'",
+            "validate-leaf-contract issue='issue-41'",
             "direct-leaf issue='issue-41'",
             "export-session session issue='issue-41'",
         ):
@@ -48,12 +51,30 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertEqual(
             tasks,
             {
+                ("SMOKE-LEAF-COMPLETED", "depth2-leaf-completed"),
+                ("SMOKE-LEAF-BLOCKED", "depth2-leaf-blocked"),
                 ("SMOKE-CONTROL", "ask-free-control"),
                 ("SMOKE-ASK", "depth2-ask"),
                 ("SMOKE-ESCALATION", "leaf-escalation"),
                 ("SMOKE-ESCALATION-PERMISSION", "leaf-escalation-permission"),
             },
         )
+
+        completed = next(
+            definition for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-LEAF-COMPLETED"
+        )
+        completed_text = " ".join(completed[3] + completed[4])
+        self.assertIn("git status --short", completed_text)
+        self.assertIn("status: COMPLETED", completed_text)
+        self.assertIn("agent::doctor", completed_text)
+        self.assertIn("project::doctor", completed_text)
+
+        blocked = next(
+            definition for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-LEAF-BLOCKED"
+        )
+        self.assertIn("status: BLOCKED", " ".join(blocked[3] + blocked[4]))
 
         smoke_ask = next(
             definition
@@ -284,6 +305,260 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             finally:
                 runtime.workspace = original_workspace
                 runtime.run_capture = original_run_capture
+
+    def test_validate_leaf_contract_scopes_initialization_checks_to_leaf_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "issue"
+            logs = base / "logs"
+            logs.mkdir(parents=True)
+            for task, slug, state, extra in (
+                ("SMOKE-LEAF-COMPLETED", "depth2-leaf-completed", "completed", "parent accepted"),
+                ("SMOKE-LEAF-BLOCKED", "depth2-leaf-blocked", "blocked", ""),
+            ):
+                path = base / "smoke-repo" / ".worktrees" / f"{task}-{slug}" / ".task-state" / "task.md"
+                path.parent.mkdir(parents=True)
+                path.write_text(f"Work Unit state={state}\n{extra}\n", encoding="utf-8")
+                (path.parent / "work-units.json").write_text(
+                    json.dumps({"units": {"WU-1": {"state": state}}}) + "\n",
+                    encoding="utf-8",
+                )
+            (logs / "opencode-leaf-completed-20260101.log").write_text(
+                "\n".join([
+                    "message=created id=main agent=main",
+                    "message=created id=to-completed parentID=main agent=task-orchestrator",
+                    "initialization just agent::doctor just agent::context just project::doctor",
+                    "message=created id=done parentID=to-completed title=completed agent=general",
+                    'message="exiting loop" session.id=done',
+                ]) + "\n", encoding="utf-8"
+            )
+            (logs / "opencode-leaf-blocked-20260101.log").write_text(
+                "\n".join([
+                    "message=created id=to-blocked parentID=main agent=task-orchestrator",
+                    "message=created id=blocked parentID=to-blocked title=blocked agent=explore",
+                    'message="exiting loop" session.id=blocked',
+                ]) + "\n", encoding="utf-8"
+            )
+            original_workspace = runtime.workspace
+            original_session_export = runtime._session_export
+            runtime.workspace = lambda _issue: base
+            evidence = {
+                "to-completed": {
+                    "session_id": "to-completed",
+                    "assistant_final_status": None,
+                    "tool_commands": ["just agent::doctor", "just agent::context", "just project::doctor"],
+                    "tool_statuses": ["completed", "completed", "completed"],
+                },
+                "to-blocked": {
+                    "session_id": "to-blocked",
+                    "assistant_final_status": None,
+                    "tool_commands": ["just agent::doctor", "just agent::context", "just project::doctor"],
+                    "tool_statuses": ["completed", "completed", "completed"],
+                },
+                "done": {
+                    "session_id": "done",
+                    "assistant_final_status": "COMPLETED",
+                    "tool_commands": ["git status --short"],
+                    "tool_statuses": ["completed"],
+                },
+                "blocked": {
+                    "session_id": "blocked",
+                    "assistant_final_status": "BLOCKED",
+                    "tool_commands": [],
+                    "tool_statuses": [],
+                },
+            }
+            runtime._session_export = lambda _repo, session_id, **_kwargs: evidence[session_id]
+            try:
+                result = runtime.validate_leaf_contract("test")
+            finally:
+                runtime.workspace = original_workspace
+                runtime._session_export = original_session_export
+            self.assertEqual("PASS", result["status"])
+            self.assertEqual(
+                {"completed": "COMPLETED", "blocked": "BLOCKED"},
+                result["leafStatuses"],
+            )
+
+    def test_canonical_leaf_status_rejects_unknown_multiple_and_missing_fields(self) -> None:
+        self.assertEqual(
+            "BLOCKED",
+            runtime._canonical_leaf_status("status: BLOCKED\n\nEvidence.", "leaf"),
+        )
+        for response in (
+            "status: PASS",
+            "Evidence before status.\nstatus: BLOCKED",
+            "status: BLOCKED\nstatus: COMPLETED",
+            "BLOCKED",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(runtime.RuntimeSmokeError, "exactly one valid first-line status"):
+                    runtime._canonical_leaf_status(response, "leaf")
+
+    def test_sanitized_redacted_tool_input_cannot_satisfy_command_assertions(self) -> None:
+        sanitized = {
+            "messages": [{
+                "info": {"role": "assistant"},
+                "parts": [
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"redacted": "tool-input"},
+                        },
+                    },
+                    {"type": "text", "text": "status: BLOCKED\n\nInitialization was denied."},
+                ],
+            }],
+        }
+        evidence = runtime._derive_session_evidence(
+            sanitized, "leaf", require_final_status=True
+        )
+        self.assertEqual([None], evidence["tool_commands"])
+        self.assertNotEqual(["git status --short"], evidence["tool_commands"])
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "did not complete initialization"):
+            runtime._require_parent_initialization(evidence, "leaf")
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "missing or redacted"):
+            runtime._require_leaf_tool_evidence(evidence, "completed", "leaf")
+
+    def test_unsanitized_export_is_reduced_to_minimal_derived_evidence(self) -> None:
+        unsanitized = {
+            "messages": [
+                {
+                    "info": {"role": "user"},
+                    "parts": [{"type": "text", "text": "full private prompt"}],
+                },
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [
+                        {
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": {
+                                "status": "completed",
+                                "input": {"command": "git status --short"},
+                                "output": "full private tool output",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "status: COMPLETED\n\nfull private assistant explanation",
+                        },
+                    ],
+                },
+            ]
+        }
+        original_run = runtime.subprocess.run
+
+        def fake_run(_command, **kwargs):
+            json.dump(unsanitized, kwargs["stdout"])
+            kwargs["stdout"].flush()
+            return subprocess.CompletedProcess(_command, 0, stderr="")
+
+        runtime.subprocess.run = fake_run
+        try:
+            evidence = runtime._session_export(
+                Path("."), "leaf", require_final_status=True
+            )
+        finally:
+            runtime.subprocess.run = original_run
+        self.assertEqual(
+            {
+                "session_id": "leaf",
+                "assistant_final_status": "COMPLETED",
+                "tool_commands": ["git status --short"],
+                "tool_statuses": ["completed"],
+            },
+            evidence,
+        )
+        rendered = json.dumps(evidence)
+        self.assertNotIn("private", rendered)
+        self.assertNotIn("output", rendered)
+        self.assertNotIn("messages", rendered)
+
+    def test_leaf_tool_evidence_rejects_blocked_bash_and_hides_command(self) -> None:
+        evidence = {
+            "session_id": "leaf",
+            "assistant_final_status": "BLOCKED",
+            "tool_commands": ["secret-command-value"],
+            "tool_statuses": ["completed"],
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeSmokeError, "blocked leaf leaf attempted a Bash operation"
+        ) as raised:
+            runtime._require_leaf_tool_evidence(evidence, "blocked", "leaf")
+        self.assertNotIn("secret-command-value", str(raised.exception))
+
+    def test_trailing_empty_assistant_message_cannot_reuse_earlier_status(self) -> None:
+        exported = {
+            "messages": [
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "text", "text": "status: COMPLETED"}],
+                },
+                {"info": {"role": "assistant"}, "parts": []},
+            ]
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeSmokeError, "exactly one valid first-line status"
+        ):
+            runtime._derive_session_evidence(
+                exported, "leaf", require_final_status=True
+            )
+
+    def test_latest_complete_leaf_log_skips_newer_incomplete_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            complete = root / "opencode-leaf-blocked-20260101.log"
+            incomplete = root / "opencode-leaf-blocked-20260102.log"
+            complete.write_text(
+                "message=created id=parent parentID=main agent=task-orchestrator\n"
+                "message=created id=leaf parentID=parent agent=explore\n"
+                'message="exiting loop" session.id=leaf\n',
+                encoding="utf-8",
+            )
+            incomplete.write_text(
+                "message=created id=new-parent parentID=main agent=task-orchestrator\n",
+                encoding="utf-8",
+            )
+            selected = runtime._latest_complete_leaf_log(
+                [complete, incomplete], "leaf-blocked"
+            )
+        self.assertEqual((complete, "parent", "leaf"), selected)
+
+    def test_transient_export_invalid_json_and_status_prefix_fail_closed(self) -> None:
+        original_run = runtime.subprocess.run
+        original_version = runtime._opencode_version
+        runtime._opencode_version = lambda _repo: "1.18.test"
+
+        def fake_run(_command, **kwargs):
+            kwargs["stdout"].write('Exporting session...\n{"messages": []}')
+            kwargs["stdout"].flush()
+            return subprocess.CompletedProcess(_command, 0, stderr="bounded stderr")
+
+        runtime.subprocess.run = fake_run
+        try:
+            with self.assertRaisesRegex(
+                runtime.RuntimeSmokeError,
+                r"opencode_version=1\.18\.test; exit_code=0; stderr=bounded stderr; "
+                r"json_error=line 1 column 1 position 0",
+            ) as raised:
+                runtime._transient_session_export(Path("."), "leaf")
+        finally:
+            runtime.subprocess.run = original_run
+            runtime._opencode_version = original_version
+        self.assertNotIn("Exporting session", str(raised.exception))
+        self.assertNotIn("messages", str(raised.exception))
+
+    def test_parent_initialization_does_not_treat_unexecuted_checks_as_pass(self) -> None:
+        evidence = {
+            "session_id": "parent",
+            "assistant_final_status": None,
+            "tool_commands": ["just agent::doctor", "just agent::context"],
+            "tool_statuses": ["completed", "pending"],
+        }
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "did not complete initialization"):
+            runtime._require_parent_initialization(evidence, "parent")
 
     def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -622,12 +897,15 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         report = runtime.report_template("issue-41", metadata)
         self.assertIn("Ask-free nested control", report)
         self.assertIn("Direct leaf control", report)
+        self.assertIn("Depth-2 leaf Work Unit contracts", report)
         self.assertIn("Depth-2 native Ask compatibility canary", report)
         self.assertIn("Leaf → Depth-1 escalation release gate", report)
         self.assertIn("release blocker: NO", report)
         self.assertIn("#51 release gate (Leaf -> Depth-1 escalation)", report)
         self.assertIn("#7 release status", report)
         self.assertIn("SMOKE-ESCALATION contract: READY", report)
+        self.assertIn("SMOKE-LEAF-COMPLETED contract: READY", report)
+        self.assertIn("SMOKE-LEAF-BLOCKED contract: READY", report)
         self.assertIn("SMOKE-ESCALATION-PERMISSION contract: READY", report)
         self.assertIn("Ask origin is Task Orchestrator session", report)
         self.assertIn("`runtime::validate-escalation`", report)

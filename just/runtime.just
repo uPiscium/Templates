@@ -36,8 +36,22 @@ smoke-escalation-reject issue='issue-41':
     bash {{quote(debug_runner)}} {{quote(issue)}} leaf-escalation-reject
 
 [working-directory: root]
+smoke-leaf-completed issue='issue-41':
+    @echo "Depth-2 completed leaf smoke: run /task-run SMOKE-LEAF-COMPLETED in the TUI"
+    bash {{quote(debug_runner)}} {{quote(issue)}} leaf-completed
+
+[working-directory: root]
+smoke-leaf-blocked issue='issue-41':
+    @echo "Depth-2 blocked leaf smoke: run /task-run SMOKE-LEAF-BLOCKED in the TUI"
+    bash {{quote(debug_runner)}} {{quote(issue)}} leaf-blocked
+
+[working-directory: root]
 validate-escalation issue='issue-41':
     python3 {{quote(runner)}} validate-escalation --issue {{quote(issue)}}
+
+[working-directory: root]
+validate-leaf-contract issue='issue-41':
+    python3 {{quote(runner)}} validate-leaf-contract --issue {{quote(issue)}}
 
 [working-directory: root]
 direct-leaf issue='issue-41':
