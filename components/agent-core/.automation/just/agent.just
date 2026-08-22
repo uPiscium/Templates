@@ -4,6 +4,10 @@ lifecycle := root / ".automation/bin/task_lifecycle.py"
 init := root / ".automation/bin/init_context.py"
 
 [working-directory: root]
+preflight:
+    python3 {{quote(init)}} preflight
+
+[working-directory: root]
 doctor:
     python3 {{quote(init)}} doctor
 

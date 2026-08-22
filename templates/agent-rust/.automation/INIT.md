@@ -16,6 +16,12 @@ Initialization validates and reports state. It must not:
 
 Repository bootstrap and Automation Core upgrade are separate state-changing workflows.
 
+## Runtime preflight
+
+`just agent::preflight` is a narrower read-only readiness check for bootstrap, adoption, and upgrade verification from the root of an installed Agent Core. It validates required runtime tools, required Agent Core files, the supported Agent Core version, and a non-empty Adapter marker without requiring a Git repository, resolving the default branch, or validating branch/worktree/Task identity.
+
+A successful preflight does not establish a valid Agent session and does not replace `/init`, `agent::doctor`, or `agent::context`. A non-default bootstrap branch without Task State may pass preflight while strict doctor/context initialization remains blocked; this separation is intentional and is not an identity-check bypass.
+
 ## Mandatory sequence
 
 1. Read `AGENTS.md` and this file.

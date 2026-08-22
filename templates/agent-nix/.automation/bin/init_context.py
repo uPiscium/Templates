@@ -10,6 +10,16 @@ import sys
 from pathlib import Path
 
 SUPPORTED_AGENT_CORE_VERSION = "3"
+REQUIRED_TOOLS = ("git", "gh", "just", "python3")
+REQUIRED_FILES = (
+    "AGENTS.md",
+    ".automation/INIT.md",
+    ".automation/VERSION",
+    ".automation/ADAPTER",
+    ".automation/policy.toml",
+    "just/project/mod.just",
+    "opencode.json",
+)
 TASK_ID_RE = re.compile(r"(?m)^- Task ID: (.+)$")
 BRANCH_RE = re.compile(r"(?m)^- Branch: (.+)$")
 WORKTREE_RE = re.compile(r"(?m)^- Worktree: (.+)$")
@@ -128,6 +138,34 @@ def validate_identity(root: Path, branch: str, base: str, state: dict | None) ->
     return task_id
 
 
+def check_runtime_prerequisites(root: Path) -> None:
+    missing = [tool for tool in REQUIRED_TOOLS if shutil.which(tool) is None]
+    if missing:
+        raise InitError("missing required tools: " + ", ".join(missing))
+    for relative in REQUIRED_FILES:
+        if not (root / relative).is_file():
+            raise InitError(f"missing required repository file: {relative}")
+
+
+def preflight(root: Path) -> dict:
+    check_runtime_prerequisites(root)
+    version = read_required(root / ".automation" / "VERSION", "Agent Core VERSION")
+    if version != SUPPORTED_AGENT_CORE_VERSION:
+        raise InitError(
+            f"unsupported Agent Core version: repository={version}, runtime={SUPPORTED_AGENT_CORE_VERSION}"
+        )
+    adapter = read_required(root / ".automation" / "ADAPTER", "Project Adapter marker")
+    if not adapter:
+        raise InitError(f"empty Project Adapter marker: {root / '.automation' / 'ADAPTER'}")
+    return {
+        "status": "PASS",
+        "readOnly": True,
+        "repositoryRoot": str(root),
+        "agentCoreVersion": version,
+        "adapter": adapter,
+    }
+
+
 def context(root: Path) -> dict:
     version = read_required(root / ".automation" / "VERSION", "Agent Core VERSION")
     if version != SUPPORTED_AGENT_CORE_VERSION:
@@ -154,35 +192,27 @@ def context(root: Path) -> dict:
 
 
 def doctor(root: Path) -> dict:
-    missing = [tool for tool in ("git", "gh", "just", "python3") if shutil.which(tool) is None]
-    if missing:
-        raise InitError("missing required tools: " + ", ".join(missing))
-    for relative in (
-        "AGENTS.md",
-        ".automation/INIT.md",
-        ".automation/VERSION",
-        ".automation/ADAPTER",
-        ".automation/policy.toml",
-        "just/project/mod.just",
-        "opencode.json",
-    ):
-        if not (root / relative).is_file():
-            raise InitError(f"missing required repository file: {relative}")
+    check_runtime_prerequisites(root)
     data = context(root)
     return {"status": "PASS", "readOnly": True, **data}
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Read-only Agent initialization checks")
-    result.add_argument("command", choices=("doctor", "context"))
+    result.add_argument("command", choices=("preflight", "doctor", "context"))
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
-        root = repo_root()
-        result = doctor(root) if args.command == "doctor" else context(root)
+        commands = {
+            "preflight": preflight,
+            "doctor": doctor,
+            "context": context,
+        }
+        root = Path.cwd().resolve() if args.command == "preflight" else repo_root()
+        result = commands[args.command](root)
         print(json.dumps(result, sort_keys=True))
     except InitError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

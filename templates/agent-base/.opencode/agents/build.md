@@ -13,6 +13,7 @@ permission:
     security-reviewer: allow
     scout: allow
   bash:
+    "just agent::preflight": allow
     "just agent::doctor": allow
     "just agent::context": allow
     "just project::doctor": allow

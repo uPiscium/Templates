@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +20,70 @@ spec.loader.exec_module(init)
 
 
 class InitContractTest(unittest.TestCase):
+    def run_fixture(
+        self,
+        root: Path,
+        *command: str,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            command,
+            cwd=root,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        if check and result.returncode != 0:
+            self.fail(
+                f"command failed ({' '.join(command)}):\n{result.stdout}\n{result.stderr}"
+            )
+        return result
+
+    def create_runtime(
+        self,
+        root: Path,
+        *,
+        version: str = "3",
+        adapter: str = "base",
+        omit: str | None = None,
+    ) -> None:
+        files = {
+            "AGENTS.md": "# Agent rules\n",
+            ".automation/INIT.md": "# Init\n",
+            ".automation/VERSION": version + "\n",
+            ".automation/ADAPTER": adapter + "\n",
+            ".automation/policy.toml": "version = 1\n",
+            "just/project/mod.just": "doctor:\n    @true\n",
+            "opencode.json": "{}\n",
+        }
+        for relative, content in files.items():
+            if relative == omit:
+                continue
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    def context_git(self, root: Path, *args: str, check: bool = True) -> str:
+        del root, check
+        if args == ("rev-parse", "HEAD"):
+            return "1" * 40
+        if args == ("status", "--short"):
+            return ""
+        raise AssertionError(f"unexpected git call: {args}")
+
+    def task_state_text(self, root: Path) -> str:
+        sections = "\n".join(
+            f"## {section}\n\n- defined\n" for section in init.REQUIRED_TASK_SECTIONS
+        )
+        return (
+            "# TASK-1\n\n"
+            "- Task ID: TASK-1\n"
+            "- Branch: task/TASK-1-example\n"
+            f"- Worktree: {root}\n\n"
+            f"{sections}"
+        )
+
     def test_runtime_version_matches_agent_core_version(self) -> None:
         version = (
             ROOT / "components" / "agent-core" / ".automation" / "VERSION"
@@ -38,6 +105,27 @@ class InitContractTest(unittest.TestCase):
         with self.assertRaisesRegex(init.InitError, "branch/Task identity mismatch"):
             init.validate_identity(Path("."), "task/TASK-2-example", "main", state)
 
+    def test_task_state_worktree_mismatch_is_rejected(self) -> None:
+        state = {
+            "taskId": "TASK-1",
+            "branch": "task/TASK-1-example",
+            "worktree": "/different/worktree",
+        }
+        with self.assertRaisesRegex(init.InitError, "Task State worktree does not match"):
+            init.validate_identity(Path("."), "task/TASK-1-example", "main", state)
+
+    def test_task_state_must_be_ignored(self) -> None:
+        root = Path(".")
+        state = {
+            "taskId": "TASK-1",
+            "branch": "task/TASK-1-example",
+            "worktree": str(root.resolve()),
+        }
+        with mock.patch.object(init, "task_state_is_ignored", return_value=False), self.assertRaisesRegex(
+            init.InitError, ".task-state is not ignored"
+        ):
+            init.validate_identity(root, "task/TASK-1-example", "main", state)
+
     def test_version_mismatch_blocks_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -47,6 +135,244 @@ class InitContractTest(unittest.TestCase):
             (automation / "ADAPTER").write_text("base\n", encoding="utf-8")
             with self.assertRaisesRegex(init.InitError, "unsupported Agent Core version"):
                 init.context(root)
+
+    def test_bootstrap_branch_preflight_passes_while_context_and_doctor_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"):
+                self.assertEqual("PASS", init.preflight(root)["status"])
+                with mock.patch.object(init, "current_branch", return_value="bootstrap"), mock.patch.object(
+                    init, "default_branch", return_value="main"
+                ):
+                    for operation in (init.context, init.doctor):
+                        with self.subTest(operation=operation.__name__), self.assertRaisesRegex(
+                            init.InitError, "non-default branch requires Task State"
+                        ):
+                            operation(root)
+
+    def test_preflight_never_calls_identity_or_context_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            forbidden = (
+                "default_branch",
+                "current_branch",
+                "task_state",
+                "validate_identity",
+                "context",
+            )
+            patches = [
+                mock.patch.object(init, name, side_effect=AssertionError(name))
+                for name in forbidden
+            ]
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"):
+                for patch in patches:
+                    patch.start()
+                try:
+                    self.assertEqual("PASS", init.preflight(root)["status"])
+                finally:
+                    for patch in reversed(patches):
+                        patch.stop()
+
+    def test_default_branch_preflight_doctor_and_context_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+                init, "current_branch", return_value="main"
+            ), mock.patch.object(init, "default_branch", return_value="main"), mock.patch.object(
+                init, "git", side_effect=self.context_git
+            ):
+                self.assertEqual("PASS", init.preflight(root)["status"])
+                self.assertIsNone(init.context(root)["taskId"])
+                self.assertEqual("PASS", init.doctor(root)["status"])
+
+    def test_registered_task_preflight_doctor_and_context_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            state = root / ".task-state" / "task.md"
+            state.parent.mkdir()
+            state.write_text(self.task_state_text(root), encoding="utf-8")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+                init, "current_branch", return_value="task/TASK-1-example"
+            ), mock.patch.object(init, "default_branch", return_value="main"), mock.patch.object(
+                init, "task_state_is_ignored", return_value=True
+            ), mock.patch.object(init, "git", side_effect=self.context_git):
+                self.assertEqual("PASS", init.preflight(root)["status"])
+                self.assertEqual("TASK-1", init.context(root)["taskId"])
+                self.assertEqual("PASS", init.doctor(root)["status"])
+
+    def test_detached_head_remains_strict_for_context_and_doctor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+                init, "current_branch", side_effect=init.InitError("detached HEAD is not supported")
+            ):
+                self.assertEqual("PASS", init.preflight(root)["status"])
+                for operation in (init.context, init.doctor):
+                    with self.subTest(operation=operation.__name__), self.assertRaisesRegex(
+                        init.InitError, "detached HEAD is not supported"
+                    ):
+                        operation(root)
+
+    def test_preflight_rejects_missing_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            with mock.patch.object(
+                init.shutil,
+                "which",
+                side_effect=lambda tool: None if tool == "gh" else f"/bin/{tool}",
+            ), self.assertRaisesRegex(init.InitError, "missing required tools: gh"):
+                init.preflight(root)
+
+    def test_preflight_rejects_missing_required_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root, omit="AGENTS.md")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), self.assertRaisesRegex(
+                init.InitError, "missing required repository file: AGENTS.md"
+            ):
+                init.preflight(root)
+
+    def test_preflight_rejects_unsupported_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root, version="999")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), self.assertRaisesRegex(
+                init.InitError, "unsupported Agent Core version"
+            ):
+                init.preflight(root)
+
+    def test_preflight_rejects_empty_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root, adapter="")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+                init, "current_branch", return_value="main"
+            ), mock.patch.object(init, "default_branch", return_value="main"), mock.patch.object(
+                init, "git", side_effect=self.context_git
+            ):
+                with self.assertRaisesRegex(init.InitError, "empty Project Adapter marker"):
+                    init.preflight(root)
+                self.assertEqual("", init.context(root)["adapter"])
+                self.assertEqual("PASS", init.doctor(root)["status"])
+
+    def test_preflight_rejects_missing_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root, omit=".automation/ADAPTER")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"), self.assertRaisesRegex(
+                init.InitError, "missing required repository file: .automation/ADAPTER"
+            ):
+                init.preflight(root)
+
+    def test_preflight_does_not_impose_adapter_naming_grammar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root, adapter="Legacy_Adapter.v1")
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"):
+                self.assertEqual("Legacy_Adapter.v1", init.preflight(root)["adapter"])
+
+    def test_preflight_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            with mock.patch.object(init.shutil, "which", return_value="/bin/tool"):
+                init.preflight(root)
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(before, after)
+            self.assertFalse((root / ".task-state").exists())
+
+    def test_preflight_cli_and_just_api_are_exposed(self) -> None:
+        self.assertEqual("preflight", init.parser().parse_args(["preflight"]).command)
+        recipes = (
+            ROOT / "components" / "agent-core" / ".automation" / "just" / "agent.just"
+        ).read_text(encoding="utf-8")
+        self.assertIn("preflight:\n    python3 {{quote(init)}} preflight", recipes)
+
+    def test_preflight_cli_does_not_require_git_repository_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_runtime(root)
+            tools = root / ".test-tools"
+            tools.mkdir()
+            just = tools / "just"
+            just.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            just.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{tools}:{env['PATH']}"
+            result = self.run_fixture(
+                root,
+                sys.executable,
+                str(MODULE_PATH),
+                "preflight",
+                env=env,
+            )
+            self.assertIn('"status": "PASS"', result.stdout)
+            self.assertFalse((root / ".git").exists())
+
+    @unittest.skipUnless(shutil.which("just"), "just is required for runtime preflight smoke")
+    def test_real_repository_identity_modes_preserve_strictness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "repository"
+            shutil.copytree(ROOT / "templates" / "agent-base", root)
+            self.run_fixture(root, "git", "init", "-b", "main")
+            self.run_fixture(root, "git", "config", "user.name", "Preflight Test")
+            self.run_fixture(
+                root, "git", "config", "user.email", "preflight@example.invalid"
+            )
+            self.run_fixture(root, "git", "add", ".")
+            self.run_fixture(root, "git", "commit", "-m", "fixture")
+            self.run_fixture(root, "git", "update-ref", "refs/remotes/origin/main", "HEAD")
+            self.run_fixture(
+                root,
+                "git",
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            )
+
+            for command in ("agent::preflight", "agent::doctor", "agent::context"):
+                self.run_fixture(root, "just", command)
+
+            self.run_fixture(root, "git", "switch", "-c", "bootstrap-adoption")
+            before = self.run_fixture(root, "git", "status", "--porcelain").stdout
+            self.run_fixture(root, "just", "agent::preflight")
+            after = self.run_fixture(root, "git", "status", "--porcelain").stdout
+            self.assertEqual(before, after)
+            for command in ("agent::doctor", "agent::context"):
+                result = self.run_fixture(root, "just", command, check=False)
+                self.assertEqual(2, result.returncode, command)
+                self.assertIn(
+                    "non-default branch requires Task State",
+                    result.stderr,
+                    command,
+                )
+
+            self.run_fixture(root, "git", "switch", "main")
+            self.run_fixture(
+                root,
+                "just",
+                "agent::task-start",
+                "SMOKE-PREFLIGHT",
+                "runtime-preflight",
+            )
+            task = root / ".worktrees" / "SMOKE-PREFLIGHT-runtime-preflight"
+            for command in ("agent::preflight", "agent::doctor", "agent::context"):
+                self.run_fixture(task, "just", command)
 
     def test_init_runtime_contains_no_repository_mutation_commands(self) -> None:
         text = MODULE_PATH.read_text(encoding="utf-8")

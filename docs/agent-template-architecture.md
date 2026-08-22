@@ -159,6 +159,7 @@ Internal helper recipes should remain private and should not be treated as publi
 Every Agent-ready repository should expose the following logical operations:
 
 ```text
+just agent::preflight
 just agent::doctor
 just agent::context
 just agent::task-start <TASK-ID> <slug>
@@ -174,8 +175,9 @@ just agent::cleanup <TASK-ID>
 
 Semantics:
 
-- `doctor`: validate Agent Core prerequisites without repairing them.
-- `context`: resolve repository/worktree/branch/Task/adapter context in machine-readable form.
+- `preflight`: validate runtime tools, required files, Agent Core version, and Adapter readiness without branch/Task identity; read-only and suitable for bootstrap/adoption/upgrade diagnostics.
+- `doctor`: validate full repository/session readiness, including strict context and branch/Task identity, without repairing it.
+- `context`: resolve repository/worktree/branch/Task/adapter context in machine-readable form with strict identity validation.
 - `task-start`: create a dedicated branch/worktree and initialize Task State.
 - `status`: report current Task state and Git relationship.
 - `verify`: execute the stable project verification contract and record evidence.
@@ -266,6 +268,8 @@ plan
 Because `plan` has `bash: deny`, it cannot complete the executable initialization sequence. Instead it performs planning-only initialization by reading `AGENTS.md`, `.automation/INIT.md`, `.automation/INIT.fragment.md`, and optional Task State, then returns `PLANNING_INITIALIZATION_HANDOFF` semantics: explicit `execution_prerequisites` and `verification_handoff` entries for every unexecuted doctor, context, project, build, test, or policy check. Unexecuted checks remain `UNEXECUTED`; they are never reported as PASS.
 
 This planning-only branch does not weaken full initialization. `build`, `task-orchestrator`, and other execution-capable workflows still must run `just agent::doctor`, `just agent::context`, and `just project::doctor` before editing, implementation delegation, or project commands.
+
+`agent::preflight` is not a substitute for that initialization sequence. A bootstrap or adoption branch may use it to prove runtime readiness without fabricating Task State, while doctor/context and `/init` continue to reject an unregistered non-default branch.
 
 ### 9.1 Allowed delegation graph
 
