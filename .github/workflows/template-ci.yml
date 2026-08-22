@@ -74,6 +74,7 @@ jobs:
           set -euo pipefail
           target="$RUNNER_TEMP/${{ matrix.template }}"
           cd "$target"
+          nix develop --command just agent::preflight
           nix develop --command just agent::doctor
           nix develop --command just agent::context
       - name: Project Adapter smoke

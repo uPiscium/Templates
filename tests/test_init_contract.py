@@ -306,6 +306,7 @@ class InitContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("preflight:\n    python3 {{quote(init)}} preflight", recipes)
 
+    @unittest.skipUnless(shutil.which("just"), "just is required for runtime preflight smoke")
     def test_preflight_cli_does_not_require_git_repository_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -319,6 +320,7 @@ class InitContractTest(unittest.TestCase):
             self.assertIn('"status": "PASS"', result.stdout)
             self.assertFalse((root / ".git").exists())
 
+    @unittest.skipUnless(shutil.which("just"), "just is required for runtime preflight smoke")
     def test_real_repository_identity_modes_preserve_strictness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repository"
