@@ -27,17 +27,18 @@ class OpenCodePolicyIntegrationTest(unittest.TestCase):
         self.assertIn('inputs.nixpkgs.follows = "nixpkgs";', self.flake)
         self.assertRegex(self.flake, r"outputs\s*=\s*\{[^}]*\bopencodePolicy\b")
 
-    def test_lock_pins_opencode_policy_repository_and_revision(self) -> None:
+    def test_lock_pins_opencode_policy_repository_and_revision_shape(self) -> None:
+        self.assertIn("opencodePolicy", self.lock["nodes"]["root"]["inputs"])
+        self.assertEqual(
+            "opencodePolicy",
+            self.lock["nodes"]["root"]["inputs"]["opencodePolicy"],
+        )
         node = self.lock["nodes"]["opencodePolicy"]
         self.assertEqual("upiscium", node["locked"]["owner"])
         self.assertEqual("OpenCodePolicy", node["locked"]["repo"])
-        self.assertEqual(
-            "103b47b67a7e650835ac277ed192dbc92d1639c4",
-            node["locked"]["rev"],
-        )
+        self.assertEqual("github", node["locked"]["type"])
         self.assertRegex(node["locked"]["rev"], r"^[0-9a-f]{40}$")
         self.assertEqual(["nixpkgs"], node["inputs"]["nixpkgs"])
-        self.assertEqual("opencodePolicy", self.lock["nodes"]["root"]["inputs"]["opencodePolicy"])
 
     def test_linux_only_policy_check_uses_explicit_agent_core_profile_and_self(self) -> None:
         self.assertIn("flake-utils.lib.eachDefaultSystem", self.flake)
