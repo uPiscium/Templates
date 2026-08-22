@@ -30,6 +30,9 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             "smoke-escalation issue='issue-41'",
             "smoke-escalation-reject issue='issue-41'",
             "validate-escalation issue='issue-41'",
+            "smoke-leaf-completed issue='issue-41'",
+            "smoke-leaf-blocked issue='issue-41'",
+            "validate-leaf-contract issue='issue-41'",
             "direct-leaf issue='issue-41'",
             "export-session session issue='issue-41'",
         ):
@@ -48,12 +51,30 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         self.assertEqual(
             tasks,
             {
+                ("SMOKE-LEAF-COMPLETED", "depth2-leaf-completed"),
+                ("SMOKE-LEAF-BLOCKED", "depth2-leaf-blocked"),
                 ("SMOKE-CONTROL", "ask-free-control"),
                 ("SMOKE-ASK", "depth2-ask"),
                 ("SMOKE-ESCALATION", "leaf-escalation"),
                 ("SMOKE-ESCALATION-PERMISSION", "leaf-escalation-permission"),
             },
         )
+
+        completed = next(
+            definition for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-LEAF-COMPLETED"
+        )
+        completed_text = " ".join(completed[3] + completed[4])
+        self.assertIn("git status --short", completed_text)
+        self.assertIn("status: COMPLETED", completed_text)
+        self.assertIn("agent::doctor", completed_text)
+        self.assertIn("project::doctor", completed_text)
+
+        blocked = next(
+            definition for definition in runtime.TASK_DEFINITIONS
+            if definition[0] == "SMOKE-LEAF-BLOCKED"
+        )
+        self.assertIn("status: BLOCKED", " ".join(blocked[3] + blocked[4]))
 
         smoke_ask = next(
             definition
@@ -284,6 +305,140 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
             finally:
                 runtime.workspace = original_workspace
                 runtime.run_capture = original_run_capture
+
+    def test_validate_leaf_contract_scopes_initialization_checks_to_leaf_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "issue"
+            logs = base / "logs"
+            logs.mkdir(parents=True)
+            for task, slug, state, extra in (
+                ("SMOKE-LEAF-COMPLETED", "depth2-leaf-completed", "completed", "parent accepted"),
+                ("SMOKE-LEAF-BLOCKED", "depth2-leaf-blocked", "blocked", ""),
+            ):
+                path = base / "smoke-repo" / ".worktrees" / f"{task}-{slug}" / ".task-state" / "task.md"
+                path.parent.mkdir(parents=True)
+                path.write_text(f"Work Unit state={state}\n{extra}\n", encoding="utf-8")
+                (path.parent / "work-units.json").write_text(
+                    json.dumps({"units": {"WU-1": {"state": state}}}) + "\n",
+                    encoding="utf-8",
+                )
+            (logs / "opencode-leaf-completed-20260101.log").write_text(
+                "\n".join([
+                    "message=created id=main agent=main",
+                    "message=created id=to-completed parentID=main agent=task-orchestrator",
+                    "initialization just agent::doctor just agent::context just project::doctor",
+                    "message=created id=done parentID=to-completed title=completed agent=general",
+                    'message="exiting loop" session.id=done',
+                ]) + "\n", encoding="utf-8"
+            )
+            (logs / "opencode-leaf-blocked-20260101.log").write_text(
+                "\n".join([
+                    "message=created id=to-blocked parentID=main agent=task-orchestrator",
+                    "message=created id=blocked parentID=to-blocked title=blocked agent=explore",
+                    'message="exiting loop" session.id=blocked',
+                ]) + "\n", encoding="utf-8"
+            )
+            original_workspace = runtime.workspace
+            original_run_capture = runtime.run_capture
+            runtime.workspace = lambda _issue: base
+            exports = {
+                "to-completed": {
+                    "messages": [{
+                        "info": {"role": "assistant"},
+                        "parts": [
+                            {"type": "tool", "state": {"status": "completed", "input": {"command": command}}}
+                            for command in ("just agent::doctor", "just agent::context", "just project::doctor")
+                        ],
+                    }],
+                },
+                "to-blocked": {
+                    "messages": [{
+                        "info": {"role": "assistant"},
+                        "parts": [
+                            {"type": "tool", "state": {"status": "completed", "input": {"command": command}}}
+                            for command in ("just agent::doctor", "just agent::context", "just project::doctor")
+                        ],
+                    }],
+                },
+                "done": {
+                    "messages": [{
+                        "info": {"role": "assistant"},
+                        "parts": [
+                            {"type": "tool", "state": {"status": "completed", "input": {"command": "git status --short"}}},
+                            {"type": "text", "text": "status: COMPLETED\n\nGit status is clean."},
+                        ],
+                    }],
+                },
+                "blocked": {
+                    "messages": [{
+                        "info": {"role": "assistant"},
+                        "parts": [{"type": "text", "text": "status: BLOCKED\n\nRequired file is absent."}],
+                    }],
+                },
+            }
+            runtime.run_capture = lambda command, *, cwd: json.dumps(exports[command[-1]])
+            try:
+                result = runtime.validate_leaf_contract("test")
+            finally:
+                runtime.workspace = original_workspace
+                runtime.run_capture = original_run_capture
+            self.assertEqual("PASS", result["status"])
+            self.assertEqual(
+                {"completed": "COMPLETED", "blocked": "BLOCKED"},
+                result["leafStatuses"],
+            )
+
+    def test_canonical_leaf_status_rejects_unknown_multiple_and_missing_fields(self) -> None:
+        self.assertEqual(
+            "BLOCKED",
+            runtime._canonical_leaf_status("status: BLOCKED\n\nEvidence.", "leaf"),
+        )
+        for response in (
+            "status: PASS",
+            "Evidence before status.\nstatus: BLOCKED",
+            "status: BLOCKED\nstatus: COMPLETED",
+            "BLOCKED",
+        ):
+            with self.subTest(response=response):
+                with self.assertRaisesRegex(runtime.RuntimeSmokeError, "exactly one valid first-line status"):
+                    runtime._canonical_leaf_status(response, "leaf")
+
+    def test_leaf_export_exposes_denied_initialization_attempts(self) -> None:
+        original_run_capture = runtime.run_capture
+        runtime.run_capture = lambda _command, *, cwd: json.dumps({
+            "messages": [{
+                "info": {"role": "assistant"},
+                "parts": [
+                    {"type": "tool", "state": {"input": {"command": "just agent::doctor"}}},
+                    {"type": "text", "text": "status: BLOCKED\n\nInitialization was denied."},
+                ],
+            }],
+        })
+        try:
+            response, commands = runtime._leaf_export(Path("."), "leaf")
+        finally:
+            runtime.run_capture = original_run_capture
+        self.assertEqual("BLOCKED", runtime._canonical_leaf_status(response, "leaf"))
+        self.assertEqual(["just agent::doctor"], commands)
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "attempted initialization"):
+            runtime._reject_leaf_initialization_commands(commands, "leaf")
+
+    def test_parent_initialization_does_not_treat_unexecuted_checks_as_pass(self) -> None:
+        original_run_capture = runtime.run_capture
+        runtime.run_capture = lambda _command, *, cwd: json.dumps({
+            "messages": [{
+                "info": {"role": "assistant"},
+                "parts": [
+                    {"type": "tool", "state": {"status": "completed", "input": {"command": "just agent::doctor"}}},
+                    {"type": "tool", "state": {"status": "pending", "input": {"command": "just agent::context"}}},
+                ],
+            }],
+        })
+        try:
+            with self.assertRaisesRegex(runtime.RuntimeSmokeError, "did not complete initialization"):
+                runtime._require_parent_initialization(Path("."), "parent")
+        finally:
+            runtime.run_capture = original_run_capture
 
     def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -622,12 +777,15 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
         report = runtime.report_template("issue-41", metadata)
         self.assertIn("Ask-free nested control", report)
         self.assertIn("Direct leaf control", report)
+        self.assertIn("Depth-2 leaf Work Unit contracts", report)
         self.assertIn("Depth-2 native Ask compatibility canary", report)
         self.assertIn("Leaf → Depth-1 escalation release gate", report)
         self.assertIn("release blocker: NO", report)
         self.assertIn("#51 release gate (Leaf -> Depth-1 escalation)", report)
         self.assertIn("#7 release status", report)
         self.assertIn("SMOKE-ESCALATION contract: READY", report)
+        self.assertIn("SMOKE-LEAF-COMPLETED contract: READY", report)
+        self.assertIn("SMOKE-LEAF-BLOCKED contract: READY", report)
         self.assertIn("SMOKE-ESCALATION-PERMISSION contract: READY", report)
         self.assertIn("Ask origin is Task Orchestrator session", report)
         self.assertIn("`runtime::validate-escalation`", report)

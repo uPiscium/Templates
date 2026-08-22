@@ -34,7 +34,12 @@ Before planning, editing, delegation, or project commands, load the `initialize`
 Own exactly one Task in its assigned worktree. Focus on high-leverage coordination: establish and maintain the Task Contract, decompose and delegate Work Units, integrate evidence, inspect actual diffs and results, update Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request.
 
 Depth-2 leaf Work Units are non-interactive:
-- accept and process only leaf status returns of `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`; treat any other leaf status as invalid evidence and set Task BLOCKED.
+- accept exactly one canonical leaf status field, using one of these exact lines:
+  - `status: COMPLETED` -> `completed`
+  - `status: BLOCKED` -> `blocked`
+  - `status: NEEDS_APPROVAL` -> `needs-approval`
+  - `status: NEEDS_DECISION` -> `needs-decision`
+- `status: BLOCKED` is valid evidence. Only an unknown, multiple, or missing status field is invalid evidence; treat those cases as invalid and set Task BLOCKED.
 - do not allow leaf agents to propose direct permission requests or permission bypasses.
 
 On `NEEDS_APPROVAL` / `NEEDS_DECISION`, this orchestrator is the approval and decision boundary:

@@ -34,6 +34,19 @@ TASK_ORCHESTRATOR_LEAVES = (
     "scout",
 )
 LEAF_STATUS_SET = {"COMPLETED", "BLOCKED", "NEEDS_APPROVAL", "NEEDS_DECISION"}
+LEAF_STATUS_FIELDS = tuple(f"status: {status}" for status in (
+    "COMPLETED",
+    "BLOCKED",
+    "NEEDS_APPROVAL",
+    "NEEDS_DECISION",
+))
+LEAF_CONTRACT_TEMPLATES = (
+    "agent-base",
+    "agent-python",
+    "agent-rust",
+    "agent-nix",
+    "agent-cpp-cmake",
+)
 READ_ONLY_GIT_COMMANDS = {
     "git status",
     "git status *",
@@ -178,6 +191,10 @@ def status_report_lines(text: str) -> set[str]:
     return set(re.findall(r"\b(?:COMPLETED|BLOCKED|NEEDS_APPROVAL|NEEDS_DECISION)\b", text))
 
 
+def exact_status_fields(text: str) -> list[str]:
+    return re.findall(r"`(status: (?:COMPLETED|BLOCKED|NEEDS_APPROVAL|NEEDS_DECISION))`", text)
+
+
 def assert_prompt_contract_for_leaf_statuses(test_case: unittest.TestCase, body: str, name: str) -> None:
     test_case.assertEqual(status_report_lines(body), LEAF_STATUS_SET, name)
     lower = body.lower()
@@ -199,6 +216,61 @@ def assert_prompt_contract_for_leaf_statuses(test_case: unittest.TestCase, body:
     ):
         test_case.assertIn(field, lower, name)
     test_case.assertIn("ambiguity, options with tradeoffs, and recommendation", lower, name)
+
+
+def assert_leaf_startup_contract(test_case: unittest.TestCase, body: str, name: str) -> None:
+    lower = body.lower()
+    test_case.assertIn("initialize", lower, name)
+    test_case.assertRegex(lower, r"(?:no|not|without|do not|don't)[^\n.]{0,80}initialize", name)
+    test_case.assertIn(
+        "parent task orchestrator already initialized the task worktree and validated the task contract",
+        lower,
+        name,
+    )
+    test_case.assertIn("bounded", lower, name)
+    test_case.assertIn("objective", lower, name)
+    test_case.assertIn("project::", lower, name)
+    test_case.assertIn("as leaf-session startup prerequisites", lower, name)
+    for command in ("just agent::doctor", "just agent::context", "just project::doctor"):
+        test_case.assertIn(command, lower, name)
+    test_case.assertIn(
+        "do not run `just agent::doctor`, `just agent::context`, or mandatory "
+        "`just project::doctor` as leaf-session startup prerequisites",
+        lower,
+        name,
+    )
+
+
+def assert_orchestrator_status_contract(test_case: unittest.TestCase, body: str) -> None:
+    lower = body.lower()
+    for field in LEAF_STATUS_FIELDS:
+        test_case.assertIn(field.lower(), lower)
+    test_case.assertEqual(set(exact_status_fields(body)), set(LEAF_STATUS_FIELDS))
+    for phrase in (
+        "unknown, multiple, or missing status field",
+        "invalid evidence",
+    ):
+        test_case.assertIn(phrase, lower)
+    invalid_lines = [line for line in lower.splitlines() if "invalid evidence" in line]
+    test_case.assertTrue(
+        any(
+            "only" in line
+            and all(term in line for term in ("unknown", "multiple", "missing"))
+            for line in invalid_lines
+        ),
+        "invalid evidence must be limited to unknown, multiple, or missing status fields",
+    )
+    for source, target in (
+        ("COMPLETED", "completed"),
+        ("BLOCKED", "blocked"),
+        ("NEEDS_APPROVAL", "needs-approval"),
+        ("NEEDS_DECISION", "needs-decision"),
+    ):
+        test_case.assertRegex(
+            lower,
+            rf"status:\s*{source.lower()}[^\n]*(?:->|→|maps? to|means|becomes)[^\n]*{re.escape(target)}",
+            source,
+        )
 
 
 def frontmatter(path: Path) -> str:
@@ -515,6 +587,62 @@ global permissive plan
                         r"integrate::status|project::commit|project::publish|project::release)",
                         leaf,
                     )
+
+    def test_leaf_permissions_are_exact_and_exclude_startup_commands(self) -> None:
+        """Leaf profiles are the complete allowlist, not a reduced init profile."""
+        for leaf in TASK_ORCHESTRATOR_LEAVES:
+            permission = permission_for(leaf)
+            bash = permission.get("bash", {})
+            self.assertIsInstance(bash, dict, leaf)
+            self.assertEqual(
+                {command for command, action in bash.items() if action == "allow"},
+                LEAF_ALLOWED_BASH[leaf],
+                leaf,
+            )
+            self.assertNotIn("just agent::doctor", bash, leaf)
+            self.assertNotIn("just agent::context", bash, leaf)
+            if "just project::doctor" in LEAF_ALLOWED_BASH[leaf]:
+                self.assertEqual(bash.get("just project::doctor"), "allow", leaf)
+
+    def test_leaf_prompts_require_parent_initialized_contract_and_bounded_objective(self) -> None:
+        for leaf in TASK_ORCHESTRATOR_LEAVES:
+            assert_leaf_startup_contract(self, body_text(leaf), leaf)
+
+    def test_leaf_status_fields_use_one_canonical_exact_format(self) -> None:
+        pattern = re.compile(r"(?m)^\s*-?\s*Start .* exactly one `status: (\w+)`")
+        for leaf in TASK_ORCHESTRATOR_LEAVES:
+            body = body_text(leaf)
+            self.assertTrue(pattern.search(body), leaf)
+            self.assertEqual(
+                {f"status: {status}" for status in status_report_lines(body)},
+                set(LEAF_STATUS_FIELDS),
+                leaf,
+            )
+            self.assertEqual(exact_status_fields(body), list(LEAF_STATUS_FIELDS), leaf)
+
+    def test_task_orchestrator_has_exact_leaf_status_mapping(self) -> None:
+        assert_orchestrator_status_contract(self, body_text("task-orchestrator"))
+
+    def test_generated_templates_share_leaf_source_contract(self) -> None:
+        for template in LEAF_CONTRACT_TEMPLATES:
+            agents = ROOT / "templates" / template / ".opencode" / "agents"
+            for leaf in TASK_ORCHESTRATOR_LEAVES:
+                source = (AGENTS / f"{leaf}.md").read_text(encoding="utf-8")
+                generated = (agents / f"{leaf}.md").read_text(encoding="utf-8")
+                self.assertEqual(generated, source, f"{template}: {leaf}")
+                assert_leaf_startup_contract(self, generated, f"{template}: {leaf}")
+                self.assertEqual(status_report_lines(generated), LEAF_STATUS_SET, f"{template}: {leaf} statuses")
+                self.assertEqual(exact_status_fields(generated), list(LEAF_STATUS_FIELDS), f"{template}: {leaf} status format")
+                for field in LEAF_STATUS_FIELDS:
+                    self.assertIn(field, generated, f"{template}: {leaf}: {field}")
+
+            source_orchestrator = (AGENTS / "task-orchestrator.md").read_text(encoding="utf-8")
+            generated_orchestrator = (agents / "task-orchestrator.md").read_text(encoding="utf-8")
+            self.assertEqual(generated_orchestrator, source_orchestrator, f"{template}: task-orchestrator")
+            assert_orchestrator_status_contract(self, generated_orchestrator)
+            for field in LEAF_STATUS_FIELDS:
+                self.assertIn(field, generated_orchestrator, f"{template}: task-orchestrator: {field}")
+            self.assertEqual(set(exact_status_fields(generated_orchestrator)), set(LEAF_STATUS_FIELDS), f"{template}: task-orchestrator status format")
     def test_leaf_prompts_expose_completion_status_contract(self) -> None:
         for leaf in LEAF_PRIMARY_AGENTS:
             assert_prompt_contract_for_leaf_statuses(self, body_text(leaf), leaf)

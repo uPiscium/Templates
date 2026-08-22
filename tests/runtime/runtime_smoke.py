@@ -22,6 +22,42 @@ LEAF_ESCALATION_REJECT_COMMAND = "printf 'leaf-escalation-user-rejected\\n'"
 
 TASK_DEFINITIONS = (
     (
+        "SMOKE-LEAF-COMPLETED",
+        "depth2-leaf-completed",
+        "Prove that a bounded Depth-2 general leaf can complete an allowed read-only Work Unit after parent initialization.",
+        [
+            "After parent initialization, delegate exactly one bounded Work Unit to `general` (or `explore`).",
+            "Pass this exact objective: run `git status --short` exactly once, perform no other operation, and return the result.",
+            "The leaf must not invoke `agent::doctor`, `agent::context`, or `project::doctor`.",
+            "The leaf returns exactly `status: COMPLETED`; the parent accepts and records completed.",
+        ],
+        [
+            "Parent initialization may contain doctor/context/project::doctor events; they are outside the leaf-session inspection window.",
+            "The leaf session contains no denied initialization attempt or denied initialization event.",
+            "The leaf response has exactly one valid status field: `status: COMPLETED`.",
+            "Task State and work-units evidence record the Work Unit as completed.",
+        ],
+        ["Run from Main TUI with `/task-run SMOKE-LEAF-COMPLETED` under `just runtime::smoke-leaf-completed`."],
+    ),
+    (
+        "SMOKE-LEAF-BLOCKED",
+        "depth2-leaf-blocked",
+        "Prove that an intentionally impossible bounded Work Unit is reported as a valid blocked result rather than a false success.",
+        [
+            "After parent initialization, delegate exactly one bounded Work Unit to `explore`.",
+            "Pass this exact objective: report the contents of the guaranteed-absent tracked file `.runtime-smoke-intentionally-missing`; do not broaden the objective or substitute another path.",
+            "The leaf may establish that the required file is absent, but must not attempt any denied operation.",
+            "The leaf returns exactly `status: BLOCKED`; the parent treats it as valid and records the Work Unit as blocked.",
+        ],
+        [
+            "Parent initialization events are not attributed to the leaf.",
+            "The leaf response has exactly one valid status field: `status: BLOCKED`.",
+            "Task State and work-units evidence record the Work Unit as blocked.",
+            "No unexecuted runtime observation is classified as PASS.",
+        ],
+        ["Run from Main TUI with `/task-run SMOKE-LEAF-BLOCKED` under `just runtime::smoke-leaf-blocked`."],
+    ),
+    (
         "SMOKE-CONTROL",
         "ask-free-control",
         "Diagnose whether a nested Depth-2 leaf can complete without any Ask permission event.",
@@ -372,6 +408,8 @@ def report_template(issue: str, metadata: dict) -> str:
 - `runtime::doctor`: PASS
 - fixture bootstrap: PASS
 - Main initialization: PASS
+- SMOKE-LEAF-COMPLETED contract: READY
+- SMOKE-LEAF-BLOCKED contract: READY
 - SMOKE-CONTROL contract: READY
 - SMOKE-ASK contract: READY
 - SMOKE-ESCALATION contract: READY
@@ -388,6 +426,22 @@ def report_template(issue: str, metadata: dict) -> str:
 - provider response observed: PASS / FAIL / INCOMPLETE
 - read-only tool completed: PASS / FAIL / INCOMPLETE
 - child returned to parent: PASS / FAIL / INCOMPLETE
+- result: PASS / FAIL / INCOMPLETE
+
+## Depth-2 leaf Work Unit contracts
+
+- completed-case Log:
+- blocked-case Log:
+- Task Orchestrator session ID:
+- completed leaf session ID:
+- blocked leaf session ID:
+- parent initialization doctor/context/project::doctor events excluded from leaf inspection: PASS / FAIL / INCOMPLETE
+- completed leaf exact `status: COMPLETED`: PASS / FAIL / INCOMPLETE
+- parent accepted and recorded completed Work Unit: PASS / FAIL / INCOMPLETE
+- blocked leaf exact `status: BLOCKED`: PASS / FAIL / INCOMPLETE
+- parent recorded blocked Work Unit: PASS / FAIL / INCOMPLETE
+- denied initialization attempt/event in either leaf session: PASS / FAIL / INCOMPLETE
+- `runtime::validate-leaf-contract`: PASS / FAIL / INCOMPLETE
 - result: PASS / FAIL / INCOMPLETE
 
 ## Direct leaf control
@@ -924,6 +978,159 @@ def validate_escalation(issue: str) -> dict:
     }
 
 
+VALID_LEAF_STATUSES = {"COMPLETED", "BLOCKED", "NEEDS_APPROVAL", "NEEDS_DECISION"}
+
+
+def _canonical_leaf_status(text: str, leaf_id: str) -> str:
+    """Return an exact, first-line canonical status from a leaf final response."""
+    lines = text.splitlines()
+    matches = re.findall(r"(?m)^status: ([A-Z_]+)$", text)
+    if not lines or len(matches) != 1 or lines[0] != f"status: {matches[0]}" or matches[0] not in VALID_LEAF_STATUSES:
+        raise RuntimeSmokeError(
+            f"leaf {leaf_id} must emit exactly one valid first-line status field; observed {matches!r}"
+        )
+    return matches[0]
+
+
+def _leaf_session_from_log(path: Path) -> tuple[str, str]:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    parent_matches = [
+        (index, match.group(1))
+        for index, line in enumerate(lines)
+        if "agent=task-orchestrator" in line
+        for match in [re.search(r"message=created id=(\S+)", line)]
+        if match is not None
+    ]
+    if len(parent_matches) != 1:
+        raise RuntimeSmokeError(f"expected one Task Orchestrator session in {path}, observed {len(parent_matches)}")
+    parent_index, parent_id = parent_matches[0]
+    leaf_matches = [
+        (index, match.group(1))
+        for index, line in enumerate(lines)
+        if f"parentID={parent_id}" in line and ("agent=general" in line or "agent=explore" in line)
+        for match in [re.search(r"message=created id=(\S+)", line)]
+        if match is not None
+    ]
+    if len(leaf_matches) != 1:
+        raise RuntimeSmokeError(f"expected one Depth-2 leaf session in {path}, observed {len(leaf_matches)}")
+    leaf_index, leaf_id = leaf_matches[0]
+    exits = [index for index, line in enumerate(lines) if f'message="exiting loop" session.id={leaf_id}' in line]
+    if len(exits) != 1 or not (parent_index < leaf_index < exits[0]):
+        raise RuntimeSmokeError(f"leaf {leaf_id} does not have one ordered completion event in {path}")
+    return parent_id, leaf_id
+
+
+def _session_export(repo: Path, session_id: str) -> tuple[list[str], list[tuple[str, str]]]:
+    try:
+        exported = json.loads(run_capture(["opencode", "export", "--sanitize", session_id], cwd=repo))
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise RuntimeSmokeError(f"invalid sanitized export for session {session_id}") from exc
+    messages = exported.get("messages", []) if isinstance(exported, dict) else []
+    assistant_texts: list[str] = []
+    tools: list[tuple[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info", {})
+        parts = message.get("parts", [])
+        if isinstance(info, dict) and info.get("role") == "assistant":
+            text = "\n".join(
+                part.get("text", "")
+                for part in parts
+                if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+            ).strip()
+            if text:
+                assistant_texts.append(text)
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "tool":
+                continue
+            command = part.get("state", {}).get("input", {}).get("command")
+            if isinstance(command, str):
+                status = part.get("state", {}).get("status", "")
+                tools.append((command, status if isinstance(status, str) else ""))
+    return assistant_texts, tools
+
+
+def _leaf_export(repo: Path, leaf_id: str) -> tuple[str, list[str]]:
+    assistant_texts, tools = _session_export(repo, leaf_id)
+    if not assistant_texts:
+        raise RuntimeSmokeError(f"sanitized export has no assistant response for leaf {leaf_id}")
+    return assistant_texts[-1], [command for command, _status in tools]
+
+
+def _require_parent_initialization(repo: Path, parent_id: str) -> None:
+    _responses, tools = _session_export(repo, parent_id)
+    for command in ("just agent::doctor", "just agent::context", "just project::doctor"):
+        matches = [status for candidate, status in tools if candidate == command]
+        if matches != ["completed"]:
+            raise RuntimeSmokeError(
+                f"Task Orchestrator {parent_id} did not complete initialization command {command}: {matches!r}"
+            )
+
+
+def _reject_leaf_initialization_commands(commands: list[str], leaf_id: str) -> None:
+    forbidden = ("agent::doctor", "agent::context", "project::doctor")
+    if any(command in candidate for candidate in commands for command in forbidden):
+        raise RuntimeSmokeError(f"leaf {leaf_id} attempted initialization inspection")
+
+
+def validate_leaf_contract(issue: str) -> dict:
+    """Validate completed/blocked contracts using leaf exports, never parent init output."""
+    base = workspace(issue)
+    repo = smoke_repo(issue)
+    case_logs: dict[str, Path] = {}
+    for expected, mode in (("completed", "leaf-completed"), ("blocked", "leaf-blocked")):
+        matches = sorted((base / "logs").glob(f"opencode-{mode}-[0-9]*.log"))
+        if not matches:
+            raise RuntimeSmokeError(f"missing {mode} DEBUG log")
+        case_logs[expected] = matches[-1]
+
+    parent_ids: dict[str, str] = {}
+    results: dict[str, str] = {}
+    for expected, log in case_logs.items():
+        parent_id, leaf_id = _leaf_session_from_log(log)
+        _require_parent_initialization(repo, parent_id)
+        response, commands = _leaf_export(repo, leaf_id)
+        status_value = _canonical_leaf_status(response, leaf_id)
+        if status_value.lower() != expected:
+            raise RuntimeSmokeError(f"leaf {leaf_id} returned {status_value}, expected {expected.upper()}")
+        _reject_leaf_initialization_commands(commands, leaf_id)
+        if expected == "completed" and commands != ["git status --short"]:
+            raise RuntimeSmokeError(f"completed leaf operations are not exactly git status --short: {commands!r}")
+        parent_ids[expected] = parent_id
+        results[expected] = status_value
+
+    state_paths = {
+        "completed": base / "smoke-repo" / ".worktrees" / "SMOKE-LEAF-COMPLETED-depth2-leaf-completed" / ".task-state" / "task.md",
+        "blocked": base / "smoke-repo" / ".worktrees" / "SMOKE-LEAF-BLOCKED-depth2-leaf-blocked" / ".task-state" / "task.md",
+    }
+    for expected, path in state_paths.items():
+        if not path.is_file():
+            raise RuntimeSmokeError(f"missing {expected} Task State: {path}")
+        text = path.read_text(encoding="utf-8")
+        if f"state={expected}" not in text and f'"state": "{expected}"' not in text:
+            raise RuntimeSmokeError(f"Task State does not record {expected}: {path}")
+        work_units = path.parent / "work-units.json"
+        if not work_units.is_file():
+            raise RuntimeSmokeError(f"missing machine-readable Work Unit evidence: {work_units}")
+        try:
+            units = json.loads(work_units.read_text(encoding="utf-8"))
+            states = [unit.get("state") for unit in units.get("units", {}).values()]
+        except (OSError, json.JSONDecodeError, AttributeError):
+            raise RuntimeSmokeError(f"invalid machine-readable Work Unit evidence: {work_units}")
+        if states != [expected]:
+            raise RuntimeSmokeError(f"Work Unit state evidence is not exactly {expected}: {work_units}")
+
+    return {
+        "status": "PASS",
+        "issue": issue,
+        "logs": {key: str(value) for key, value in case_logs.items()},
+        "parentSessions": parent_ids,
+        "leafStatuses": results,
+        "taskStates": {key: str(value) for key, value in state_paths.items()},
+    }
+
+
 def snapshot_sessions(issue: str, label: str) -> dict:
     label = validate_name(label, "snapshot label")
     repo = smoke_repo(issue)
@@ -976,6 +1183,9 @@ def parser() -> argparse.ArgumentParser:
     command = sub.add_parser("validate-escalation")
     command.add_argument("--issue", default="issue-41")
 
+    command = sub.add_parser("validate-leaf-contract")
+    command.add_argument("--issue", default="issue-41")
+
     command = sub.add_parser("snapshot-sessions")
     command.add_argument("--issue", default="issue-41")
     command.add_argument("--label", required=True)
@@ -1000,6 +1210,8 @@ def main() -> int:
             value = status(args.issue)
         elif args.command == "validate-escalation":
             value = validate_escalation(args.issue)
+        elif args.command == "validate-leaf-contract":
+            value = validate_leaf_contract(args.issue)
         elif args.command == "snapshot-sessions":
             value = snapshot_sessions(args.issue, args.label)
         elif args.command == "export-session":

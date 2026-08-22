@@ -5,6 +5,7 @@ This repository is designed for hierarchical agent-driven development.
 ## Durable invariants
 
 - Before planning, editing, delegation, or project commands in a new primary-agent or Task-Orchestrator session, read `.automation/INIT.md` and complete the `initialize` skill. Initialization is read-only and failures block work.
+- Depth-2 leaves inherit the parent Task Orchestrator's completed Task worktree initialization and Task Contract validation. They must not start `initialize` or the full workflow, and must not run `just agent::doctor`, `just agent::context`, or mandatory `just project::doctor` as startup prerequisites; already-allowed `project::*` commands remain usable when the bounded objective/check requires them.
 - Use the repository-local Just API for Task lifecycle, publication, and integration operations.
 - Do not bypass guarded Just recipes with raw state-changing Git or GitHub commands.
 - Ordinary implementation Tasks must not modify Automation Core files: `opencode.json`, `AGENTS.md`, `Justfile`, `.opencode/**`, `.automation/**`, or `.github/workflows/**`.
@@ -14,7 +15,7 @@ This repository is designed for hierarchical agent-driven development.
 - Leaf agents must not create subagents.
 - Main Orchestrator owns Task scheduling and final integration. Task Orchestrators own implementation and publication preparation for exactly one Task.
 - Task Orchestrators must not merge pull requests.
-- Depth-2 leaf agents are non-interactive; they may only report `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION` and never perform their own permission requests.
+- Depth-2 leaf agents are non-interactive; they must start their final response with exactly one `status: COMPLETED`, `status: BLOCKED`, `status: NEEDS_APPROVAL`, or `status: NEEDS_DECISION` field and never perform their own permission requests.
 - Task Orchestrator is the approval and decision boundary for any delegated escalation (`NEEDS_APPROVAL`/`NEEDS_DECISION`) and must re-evaluate scope, authority, least privilege, safety, alternatives, and current evidence before deciding.
 - A leaf denial is not automatically promoted to Ask. After independent re-evaluation, the Task Orchestrator may originate a new Depth-1 request only when that operation is already Ask/allow under its own configured authority; the leaf profile remains unchanged.
 - A user-rejected Depth-1 permission decision is final for that exact operation within the Task. It must not be retried, rephrased, re-delegated, or replaced by an equivalent operation; use recorded permission evidence and a safe alternative or BLOCKED result.
