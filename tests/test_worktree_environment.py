@@ -46,7 +46,7 @@ class WorktreeEnvironmentTest(unittest.TestCase):
             SCRIPT.read_bytes(),
             (ROOT / "templates" / "agent-python" / "just" / "project" / "environment.py").read_bytes(),
         )
-        for relative in ("mod.just", "python.just"):
+        for relative in ("mod.just", "python.just", "lockfiles.py"):
             self.assertEqual(
                 (ROOT / "components" / "adapters" / "python" / "just" / "project" / relative).read_bytes(),
                 (ROOT / "templates" / "agent-python" / "just" / "project" / relative).read_bytes(),

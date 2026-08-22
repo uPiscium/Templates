@@ -18,6 +18,15 @@ nix develop --command just template::adapter-migrate-plan /path/to/repository cp
 
 `adopt-apply` performs no commit, push, or merge. It refuses to run when the target working tree is dirty or when the plan contains unresolved collisions.
 
+For a Python repository, adoption deliberately leaves dependency resolution outside the generic adoption engine. Existing `flake.lock` and `uv.lock` files are preserved byte-for-byte. After `template::adopt-apply`, run the explicit bootstrap boundary, review any newly generated lockfiles, verify without lockfile updates, and include the accepted bootstrap output in the adoption pull request:
+
+```sh
+nix develop --no-write-lock-file --command just project::bootstrap
+nix develop --no-update-lock-file --command just project::check
+```
+
+The Python bootstrap entry uses `--no-write-lock-file` so outer Nix resolution cannot update an existing `flake.lock` or materialize a missing one before the Adapter runs. Python `project::bootstrap` resolves the project name before creating only missing lockfiles. Post-bootstrap verification instead uses `--no-update-lock-file`; `project::check` uses `uv run --locked`, and `/init` and verification do not create or update lockfiles. `just project::python::sync` remains the explicit dependency synchronization operation and may update `uv.lock` when project metadata requires it.
+
 After applying Agent Core on an existing bootstrap/adoption branch, `just agent::preflight` can verify tools, required files, VERSION, and Adapter readiness without requiring fabricated Task State. This is not full initialization: `just agent::doctor`, `just agent::context`, and `/init` retain strict branch/Task identity requirements and may intentionally block until the repository is on its default branch or in a registered Task worktree.
 
 ## Adapter selection

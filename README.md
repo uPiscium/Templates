@@ -36,19 +36,26 @@ rust   -> agent-rust
 
 Every Agent-ready repository contains the shared Agent Core plus exactly one Project Adapter. Adapter-less repositories are not supported; unknown projects use `base` as the minimum contract.
 
-After instantiating a generated language/toolchain template, run the one-time project bootstrap before the first validation or development session:
+After instantiating a generated non-Python language/toolchain template, run the one-time project bootstrap before the first validation or development session:
 
 ```sh
 nix develop --command just project::bootstrap
 ```
 
-The optional explicit project name can be supplied when the directory name is not the desired project name:
+For the Python template, prevent the outer Nix invocation from writing `flake.lock`; the Python Adapter bootstrap owns explicit materialization of missing `flake.lock` and `uv.lock` files:
+
+```sh
+nix develop --no-write-lock-file --command just project::bootstrap
+```
+
+The optional explicit project name can be supplied when the directory name is not the desired project name. Preserve the same Python-specific flag when using it:
 
 ```sh
 nix develop --command just project::bootstrap my-project
+nix develop --no-write-lock-file --command just project::bootstrap my-project
 ```
 
-`project::bootstrap` is the explicit state-changing setup step. It resolves generated project-name placeholders and is idempotent. It does not commit, push, merge, or change GitHub repository settings. After bootstrap, initialize Git as needed and use `/init` or the corresponding Just checks for normal read-only session validation.
+`project::bootstrap` is the explicit state-changing setup step. It resolves generated project-name placeholders and is idempotent. Python uses `--no-write-lock-file` so outer `nix develop` may resolve inputs but cannot take ownership of lockfile mutation; the Adapter then creates missing repository-owned `flake.lock` and `uv.lock` files without refreshing existing lockfiles. It does not commit, push, merge, or change GitHub repository settings. Include bootstrap output in the initial commit, then use `nix develop --no-update-lock-file --command ...` and the corresponding Just checks for normal read-only validation; Python verification uses `uv run --locked` and does not repair missing or stale dependency identity.
 
 ## Repository policy
 
