@@ -339,49 +339,40 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 ]) + "\n", encoding="utf-8"
             )
             original_workspace = runtime.workspace
-            original_run_capture = runtime.run_capture
+            original_session_export = runtime._session_export
             runtime.workspace = lambda _issue: base
-            exports = {
+            evidence = {
                 "to-completed": {
-                    "messages": [{
-                        "info": {"role": "assistant"},
-                        "parts": [
-                            {"type": "tool", "state": {"status": "completed", "input": {"command": command}}}
-                            for command in ("just agent::doctor", "just agent::context", "just project::doctor")
-                        ],
-                    }],
+                    "session_id": "to-completed",
+                    "assistant_final_status": None,
+                    "tool_commands": ["just agent::doctor", "just agent::context", "just project::doctor"],
+                    "tool_statuses": ["completed", "completed", "completed"],
                 },
                 "to-blocked": {
-                    "messages": [{
-                        "info": {"role": "assistant"},
-                        "parts": [
-                            {"type": "tool", "state": {"status": "completed", "input": {"command": command}}}
-                            for command in ("just agent::doctor", "just agent::context", "just project::doctor")
-                        ],
-                    }],
+                    "session_id": "to-blocked",
+                    "assistant_final_status": None,
+                    "tool_commands": ["just agent::doctor", "just agent::context", "just project::doctor"],
+                    "tool_statuses": ["completed", "completed", "completed"],
                 },
                 "done": {
-                    "messages": [{
-                        "info": {"role": "assistant"},
-                        "parts": [
-                            {"type": "tool", "state": {"status": "completed", "input": {"command": "git status --short"}}},
-                            {"type": "text", "text": "status: COMPLETED\n\nGit status is clean."},
-                        ],
-                    }],
+                    "session_id": "done",
+                    "assistant_final_status": "COMPLETED",
+                    "tool_commands": ["git status --short"],
+                    "tool_statuses": ["completed"],
                 },
                 "blocked": {
-                    "messages": [{
-                        "info": {"role": "assistant"},
-                        "parts": [{"type": "text", "text": "status: BLOCKED\n\nRequired file is absent."}],
-                    }],
+                    "session_id": "blocked",
+                    "assistant_final_status": "BLOCKED",
+                    "tool_commands": [],
+                    "tool_statuses": [],
                 },
             }
-            runtime.run_capture = lambda command, *, cwd: json.dumps(exports[command[-1]])
+            runtime._session_export = lambda _repo, session_id, **_kwargs: evidence[session_id]
             try:
                 result = runtime.validate_leaf_contract("test")
             finally:
                 runtime.workspace = original_workspace
-                runtime.run_capture = original_run_capture
+                runtime._session_export = original_session_export
             self.assertEqual("PASS", result["status"])
             self.assertEqual(
                 {"completed": "COMPLETED", "blocked": "BLOCKED"},
@@ -403,42 +394,171 @@ class RuntimeSmokeHarnessTest(unittest.TestCase):
                 with self.assertRaisesRegex(runtime.RuntimeSmokeError, "exactly one valid first-line status"):
                     runtime._canonical_leaf_status(response, "leaf")
 
-    def test_leaf_export_exposes_denied_initialization_attempts(self) -> None:
-        original_run_capture = runtime.run_capture
-        runtime.run_capture = lambda _command, *, cwd: json.dumps({
+    def test_sanitized_redacted_tool_input_cannot_satisfy_command_assertions(self) -> None:
+        sanitized = {
             "messages": [{
                 "info": {"role": "assistant"},
                 "parts": [
-                    {"type": "tool", "state": {"input": {"command": "just agent::doctor"}}},
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"redacted": "tool-input"},
+                        },
+                    },
                     {"type": "text", "text": "status: BLOCKED\n\nInitialization was denied."},
                 ],
             }],
-        })
+        }
+        evidence = runtime._derive_session_evidence(
+            sanitized, "leaf", require_final_status=True
+        )
+        self.assertEqual([None], evidence["tool_commands"])
+        self.assertNotEqual(["git status --short"], evidence["tool_commands"])
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "did not complete initialization"):
+            runtime._require_parent_initialization(evidence, "leaf")
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "missing or redacted"):
+            runtime._require_leaf_tool_evidence(evidence, "completed", "leaf")
+
+    def test_unsanitized_export_is_reduced_to_minimal_derived_evidence(self) -> None:
+        unsanitized = {
+            "messages": [
+                {
+                    "info": {"role": "user"},
+                    "parts": [{"type": "text", "text": "full private prompt"}],
+                },
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [
+                        {
+                            "type": "tool",
+                            "tool": "bash",
+                            "state": {
+                                "status": "completed",
+                                "input": {"command": "git status --short"},
+                                "output": "full private tool output",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": "status: COMPLETED\n\nfull private assistant explanation",
+                        },
+                    ],
+                },
+            ]
+        }
+        original_run = runtime.subprocess.run
+
+        def fake_run(_command, **kwargs):
+            json.dump(unsanitized, kwargs["stdout"])
+            kwargs["stdout"].flush()
+            return subprocess.CompletedProcess(_command, 0, stderr="")
+
+        runtime.subprocess.run = fake_run
         try:
-            response, commands = runtime._leaf_export(Path("."), "leaf")
+            evidence = runtime._session_export(
+                Path("."), "leaf", require_final_status=True
+            )
         finally:
-            runtime.run_capture = original_run_capture
-        self.assertEqual("BLOCKED", runtime._canonical_leaf_status(response, "leaf"))
-        self.assertEqual(["just agent::doctor"], commands)
-        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "attempted initialization"):
-            runtime._reject_leaf_initialization_commands(commands, "leaf")
+            runtime.subprocess.run = original_run
+        self.assertEqual(
+            {
+                "session_id": "leaf",
+                "assistant_final_status": "COMPLETED",
+                "tool_commands": ["git status --short"],
+                "tool_statuses": ["completed"],
+            },
+            evidence,
+        )
+        rendered = json.dumps(evidence)
+        self.assertNotIn("private", rendered)
+        self.assertNotIn("output", rendered)
+        self.assertNotIn("messages", rendered)
+
+    def test_leaf_tool_evidence_rejects_blocked_bash_and_hides_command(self) -> None:
+        evidence = {
+            "session_id": "leaf",
+            "assistant_final_status": "BLOCKED",
+            "tool_commands": ["secret-command-value"],
+            "tool_statuses": ["completed"],
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeSmokeError, "blocked leaf leaf attempted a Bash operation"
+        ) as raised:
+            runtime._require_leaf_tool_evidence(evidence, "blocked", "leaf")
+        self.assertNotIn("secret-command-value", str(raised.exception))
+
+    def test_trailing_empty_assistant_message_cannot_reuse_earlier_status(self) -> None:
+        exported = {
+            "messages": [
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "text", "text": "status: COMPLETED"}],
+                },
+                {"info": {"role": "assistant"}, "parts": []},
+            ]
+        }
+        with self.assertRaisesRegex(
+            runtime.RuntimeSmokeError, "exactly one valid first-line status"
+        ):
+            runtime._derive_session_evidence(
+                exported, "leaf", require_final_status=True
+            )
+
+    def test_latest_complete_leaf_log_skips_newer_incomplete_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            complete = root / "opencode-leaf-blocked-20260101.log"
+            incomplete = root / "opencode-leaf-blocked-20260102.log"
+            complete.write_text(
+                "message=created id=parent parentID=main agent=task-orchestrator\n"
+                "message=created id=leaf parentID=parent agent=explore\n"
+                'message="exiting loop" session.id=leaf\n',
+                encoding="utf-8",
+            )
+            incomplete.write_text(
+                "message=created id=new-parent parentID=main agent=task-orchestrator\n",
+                encoding="utf-8",
+            )
+            selected = runtime._latest_complete_leaf_log(
+                [complete, incomplete], "leaf-blocked"
+            )
+        self.assertEqual((complete, "parent", "leaf"), selected)
+
+    def test_transient_export_invalid_json_and_status_prefix_fail_closed(self) -> None:
+        original_run = runtime.subprocess.run
+        original_version = runtime._opencode_version
+        runtime._opencode_version = lambda _repo: "1.18.test"
+
+        def fake_run(_command, **kwargs):
+            kwargs["stdout"].write('Exporting session...\n{"messages": []}')
+            kwargs["stdout"].flush()
+            return subprocess.CompletedProcess(_command, 0, stderr="bounded stderr")
+
+        runtime.subprocess.run = fake_run
+        try:
+            with self.assertRaisesRegex(
+                runtime.RuntimeSmokeError,
+                r"opencode_version=1\.18\.test; exit_code=0; stderr=bounded stderr; "
+                r"json_error=line 1 column 1 position 0",
+            ) as raised:
+                runtime._transient_session_export(Path("."), "leaf")
+        finally:
+            runtime.subprocess.run = original_run
+            runtime._opencode_version = original_version
+        self.assertNotIn("Exporting session", str(raised.exception))
+        self.assertNotIn("messages", str(raised.exception))
 
     def test_parent_initialization_does_not_treat_unexecuted_checks_as_pass(self) -> None:
-        original_run_capture = runtime.run_capture
-        runtime.run_capture = lambda _command, *, cwd: json.dumps({
-            "messages": [{
-                "info": {"role": "assistant"},
-                "parts": [
-                    {"type": "tool", "state": {"status": "completed", "input": {"command": "just agent::doctor"}}},
-                    {"type": "tool", "state": {"status": "pending", "input": {"command": "just agent::context"}}},
-                ],
-            }],
-        })
-        try:
-            with self.assertRaisesRegex(runtime.RuntimeSmokeError, "did not complete initialization"):
-                runtime._require_parent_initialization(Path("."), "parent")
-        finally:
-            runtime.run_capture = original_run_capture
+        evidence = {
+            "session_id": "parent",
+            "assistant_final_status": None,
+            "tool_commands": ["just agent::doctor", "just agent::context"],
+            "tool_statuses": ["completed", "pending"],
+        }
+        with self.assertRaisesRegex(runtime.RuntimeSmokeError, "did not complete initialization"):
+            runtime._require_parent_initialization(evidence, "parent")
 
     def test_runtime_fixture_installs_explicit_native_ask_canary_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1020,51 +1021,151 @@ def _leaf_session_from_log(path: Path) -> tuple[str, str]:
     return parent_id, leaf_id
 
 
-def _session_export(repo: Path, session_id: str) -> tuple[list[str], list[tuple[str, str]]]:
+def _latest_complete_leaf_log(paths: list[Path], mode: str) -> tuple[Path, str, str]:
+    for path in reversed(paths):
+        try:
+            parent_id, leaf_id = _leaf_session_from_log(path)
+        except RuntimeSmokeError:
+            continue
+        return path, parent_id, leaf_id
+    raise RuntimeSmokeError(
+        f"no complete {mode} leaf session found across {len(paths)} DEBUG log(s)"
+    )
+
+
+def _opencode_version(repo: Path) -> str:
     try:
-        exported = json.loads(run_capture(["opencode", "export", "--sanitize", session_id], cwd=repo))
-    except (json.JSONDecodeError, AttributeError) as exc:
-        raise RuntimeSmokeError(f"invalid sanitized export for session {session_id}") from exc
+        result = subprocess.run(
+            ["opencode", "--version"],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"unavailable ({type(exc).__name__})"
+    value = result.stdout.strip().splitlines()
+    if result.returncode != 0 or not value:
+        return f"unavailable (exit {result.returncode})"
+    return value[0][:120]
+
+
+def _bounded_stderr(value: str, limit: int = 300) -> str:
+    summary = " ".join(value.split())
+    if not summary:
+        return "<empty>"
+    return summary[:limit] + ("..." if len(summary) > limit else "")
+
+
+def _transient_session_export(repo: Path, session_id: str) -> object:
+    """Load one unsanitized export transiently without persisting transcript data."""
+    command = ["opencode", "export", session_id]
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as export_file:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=repo,
+                text=True,
+                stdout=export_file,
+                stderr=subprocess.PIPE,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeSmokeError(
+                f"transient export failed for session {session_id}; "
+                f"opencode_version={_opencode_version(repo)}; error={type(exc).__name__}"
+            ) from exc
+        if result.returncode != 0:
+            raise RuntimeSmokeError(
+                f"transient export failed for session {session_id}; "
+                f"opencode_version={_opencode_version(repo)}; exit_code={result.returncode}; "
+                f"stderr={_bounded_stderr(result.stderr)}"
+            )
+        export_file.seek(0)
+        try:
+            return json.load(export_file)
+        except json.JSONDecodeError as exc:
+            raise RuntimeSmokeError(
+                f"transient export JSON invalid for session {session_id}; "
+                f"opencode_version={_opencode_version(repo)}; exit_code={result.returncode}; "
+                f"stderr={_bounded_stderr(result.stderr)}; "
+                f"json_error=line {exc.lineno} column {exc.colno} position {exc.pos}"
+            ) from exc
+
+
+def _derive_session_evidence(
+    exported: object, session_id: str, *, require_final_status: bool
+) -> dict[str, object]:
+    """Reduce a transient transcript to non-sensitive contract evidence."""
+    if not isinstance(exported, dict) or not isinstance(exported.get("messages"), list):
+        raise RuntimeSmokeError(f"invalid export structure for session {session_id}")
     messages = exported.get("messages", []) if isinstance(exported, dict) else []
-    assistant_texts: list[str] = []
-    tools: list[tuple[str, str]] = []
+    final_assistant_text: str | None = None
+    tool_commands: list[str | None] = []
+    tool_statuses: list[str | None] = []
     for message in messages:
         if not isinstance(message, dict):
-            continue
+            raise RuntimeSmokeError(f"invalid message structure for session {session_id}")
         info = message.get("info", {})
         parts = message.get("parts", [])
+        if not isinstance(parts, list):
+            raise RuntimeSmokeError(f"invalid parts structure for session {session_id}")
         if isinstance(info, dict) and info.get("role") == "assistant":
-            text = "\n".join(
+            final_assistant_text = "\n".join(
                 part.get("text", "")
                 for part in parts
                 if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
             ).strip()
-            if text:
-                assistant_texts.append(text)
         for part in parts:
-            if not isinstance(part, dict) or part.get("type") != "tool":
+            if not isinstance(part, dict):
+                raise RuntimeSmokeError(f"invalid part structure for session {session_id}")
+            if part.get("type") != "tool" or part.get("tool") != "bash":
                 continue
-            command = part.get("state", {}).get("input", {}).get("command")
-            if isinstance(command, str):
-                status = part.get("state", {}).get("status", "")
-                tools.append((command, status if isinstance(status, str) else ""))
-    return assistant_texts, tools
+            state = part.get("state")
+            state = state if isinstance(state, dict) else {}
+            tool_input = state.get("input")
+            tool_input = tool_input if isinstance(tool_input, dict) else {}
+            command = tool_input.get("command")
+            status = state.get("status")
+            tool_commands.append(command if isinstance(command, str) else None)
+            tool_statuses.append(status if isinstance(status, str) else None)
+    final_status = None
+    if require_final_status:
+        if final_assistant_text is None:
+            raise RuntimeSmokeError(f"export has no assistant final response for leaf {session_id}")
+        final_status = _canonical_leaf_status(final_assistant_text, session_id)
+    return {
+        "session_id": session_id,
+        "assistant_final_status": final_status,
+        "tool_commands": tool_commands,
+        "tool_statuses": tool_statuses,
+    }
 
 
-def _leaf_export(repo: Path, leaf_id: str) -> tuple[str, list[str]]:
-    assistant_texts, tools = _session_export(repo, leaf_id)
-    if not assistant_texts:
-        raise RuntimeSmokeError(f"sanitized export has no assistant response for leaf {leaf_id}")
-    return assistant_texts[-1], [command for command, _status in tools]
+def _session_export(
+    repo: Path, session_id: str, *, require_final_status: bool = False
+) -> dict[str, object]:
+    exported = _transient_session_export(repo, session_id)
+    return _derive_session_evidence(
+        exported, session_id, require_final_status=require_final_status
+    )
 
 
-def _require_parent_initialization(repo: Path, parent_id: str) -> None:
-    _responses, tools = _session_export(repo, parent_id)
+def _require_parent_initialization(evidence: dict[str, object], parent_id: str) -> None:
+    commands = evidence.get("tool_commands")
+    statuses = evidence.get("tool_statuses")
+    if not isinstance(commands, list) or not isinstance(statuses, list) or len(commands) != len(statuses):
+        raise RuntimeSmokeError(f"invalid derived tool evidence for Task Orchestrator {parent_id}")
+    completed_steps = [
+        step.strip()
+        for command, status in zip(commands, statuses)
+        if isinstance(command, str) and status == "completed"
+        for step in command.split(" && ")
+    ]
     for command in ("just agent::doctor", "just agent::context", "just project::doctor"):
-        matches = [status for candidate, status in tools if candidate == command]
-        if matches != ["completed"]:
+        if completed_steps.count(command) != 1:
             raise RuntimeSmokeError(
-                f"Task Orchestrator {parent_id} did not complete initialization command {command}: {matches!r}"
+                f"Task Orchestrator {parent_id} did not complete initialization command {command} exactly once"
             )
 
 
@@ -1074,29 +1175,49 @@ def _reject_leaf_initialization_commands(commands: list[str], leaf_id: str) -> N
         raise RuntimeSmokeError(f"leaf {leaf_id} attempted initialization inspection")
 
 
+def _require_leaf_tool_evidence(
+    evidence: dict[str, object], expected: str, leaf_id: str
+) -> None:
+    commands = evidence.get("tool_commands")
+    statuses = evidence.get("tool_statuses")
+    if not isinstance(commands, list) or not isinstance(statuses, list) or len(commands) != len(statuses):
+        raise RuntimeSmokeError(f"invalid derived tool evidence for leaf {leaf_id}")
+    if any(not isinstance(command, str) for command in commands):
+        raise RuntimeSmokeError(f"leaf {leaf_id} has missing or redacted Bash command evidence")
+    if any(not isinstance(status, str) for status in statuses):
+        raise RuntimeSmokeError(f"leaf {leaf_id} has missing Bash status evidence")
+    _reject_leaf_initialization_commands(commands, leaf_id)
+    if expected == "completed" and (
+        commands != ["git status --short"] or statuses != ["completed"]
+    ):
+        raise RuntimeSmokeError(f"completed leaf {leaf_id} operation evidence is invalid")
+    if expected == "blocked" and (commands or statuses):
+        raise RuntimeSmokeError(f"blocked leaf {leaf_id} attempted a Bash operation")
+
+
 def validate_leaf_contract(issue: str) -> dict:
     """Validate completed/blocked contracts using leaf exports, never parent init output."""
     base = workspace(issue)
     repo = smoke_repo(issue)
-    case_logs: dict[str, Path] = {}
+    cases: dict[str, tuple[Path, str, str]] = {}
     for expected, mode in (("completed", "leaf-completed"), ("blocked", "leaf-blocked")):
         matches = sorted((base / "logs").glob(f"opencode-{mode}-[0-9]*.log"))
         if not matches:
             raise RuntimeSmokeError(f"missing {mode} DEBUG log")
-        case_logs[expected] = matches[-1]
+        cases[expected] = _latest_complete_leaf_log(matches, mode)
 
     parent_ids: dict[str, str] = {}
     results: dict[str, str] = {}
-    for expected, log in case_logs.items():
-        parent_id, leaf_id = _leaf_session_from_log(log)
-        _require_parent_initialization(repo, parent_id)
-        response, commands = _leaf_export(repo, leaf_id)
-        status_value = _canonical_leaf_status(response, leaf_id)
+    for expected, (_log, parent_id, leaf_id) in cases.items():
+        parent_evidence = _session_export(repo, parent_id)
+        _require_parent_initialization(parent_evidence, parent_id)
+        leaf_evidence = _session_export(repo, leaf_id, require_final_status=True)
+        status_value = leaf_evidence.get("assistant_final_status")
+        if not isinstance(status_value, str):
+            raise RuntimeSmokeError(f"missing derived final status for leaf {leaf_id}")
         if status_value.lower() != expected:
             raise RuntimeSmokeError(f"leaf {leaf_id} returned {status_value}, expected {expected.upper()}")
-        _reject_leaf_initialization_commands(commands, leaf_id)
-        if expected == "completed" and commands != ["git status --short"]:
-            raise RuntimeSmokeError(f"completed leaf operations are not exactly git status --short: {commands!r}")
+        _require_leaf_tool_evidence(leaf_evidence, expected, leaf_id)
         parent_ids[expected] = parent_id
         results[expected] = status_value
 
@@ -1124,7 +1245,7 @@ def validate_leaf_contract(issue: str) -> dict:
     return {
         "status": "PASS",
         "issue": issue,
-        "logs": {key: str(value) for key, value in case_logs.items()},
+        "logs": {key: str(value[0]) for key, value in cases.items()},
         "parentSessions": parent_ids,
         "leafStatuses": results,
         "taskStates": {key: str(value) for key, value in state_paths.items()},
