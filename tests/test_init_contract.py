@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -20,13 +21,18 @@ spec.loader.exec_module(init)
 
 class InitContractTest(unittest.TestCase):
     def run_fixture(
-        self, root: Path, *command: str, check: bool = True
+        self,
+        root: Path,
+        *command: str,
+        check: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             command,
             cwd=root,
             text=True,
             capture_output=True,
+            env=env,
         )
         if check and result.returncode != 0:
             self.fail(
@@ -306,16 +312,23 @@ class InitContractTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("preflight:\n    python3 {{quote(init)}} preflight", recipes)
 
-    @unittest.skipUnless(shutil.which("just"), "just is required for runtime preflight smoke")
     def test_preflight_cli_does_not_require_git_repository_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.create_runtime(root)
+            tools = root / ".test-tools"
+            tools.mkdir()
+            just = tools / "just"
+            just.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            just.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{tools}:{env['PATH']}"
             result = self.run_fixture(
                 root,
                 sys.executable,
                 str(MODULE_PATH),
                 "preflight",
+                env=env,
             )
             self.assertIn('"status": "PASS"', result.stdout)
             self.assertFalse((root / ".git").exists())
