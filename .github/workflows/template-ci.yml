@@ -44,10 +44,14 @@ jobs:
           mkdir -p "$target"
           cd "$target"
           nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
-          nix develop --command just project::bootstrap smoke-project
           if [ "${{ matrix.template }}" = agent-python ]; then
+            test ! -e flake.lock
+            test ! -e uv.lock
+            nix develop --no-write-lock-file --command just project::bootstrap smoke-project
             test -f flake.lock
             test -f uv.lock
+          else
+            nix develop --command just project::bootstrap smoke-project
           fi
           if grep -R --fixed-strings '@@PROJECT_NAME@@' . \
             --exclude-dir=.git \
@@ -72,8 +76,10 @@ jobs:
           before="$(git status --porcelain)"
           if [ "${{ matrix.template }}" = agent-python ]; then
             before_locks="$(sha256sum flake.lock uv.lock)"
+            nix develop --no-write-lock-file --command just project::bootstrap smoke-project
+          else
+            nix develop --no-update-lock-file --command just project::bootstrap smoke-project
           fi
-          nix develop --no-update-lock-file --command just project::bootstrap smoke-project
           after="$(git status --porcelain)"
           test "$before" = "$after"
           if [ "${{ matrix.template }}" = agent-python ]; then

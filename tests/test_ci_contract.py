@@ -26,6 +26,13 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("project::check unexpectedly accepted a missing uv.lock", workflow)
         self.assertIn("project::check unexpectedly accepted a stale uv.lock", workflow)
         self.assertIn("test ! -e uv.lock", workflow)
+        self.assertIn("test ! -e flake.lock", workflow)
+        self.assertGreaterEqual(
+            workflow.count(
+                "nix develop --no-write-lock-file --command just project::bootstrap smoke-project"
+            ),
+            2,
+        )
 
     def test_ci_has_read_only_repository_permission(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "template-ci.yml").read_text(encoding="utf-8")

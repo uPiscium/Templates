@@ -61,9 +61,27 @@ class ProjectBootstrapTest(unittest.TestCase):
     def test_ci_uses_public_bootstrap_path(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "template-ci.yml").read_text(encoding="utf-8")
         self.assertIn("just project::bootstrap smoke-project", workflow)
+        self.assertIn(
+            "nix develop --no-write-lock-file --command just project::bootstrap smoke-project",
+            workflow,
+        )
         self.assertNotIn("prepare_smoke_template.py", workflow)
         self.assertIn("unresolved project-name placeholder remains after bootstrap", workflow)
         self.assertIn("--exclude=project_bootstrap.py", workflow)
+
+    def test_python_documented_bootstrap_prevents_outer_nix_lock_writes(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        adoption = (ROOT / "docs" / "existing-repository-adoption.md").read_text(
+            encoding="utf-8"
+        )
+        python_bootstrap = (
+            "nix develop --no-write-lock-file --command just project::bootstrap"
+        )
+        self.assertGreaterEqual(readme.count(python_bootstrap), 2)
+        self.assertIn(python_bootstrap, adoption)
+        self.assertIn(
+            "nix develop --no-update-lock-file --command just project::check", adoption
+        )
 
     def test_python_bootstrap_resolves_name_before_ensuring_lockfiles(self) -> None:
         project = (
