@@ -1,6 +1,7 @@
 root := justfile_directory()
 bootstrap_script := root / ".automation/bin/project_bootstrap.py"
 environment_script := root / "just/project/environment.py"
+lockfiles_script := root / "just/project/lockfiles.py"
 
 mod python 'python.just'
 mod? repository 'repository.just'
@@ -8,6 +9,7 @@ mod? repository 'repository.just'
 [working-directory: root]
 bootstrap name='':
     python3 {{quote(bootstrap_script)}} {{quote(name)}}
+    python3 {{quote(lockfiles_script)}} ensure
 
 [working-directory: root]
 environment:
@@ -23,16 +25,16 @@ doctor:
 
 [working-directory: root]
 format-check:
-    python3 {{quote(environment_script)}} exec uv run ruff format --check src tests
+    python3 {{quote(environment_script)}} exec uv run --locked ruff format --check src tests
 
 [working-directory: root]
 lint:
-    python3 {{quote(environment_script)}} exec uv run ruff check src tests
-    python3 {{quote(environment_script)}} exec uv run mypy src tests
+    python3 {{quote(environment_script)}} exec uv run --locked ruff check src tests
+    python3 {{quote(environment_script)}} exec uv run --locked mypy src tests
 
 [working-directory: root]
 test:
-    python3 {{quote(environment_script)}} exec uv run pytest -v
+    python3 {{quote(environment_script)}} exec uv run --locked pytest -v
 
 [working-directory: root]
 build:

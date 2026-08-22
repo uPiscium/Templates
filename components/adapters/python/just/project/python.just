@@ -7,9 +7,9 @@ sync:
 
 [working-directory: root]
 format:
-    python3 {{quote(environment_script)}} exec uv run ruff format src tests
-    python3 {{quote(environment_script)}} exec uv run ruff check --fix src tests
+    python3 {{quote(environment_script)}} exec uv run --locked ruff format src tests
+    python3 {{quote(environment_script)}} exec uv run --locked ruff check --fix src tests
 
 [working-directory: root]
 typecheck:
-    python3 {{quote(environment_script)}} exec uv run mypy src tests
+    python3 {{quote(environment_script)}} exec uv run --locked mypy src tests

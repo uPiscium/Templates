@@ -28,6 +28,20 @@ class LanguageAdapterTest(unittest.TestCase):
             self.assertIn(tool, project)
         self.assertIn("src tests", project)
         self.assertIn("SKIPPED", project)
+        self.assertIn("lockfiles.py", project)
+        self.assertLess(project.index("project_bootstrap.py"), project.index("lockfiles.py"))
+        self.assertEqual(project.count("uv run --locked"), 4)
+        self.assertNotIn("exec uv run ruff", project)
+        self.assertNotIn("exec uv run mypy", project)
+        self.assertNotIn("exec uv run pytest", project)
+
+        python = (adapter / "just" / "project" / "python.just").read_text(encoding="utf-8")
+        self.assertEqual(python.count("uv run --locked"), 3)
+        self.assertIn("exec uv sync", python)
+
+        pre_commit = (adapter / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+        self.assertEqual(pre_commit.count("uv run --locked"), 2)
+        self.assertNotIn("entry: uv run ruff", pre_commit)
 
         flake = (adapter / "flake.nix").read_text(encoding="utf-8")
         for tool in ("uv", "just", "git", "gh", "jq", "ruff", "mypy"):

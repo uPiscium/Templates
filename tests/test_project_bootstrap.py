@@ -65,6 +65,13 @@ class ProjectBootstrapTest(unittest.TestCase):
         self.assertIn("unresolved project-name placeholder remains after bootstrap", workflow)
         self.assertIn("--exclude=project_bootstrap.py", workflow)
 
+    def test_python_bootstrap_resolves_name_before_ensuring_lockfiles(self) -> None:
+        project = (
+            ROOT / "components" / "adapters" / "python" / "just" / "project" / "mod.just"
+        ).read_text(encoding="utf-8")
+        bootstrap_recipe = project.split("bootstrap name='':", 1)[1].split("\n\n", 1)[0]
+        self.assertLess(bootstrap_recipe.index("bootstrap_script"), bootstrap_recipe.index("lockfiles_script"))
+
 
 if __name__ == "__main__":
     unittest.main()

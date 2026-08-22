@@ -45,6 +45,10 @@ jobs:
           cd "$target"
           nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
           nix develop --command just project::bootstrap smoke-project
+          if [ "${{ matrix.template }}" = agent-python ]; then
+            test -f flake.lock
+            test -f uv.lock
+          fi
           if grep -R --fixed-strings '@@PROJECT_NAME@@' . \
             --exclude-dir=.git \
             --exclude=project_bootstrap.py; then
@@ -56,6 +60,7 @@ jobs:
           git config user.email "template-ci@example.invalid"
           git add .
           git commit -m initial
+          test -z "$(git status --porcelain)"
           git update-ref refs/remotes/origin/main HEAD
           git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
       - name: Bootstrap idempotency
@@ -65,35 +70,86 @@ jobs:
           target="$RUNNER_TEMP/${{ matrix.template }}"
           cd "$target"
           before="$(git status --porcelain)"
-          nix develop --command just project::bootstrap smoke-project
+          if [ "${{ matrix.template }}" = agent-python ]; then
+            before_locks="$(sha256sum flake.lock uv.lock)"
+          fi
+          nix develop --no-update-lock-file --command just project::bootstrap smoke-project
           after="$(git status --porcelain)"
           test "$before" = "$after"
+          if [ "${{ matrix.template }}" = agent-python ]; then
+            after_locks="$(sha256sum flake.lock uv.lock)"
+            test "$before_locks" = "$after_locks"
+          fi
+      - name: Record Python lockfile state
+        if: matrix.template == 'agent-python'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          sha256sum flake.lock uv.lock > "$RUNNER_TEMP/python-lockfiles.before"
+          git status --porcelain > "$RUNNER_TEMP/python-status.before"
       - name: Agent initialization smoke
         shell: bash
         run: |
           set -euo pipefail
           target="$RUNNER_TEMP/${{ matrix.template }}"
           cd "$target"
-          nix develop --command just agent::preflight
-          nix develop --command just agent::doctor
-          nix develop --command just agent::context
+          nix develop --no-update-lock-file --command just agent::preflight
+          nix develop --no-update-lock-file --command just agent::doctor
+          nix develop --no-update-lock-file --command just agent::context
       - name: Project Adapter smoke
         shell: bash
         run: |
           set -euo pipefail
           target="$RUNNER_TEMP/${{ matrix.template }}"
           cd "$target"
-          nix develop --command just project::doctor
-          nix develop --command just project::check
+          nix develop --no-update-lock-file --command just project::doctor
+          nix develop --no-update-lock-file --command just project::check
           if [ "${{ matrix.template }}" = agent-cpp-cmake ]; then
-            nix develop --command env CXX=c++ just project::doctor
-            if nix develop --command env CXX=definitely-not-a-cxx-compiler just project::doctor; then
+            nix develop --no-update-lock-file --command env CXX=c++ just project::doctor
+            if nix develop --no-update-lock-file --command env CXX=definitely-not-a-cxx-compiler just project::doctor; then
               echo 'doctor unexpectedly accepted missing CXX' >&2
               exit 1
             fi
-            nix develop --command env -u CXX just project::doctor
-            nix develop --command env CXX= just project::doctor
+            nix develop --no-update-lock-file --command env -u CXX just project::doctor
+            nix develop --no-update-lock-file --command env CXX= just project::doctor
           fi
+      - name: Verify Python lockfile state
+        if: matrix.template == 'agent-python'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          sha256sum --check "$RUNNER_TEMP/python-lockfiles.before"
+          git status --porcelain > "$RUNNER_TEMP/python-status.after"
+          cmp "$RUNNER_TEMP/python-status.before" "$RUNNER_TEMP/python-status.after"
+          test -z "$(git status --porcelain)"
+      - name: Python verification rejects missing or stale lockfile
+        if: matrix.template == 'agent-python'
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          rm uv.lock
+          if nix develop --no-update-lock-file --command just project::check; then
+            echo 'project::check unexpectedly accepted a missing uv.lock' >&2
+            exit 1
+          fi
+          test ! -e uv.lock
+          git checkout -- uv.lock
+          before_uv="$(sha256sum uv.lock)"
+          python3 -c 'from pathlib import Path; p = Path("pyproject.toml"); p.write_text(p.read_text().replace("dependencies = []", "dependencies = [\"idna==3.10\"]"))'
+          if nix develop --no-update-lock-file --command just project::check; then
+            echo 'project::check unexpectedly accepted a stale uv.lock' >&2
+            exit 1
+          fi
+          after_uv="$(sha256sum uv.lock)"
+          test "$before_uv" = "$after_uv"
+          git checkout -- pyproject.toml
+          test -z "$(git status --porcelain)"
       - name: Python inherited worktree environment smoke
         if: matrix.template == 'agent-python'
         shell: bash
@@ -101,7 +157,7 @@ jobs:
           set -euo pipefail
           target="$RUNNER_TEMP/${{ matrix.template }}"
           cd "$target"
-          nix develop --command bash -c '
+          nix develop --no-update-lock-file --command bash -c '
             set -euo pipefail
             export VIRTUAL_ENV=/tmp/main-worktree/.venv
             export UV_PROJECT_ENVIRONMENT=/tmp/main-worktree/.venv

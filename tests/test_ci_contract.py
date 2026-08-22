@@ -17,6 +17,15 @@ class CiContractTest(unittest.TestCase):
         self.assertIn("just agent::context", workflow)
         self.assertIn("just project::doctor", workflow)
         self.assertIn("just project::check", workflow)
+        self.assertIn("test -f flake.lock", workflow)
+        self.assertIn("test -f uv.lock", workflow)
+        self.assertIn("sha256sum flake.lock uv.lock", workflow)
+        self.assertIn("sha256sum --check", workflow)
+        self.assertIn("--no-update-lock-file --command just project::check", workflow)
+        self.assertIn('test -z "$(git status --porcelain)"', workflow)
+        self.assertIn("project::check unexpectedly accepted a missing uv.lock", workflow)
+        self.assertIn("project::check unexpectedly accepted a stale uv.lock", workflow)
+        self.assertIn("test ! -e uv.lock", workflow)
 
     def test_ci_has_read_only_repository_permission(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "template-ci.yml").read_text(encoding="utf-8")
