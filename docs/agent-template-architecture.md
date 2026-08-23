@@ -608,6 +608,46 @@ The publication API validates at least:
 
 Push is restricted to the Task branch with an explicit refspec. Force push is never part of the ordinary Task API.
 
+### 17.1 Automation Maintenance publication
+
+Agent Core upgrades are a separate, dedicated publication workflow, not ordinary Task work. The Task must be registered, non-default, and have ignored disposable Task State. From that Task worktree, use:
+
+```sh
+AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout>
+```
+
+The ambient variable is only an upgrade opt-in. It cannot authorize a commit; ordinary `just agent::commit <task>` continues to reject Automation Core paths. Upgrade preserves Adapter, repository, product, and CI-owned paths, and performs no commit, push, or merge.
+
+The canonical publication flows are:
+
+1. **Normal upgrade:** run `automation::upgrade` from the dedicated Automation
+   Maintenance Task, inspect the resulting diff, perform normal verification,
+   then use `automation::commit`, `agent::push`, and `agent::pr-create`.
+2. **Pre-receipt consumer recovery:** a self-hosted upgrade may leave the exact
+   upgraded diff without a receipt. After normal verification and before
+   `automation::commit`, run:
+
+   ```sh
+   AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git Templates checkout>
+   ```
+
+   This bridge does not trust `NO_CHANGES`, the current diff, or the environment.
+   It pins the clean source revision, materializes the tracked `HEAD` Agent Core
+   baseline, and applies canonical upgrade semantics in isolation to reconstruct
+   expected output. It then requires exact pending paths, content, and modes,
+   plus matching Task identity and `HEAD`, before issuing the existing receipt
+   and protected authority. Product, Adapter, repository, secret-pattern, or
+   `.task-state` paths and any tampering fail closed.
+
+The bridge only repairs missing pre-receipt evidence; the existing receipt and
+authority design remains in force, and ordinary `agent::commit` continues to
+reject Automation Core changes. This is the PR #79 review fix only; no Issue #77
+behavior or scope changes.
+
+Successful upgrade writes or replaces the ignored `.task-state/automation-maintenance.json` receipt. Its schema-1 content records Task identity (`task_id`, `branch`, `worktree`), source and source revision, current/upstream versions, sorted unique `changed_paths`, the authority `HEAD`, and per-path content/state fingerprints. A protected record in the shared Git directory binds that receipt to the successful upgrade. `automation::commit <task> [message]` fails closed unless both records match the current Task/worktree identity and `HEAD`, fingerprints, and complete pending path set. Receipt paths must be Agent Core-managed; any mixed Adapter, repository, product, configured-secret, or `.task-state` scope is rejected. Ambient Git repository/index overrides are scrubbed; exact blobs and modes are staged and rechecked in a private index, committed as that verified tree without hooks, and published only by an atomic expected-HEAD Task branch update. The receipt is moved to `.task-state/automation-maintenance.consumed.json` after successful commit; the next successful upgrade with changes replaces the active receipt and removes the prior consumed receipt. A no-change invocation returns `NO_CHANGES` and preserves existing lifecycle evidence.
+
+The required sequence is `git diff --check`, `just agent::doctor`, `just project::check`, and the repository CI/smoke suite, followed by `just automation::commit <task> [message]`, existing `just agent::push <task>`, and `just agent::pr-create <task>` (Draft PR). Raw Git/GitHub bypass is not permitted. Merge is excluded from this workflow and remains a separately gated Main Orchestrator operation.
+
 ## 18. Integration boundary
 
 Only the Main Orchestrator uses `integrate::*`.

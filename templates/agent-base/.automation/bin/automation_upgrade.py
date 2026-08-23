@@ -2,19 +2,220 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
 
 class UpgradeError(RuntimeError):
     pass
+
+
+RECEIPT_NAME = "automation-maintenance.json"
+CONSUMED_RECEIPT_NAME = "automation-maintenance.consumed.json"
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+RECEIPT_FIELDS = {
+    "schema_version",
+    "status",
+    "task_id",
+    "branch",
+    "worktree",
+    "source",
+    "source_revision",
+    "current_version",
+    "upstream_version",
+    "changed_paths",
+    "authority_head",
+    "authority_nonce",
+    "path_fingerprints",
+}
+_GIT_EXECUTABLE: Path | None = None
+
+
+def git_head(repo: Path) -> str:
+    result = run(["git", "rev-parse", "HEAD"], cwd=repo, check=False)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def source_revision(source: Path) -> str | None:
+    value = git_head(source)
+    return value or None
+
+
+def receipt_path(repo: Path) -> Path:
+    return repo / ".task-state" / RECEIPT_NAME
+
+
+def consumed_receipt_path(repo: Path) -> Path:
+    return repo / ".task-state" / CONSUMED_RECEIPT_NAME
+
+
+def common_git_dir(repo: Path) -> Path:
+    value = Path(run(["git", "rev-parse", "--git-common-dir"], cwd=repo).stdout.strip())
+    return value.resolve() if value.is_absolute() else (repo / value).resolve()
+
+
+def authority_path(repo: Path) -> Path:
+    key = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
+    return common_git_dir(repo) / "opencode" / "automation-maintenance" / f"{key}.json"
+
+
+def canonical_json(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def receipt_digest(receipt: dict) -> str:
+    return hashlib.sha256(canonical_json(receipt)).hexdigest()
+
+
+def write_authority(repo: Path, receipt: dict) -> None:
+    atomic_json_write(
+        authority_path(repo),
+        {
+            "schema_version": 1,
+            "task_id": receipt["task_id"],
+            "branch": receipt["branch"],
+            "worktree": receipt["worktree"],
+            "authority_nonce": receipt["authority_nonce"],
+            "receipt_sha256": receipt_digest(receipt),
+        },
+    )
+
+
+def validate_authority(repo: Path, receipt: dict) -> None:
+    path = authority_path(repo)
+    try:
+        authority = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UpgradeError("missing or invalid successful-upgrade authority record") from exc
+    expected = {
+        "schema_version": 1,
+        "task_id": receipt["task_id"],
+        "branch": receipt["branch"],
+        "worktree": receipt["worktree"],
+        "authority_nonce": receipt["authority_nonce"],
+        "receipt_sha256": receipt_digest(receipt),
+    }
+    if authority != expected:
+        raise UpgradeError("automation receipt does not match successful-upgrade authority")
+
+
+def require_ignored_untracked(repo: Path, paths: tuple[Path, ...]) -> None:
+    for path in paths:
+        relative = path.relative_to(repo).as_posix()
+        tracked = run(
+            ["git", "ls-files", "--error-unmatch", "--", relative],
+            cwd=repo,
+            check=False,
+        ).returncode == 0
+        if tracked:
+            raise UpgradeError(f"required Task State path is tracked: {relative}")
+        ignored = run(["git", "check-ignore", "-q", relative], cwd=repo, check=False).returncode == 0
+        if not ignored:
+            raise UpgradeError(f"required Task State path is not ignored: {relative}")
+
+
+def atomic_json_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def file_fingerprint(repo: Path, raw_path: str) -> dict[str, object]:
+    path = repo / Path(*raw_path.split("/"))
+    try:
+        state = path.lstat()
+    except FileNotFoundError:
+        return {"state": "absent", "mode": None, "content_sha256": None}
+    mode = stat.S_IMODE(state.st_mode)
+    if path.is_file() and not path.is_symlink():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {"state": "file", "mode": mode, "content_sha256": digest}
+    if path.is_symlink():
+        digest = hashlib.sha256(os.readlink(path).encode("utf-8", "surrogateescape")).hexdigest()
+        return {"state": "symlink", "mode": mode, "content_sha256": digest}
+    if path.is_dir():
+        return {"state": "directory", "mode": mode, "content_sha256": None}
+    return {"state": "special", "mode": mode, "content_sha256": None}
+
+
+def parse_task_identity(repo: Path, task: str) -> tuple[str, str, Path]:
+    if not TASK_ID_RE.fullmatch(task):
+        raise UpgradeError(f"invalid Task ID: {task!r}")
+    state_path = repo / ".task-state" / "task.md"
+    if not state_path.is_file():
+        raise UpgradeError("operation requires a Task worktree with Task State")
+    text = state_path.read_text(encoding="utf-8")
+    values: dict[str, str] = {}
+    for label in ("Task ID", "Branch", "Worktree"):
+        matches = re.findall(rf"(?m)^- {re.escape(label)}: (.+)$", text)
+        if len(matches) != 1 or not matches[0].strip():
+            raise UpgradeError(f"Task State must contain exactly one {label} identity field")
+        values[label] = matches[0].strip()
+    if values["Task ID"] != task:
+        raise UpgradeError("Task State identity does not match requested Task")
+    branch = values["Branch"]
+    if not (branch.startswith(f"task/{task}-") or branch.startswith(f"fix/{task}-")):
+        raise UpgradeError(f"Task State branch is not the Task branch for {task}")
+    worktree = Path(values["Worktree"]).resolve()
+    if worktree != repo.resolve():
+        raise UpgradeError("Task State worktree does not match the current worktree")
+    return task, branch, worktree
+
+
+def registered_worktrees(repo: Path) -> dict[Path, tuple[str | None, str | None]]:
+    output = run(["git", "worktree", "list", "--porcelain"], cwd=repo).stdout
+    records: dict[Path, tuple[str | None, str | None]] = {}
+    current: dict[str, str] = {}
+    for line in output.splitlines() + [""]:
+        if not line:
+            if current.get("worktree"):
+                branch = current.get("branch", "").removeprefix("refs/heads/") or None
+                records[Path(current["worktree"]).resolve()] = (branch, current.get("HEAD"))
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    return records
+
+
+def require_registered_task(repo: Path, task: str) -> tuple[str, str, Path]:
+    _, branch, worktree = parse_task_identity(repo, task)
+    registered = registered_worktrees(repo)
+    actual = registered.get(worktree)
+    current_branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
+    head = git_head(repo)
+    branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo, check=False).stdout.strip()
+    if (
+        actual is None
+        or current_branch != branch
+        or actual[0] != branch
+        or not head
+        or not branch_oid
+        or actual[1] != head
+        or branch_oid != head
+    ):
+        raise UpgradeError("current Task worktree is not registered with the expected branch")
+    default = run(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd=repo, check=False).stdout.strip().removeprefix("origin/")
+    if not default:
+        raise UpgradeError("cannot resolve default branch")
+    if branch == default:
+        raise UpgradeError("operation refused on the default branch")
+    return task, branch, worktree
 
 
 @dataclass(frozen=True)
@@ -32,8 +233,58 @@ class Migration:
     require_absent_paths: tuple[Path, ...]
 
 
-def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+def git_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") and key != "EMAIL"
+    }
+    if overrides:
+        environment.update(overrides)
+    return environment
+
+
+def git_executable() -> Path:
+    global _GIT_EXECUTABLE
+    if _GIT_EXECUTABLE is not None:
+        return _GIT_EXECUTABLE
+    candidate = shutil.which("git")
+    if not candidate:
+        raise UpgradeError("trusted Git executable is unavailable")
+    executable = Path(candidate).resolve()
+    try:
+        metadata = executable.stat()
+    except OSError as exc:
+        raise UpgradeError("trusted Git executable is unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise UpgradeError(f"Git executable is not root-owned and immutable: {executable}")
+    _GIT_EXECUTABLE = executable
+    return executable
+
+
+def run(
+    command: list[str],
+    *,
+    cwd: Path,
+    check: bool = True,
+    env_overrides: dict[str, str] | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    is_git = bool(command and command[0] == "git")
+    environment = git_environment(env_overrides) if is_git else None
+    executable_command = [str(git_executable()), *command[1:]] if is_git else command
+    result = subprocess.run(
+        executable_command,
+        cwd=cwd,
+        text=True,
+        input=input_text,
+        capture_output=True,
+        env=environment,
+    )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise UpgradeError(f"{' '.join(command)}: {detail}")
@@ -41,8 +292,12 @@ def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.Comp
 
 
 def root() -> Path:
-    result = run(["git", "rev-parse", "--show-toplevel"], cwd=Path.cwd())
-    return Path(result.stdout.strip()).resolve()
+    installed_root = Path(__file__).resolve().parents[2]
+    result = run(["git", "rev-parse", "--show-toplevel"], cwd=installed_root)
+    discovered = Path(result.stdout.strip()).resolve()
+    if discovered != installed_root:
+        raise UpgradeError("installed Agent Core path does not match the Git worktree root")
+    return installed_root
 
 
 def version(repo: Path) -> str:
@@ -79,6 +334,36 @@ def resolve_source(path: Path | None) -> Path:
     if not (source / "components" / "agent-core" / ".automation" / "VERSION").is_file():
         raise UpgradeError(f"not a Templates source checkout: {source}")
     return source
+
+
+def git_bytes(command: list[str], *, cwd: Path) -> bytes:
+    if not command or command[0] != "git":
+        raise UpgradeError("byte helper only accepts Git commands")
+    result = subprocess.run(
+        [str(git_executable()), *command[1:]],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+        env=git_environment(),
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip() or f"exit {result.returncode}"
+        raise UpgradeError(f"{' '.join(command)}: {detail}")
+    return result.stdout
+
+
+def resolve_pinned_source(path: Path) -> tuple[Path, str]:
+    source = resolve_source(path)
+    top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=source).stdout.strip()).resolve()
+    head = git_head(source)
+    if top != source or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise UpgradeError("source must be a Git worktree root with a full non-null HEAD")
+    status = git_bytes(
+        ["git", "status", "--porcelain=v1", "-z", "--", "components/agent-core"], cwd=source
+    )
+    if status:
+        raise UpgradeError("source components/agent-core must be clean")
+    return source, head
 
 
 def load_ownership(repo: Path) -> dict[str, str]:
@@ -378,6 +663,124 @@ def action_for(repo: Path, source_core: Path, relative: Path, ownership: dict[st
     return Action(rel, "replace", "Agent Core-owned path")
 
 
+def git_object_bytes(repo: Path, revision: str, path: str) -> bytes:
+    result = subprocess.run(
+        [str(git_executable()), "show", f"{revision}:{path}"],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+        env=git_environment(),
+    )
+    if result.returncode != 0:
+        raise UpgradeError(f"cannot read Git object {path}")
+    return result.stdout
+
+
+def materialize_tree(
+    repo: Path, revision: str, destination: Path, prefix: str = "", *, surface_only: bool = False
+) -> None:
+    entries = git_bytes(["git", "ls-tree", "-r", "-z", revision, "--", prefix or "."], cwd=repo).split(b"\0")
+    destination.mkdir(parents=True, exist_ok=True)
+    prefix_bytes = (prefix.rstrip("/") + "/").encode() if prefix else b""
+    for entry in entries:
+        if not entry:
+            continue
+        header, raw_path = entry.split(b"\t", 1)
+        fields = header.split()
+        if prefix_bytes and not raw_path.startswith(prefix_bytes):
+            raise UpgradeError("Git returned an unexpected snapshot path")
+        relative_raw = raw_path[len(prefix_bytes):] if prefix_bytes else raw_path
+        try:
+            relative_text = relative_raw.decode("utf-8")
+            relative = PurePosixPath(relative_text)
+        except UnicodeDecodeError as exc:
+            raise UpgradeError("snapshot contains a non-UTF-8 path") from exc
+        if surface_only and not (
+            relative_text in {"AGENTS.md", "Justfile", "opencode.json"}
+            or relative_text.startswith(".automation/")
+            or relative_text.startswith(".opencode/")
+        ):
+            continue
+        if len(fields) != 3 or fields[0] not in {b"100644", b"100755"} or fields[1] != b"blob":
+            raise UpgradeError("Agent Core snapshot contains a symlink, submodule, or special Git entry")
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or relative.as_posix() != relative_text
+        ):
+            raise UpgradeError("snapshot contains an unsafe or unnormalized path")
+        target = destination.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(git_object_bytes(repo, revision, raw_path.decode("utf-8")))
+        target.chmod(0o755 if fields[0] == b"100755" else 0o644)
+
+
+def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict) -> list[str]:
+    actionable = [item for item in plan["actions"] if item["action"] != "noop"]
+    planned_deletes = {Path(item["path"]) for item in actionable if item["action"] == "delete"}
+    blockers: list[str] = []
+    for item in actionable:
+        relative = Path(item["path"])
+        if item["action"] == "delete":
+            target = tree / relative
+            ancestor = symlink_ancestor(tree, relative)
+            if ancestor is not None:
+                blockers.append(f"{item['path']}: delete has symlink ancestor {ancestor.as_posix()}")
+                continue
+            if path_present(target) and not (target.is_symlink() or target.is_file()):
+                blockers.append(f"{item['path']}: delete target changed to an unsafe type")
+        else:
+            blocker = write_topology_blocker(tree, relative, planned_deletes)
+            if blocker:
+                blockers.append(f"{item['path']}: {blocker}")
+    if blockers:
+        raise UpgradeError("upgrade blocked before mutation:\n- " + "\n- ".join(blockers))
+    phases = {"delete": 0, "create": 1, "replace": 2, "merge": 3}
+    ordered = sorted(
+        [item for item in actionable if item["path"] != ".automation/VERSION"],
+        key=lambda item: (phases.get(item["action"], 99), item["path"]),
+    ) + [item for item in actionable if item["path"] == ".automation/VERSION"]
+    changed: list[str] = []
+    for item in ordered:
+        relative = Path(item["path"])
+        target = tree / relative
+        source = source_core / relative
+        if item["action"] == "delete":
+            ancestor = symlink_ancestor(tree, relative)
+            if ancestor is not None:
+                raise UpgradeError(
+                    f"delete path gained symlink ancestor after planning: {ancestor.as_posix()}"
+                )
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif path_present(target):
+                raise UpgradeError(f"delete became unsafe after planning: {item['path']}")
+        else:
+            blocker = write_topology_blocker(tree, relative, set())
+            if blocker:
+                raise UpgradeError(f"managed path became unsafe after planning: {item['path']}: {blocker}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                raise UpgradeError(f"destination became a symlink after planning: {item['path']}")
+            if item["action"] in {"create", "replace"}:
+                shutil.copy2(source, target)
+            elif item["action"] == "merge" and item["path"] == "AGENTS.md":
+                merged, detail = replace_agent_rules(target.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+                if merged is None:
+                    raise UpgradeError(f"AGENTS.md merge became unsafe: {detail}")
+                target.write_text(merged, encoding="utf-8")
+            elif item["action"] == "merge" and item["path"] == "Justfile":
+                merged, detail = merge_just_router(target.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+                if merged is None:
+                    raise UpgradeError(f"Justfile merge became unsafe: {detail}")
+                target.write_text(merged, encoding="utf-8")
+            else:
+                raise UpgradeError(f"unsupported upgrade action: {item}")
+        changed.append(item["path"])
+    return sorted(set(changed))
+
+
 def build_plan(repo: Path, source: Path) -> dict:
     local = version(repo)
     remote = version(source / "components" / "agent-core")
@@ -424,99 +827,47 @@ def build_plan(repo: Path, source: Path) -> dict:
     }
 
 
-def require_maintenance(repo: Path) -> None:
+def require_maintenance(repo: Path) -> tuple[str, str, Path]:
     branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
     if not branch:
         raise UpgradeError("detached HEAD is not supported")
-    default = run(
-        ["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
-        cwd=repo,
-        check=False,
-    ).stdout.strip().removeprefix("origin/")
-    if default and branch == default:
-        raise UpgradeError("upgrade refused on default branch")
-    if not (repo / ".task-state" / "task.md").is_file():
-        raise UpgradeError("upgrade requires a Task worktree with Task State")
+    state = repo / ".task-state" / "task.md"
+    task_match = re.search(r"(?m)^- Task ID: (.+)$", state.read_text(encoding="utf-8")) if state.is_file() else None
+    if not task_match:
+        raise UpgradeError("upgrade requires a registered non-default Task branch")
+    task_id = task_match.group(1).strip()
+    identity = require_registered_task(repo, task_id)
+    require_ignored_untracked(
+        repo,
+        (repo / ".task-state" / "task.md", receipt_path(repo), consumed_receipt_path(repo)),
+    )
     if os.environ.get("AUTOMATION_MAINTENANCE") != "1":
         raise UpgradeError("upgrade requires AUTOMATION_MAINTENANCE=1 in a dedicated Automation Maintenance Task")
+    return identity
 
 
 def apply(repo: Path, source: Path) -> dict:
-    require_maintenance(repo)
+    task_id, branch, worktree = require_maintenance(repo)
     plan = build_plan(repo, source)
     if plan["blockers"]:
         raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(plan["blockers"]))
     source_core = source / "components" / "agent-core"
     changed: list[str] = []
     actionable = [item for item in plan["actions"] if item["action"] != "noop"]
-    planned_deletes = {Path(item["path"]) for item in actionable if item["action"] == "delete"}
-    preflight_blockers: list[str] = []
-    for item in actionable:
-        relative = Path(item["path"])
-        destination = repo / relative
-        if item["action"] == "delete":
-            if path_present(destination) and not (destination.is_symlink() or destination.is_file()):
-                preflight_blockers.append(f"{item['path']}: delete target changed to an unsafe type")
-        else:
-            blocker = write_topology_blocker(repo, relative, planned_deletes)
-            if blocker:
-                preflight_blockers.append(f"{item['path']}: {blocker}")
-    if preflight_blockers:
-        raise UpgradeError("upgrade blocked before mutation:\n- " + "\n- ".join(preflight_blockers))
-
-    version_actions = [item for item in actionable if item["path"] == ".automation/VERSION"]
-    ordinary_actions = [item for item in actionable if item["path"] != ".automation/VERSION"]
-    phases = {"delete": 0, "create": 1, "replace": 2, "merge": 3}
-    ordered_actions = sorted(
-        ordinary_actions,
-        key=lambda item: (phases.get(item["action"], 99), item["path"]),
-    ) + version_actions
-    for item in ordered_actions:
-        relative = Path(item["path"])
-        source_path = source_core / relative
-        destination = repo / relative
-        if item["action"] == "delete":
-            ancestor = symlink_ancestor(repo, relative)
-            if ancestor is not None:
-                raise UpgradeError(
-                    f"delete path gained symlink ancestor after planning: {ancestor.as_posix()}"
-                )
-            if destination.is_symlink() or destination.is_file():
-                destination.unlink()
-            elif path_present(destination):
-                raise UpgradeError(f"delete became unsafe after planning: {item['path']}")
-            changed.append(item["path"])
-            continue
-        topology_blocker = write_topology_blocker(repo, relative, set())
-        if topology_blocker:
-            raise UpgradeError(f"managed path became unsafe after planning: {item['path']}: {topology_blocker}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if item["action"] in {"create", "replace"}:
-            if destination.is_symlink():
-                raise UpgradeError(f"destination became a symlink after planning: {item['path']}")
-            shutil.copy2(source_path, destination)
-        elif item["action"] == "merge" and item["path"] == "AGENTS.md":
-            if destination.is_symlink():
-                raise UpgradeError("AGENTS.md became a symlink after planning")
-            merged, detail = replace_agent_rules(
-                destination.read_text(encoding="utf-8"), source_path.read_text(encoding="utf-8")
-            )
-            if merged is None:
-                raise UpgradeError(f"AGENTS.md merge became unsafe: {detail}")
-            destination.write_text(merged, encoding="utf-8")
-        elif item["action"] == "merge" and item["path"] == "Justfile":
-            if destination.is_symlink():
-                raise UpgradeError("Justfile became a symlink after planning")
-            merged, detail = merge_just_router(
-                destination.read_text(encoding="utf-8"), source_path.read_text(encoding="utf-8")
-            )
-            if merged is None:
-                raise UpgradeError(f"Justfile merge became unsafe: {detail}")
-            destination.write_text(merged, encoding="utf-8")
-        else:
-            raise UpgradeError(f"unsupported upgrade action: {item}")
-        changed.append(item["path"])
-    return {
+    if not actionable:
+        return {
+            "status": "NO_CHANGES",
+            "repositoryRoot": str(repo),
+            "sourceCore": str(source_core),
+            "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
+            "changedPaths": [],
+            "commitCreated": False,
+            "pushPerformed": False,
+            "mergePerformed": False,
+            "requiredNextChecks": [],
+        }
+    changed = apply_plan_to_tree(repo, source_core, plan)
+    result = {
         "status": "APPLIED",
         "repositoryRoot": str(repo),
         "sourceCore": str(source_core),
@@ -532,6 +883,350 @@ def apply(repo: Path, source: Path) -> dict:
             "repository CI/smoke tests",
         ],
     }
+    changed_paths = sorted(set(changed))
+    result["changedPaths"] = changed_paths
+    receipt = {
+        "schema_version": 1,
+        "status": "active",
+        "task_id": task_id,
+        "branch": branch,
+        "worktree": str(worktree),
+        "source": str(source.resolve()),
+        "source_revision": source_revision(source),
+        "current_version": plan["currentVersion"],
+        "upstream_version": plan["upstreamVersion"],
+        "changed_paths": changed_paths,
+        "authority_head": git_head(repo),
+        "authority_nonce": secrets.token_hex(32),
+        "path_fingerprints": {path: file_fingerprint(repo, path) for path in changed_paths},
+    }
+    atomic_json_write(receipt_path(repo), receipt)
+    write_authority(repo, receipt)
+    consumed_receipt_path(repo).unlink(missing_ok=True)
+    return result
+
+
+def pending_paths(repo: Path) -> list[str]:
+    paths: set[str] = set()
+    for args in (
+        ("diff", "--no-ext-diff", "--name-only", "-z"),
+        ("diff", "--no-ext-diff", "--cached", "--name-only", "-z"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
+    ):
+        output = git_bytes(["git", *args], cwd=repo)
+        for raw in output.split(b"\0"):
+            if not raw:
+                continue
+            try:
+                paths.add(raw.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise UpgradeError("Git reported a non-UTF-8 pending path") from exc
+    return sorted(paths)
+
+
+def bootstrap_fingerprint(tree: Path, raw_path: str) -> dict[str, object]:
+    return file_fingerprint(tree, raw_path)
+
+
+def reject_bootstrap_path(repo: Path, raw_path: str) -> None:
+    path = validate_receipt_path(raw_path)
+    relative = Path(*path.split("/"))
+    policy_path = repo / ".automation" / "policy.toml"
+    policy = tomllib.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
+    secret_patterns = policy.get("paths", {}).get("secret_patterns", [])
+    if path == ".task-state" or path.startswith(".task-state/"):
+        raise UpgradeError(f"pending path is Task State: {path}")
+    if any(token.lower() in path.lower() for token in secret_patterns):
+        raise UpgradeError(f"pending path matches a configured secret pattern: {path}")
+    if path.startswith("just/project/") or path == "just/local.just":
+        raise UpgradeError(f"pending path is repository-owned: {path}")
+    if path.startswith(".github/"):
+        raise UpgradeError(f"pending path is repository-owned: {path}")
+    if path == ".automation/ADAPTER" or path == ".automation/INIT.fragment.md" or path == ".automation/adoption.toml":
+        raise UpgradeError(f"pending path is Adapter-owned: {path}")
+    if not managed(relative):
+        raise UpgradeError(f"pending path is outside Agent Core: {path}")
+
+
+def bootstrap_receipt(repo: Path, source: Path) -> dict:
+    task_id, branch, worktree = require_maintenance(repo)
+    authority_head = git_head(repo)
+    authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip()
+    if receipt_path(repo).exists() or authority_path(repo).exists():
+        raise UpgradeError("cannot bootstrap with an existing receipt or authority record")
+    pending = pending_paths(repo)
+    if not pending:
+        raise UpgradeError("bootstrap requires non-empty pending paths")
+    for path in pending:
+        reject_bootstrap_path(repo, path)
+    source, source_head = resolve_pinned_source(source)
+    require_ignored_untracked(repo, (repo / ".task-state" / "automation-bootstrap.tmp",))
+    with tempfile.TemporaryDirectory(prefix="automation-bootstrap-", dir=repo / ".task-state") as temporary:
+        baseline = Path(temporary) / "baseline"
+        source_snapshot = Path(temporary) / "source" / "components" / "agent-core"
+        materialize_tree(repo, authority_head, baseline, surface_only=True)
+        materialize_tree(source, source_head, source_snapshot, "components/agent-core")
+        before = {
+            p.relative_to(baseline).as_posix(): bootstrap_fingerprint(baseline, p.relative_to(baseline).as_posix())
+            for p in baseline.rglob("*") if p.is_file()
+        }
+        plan = build_plan(baseline, source_snapshot.parent.parent)
+        if plan["blockers"]:
+            raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(plan["blockers"]))
+        selected = [
+            migration for migration in load_migrations(source_snapshot)
+            if migration.to_version <= version_number(source_snapshot)
+        ]
+        _, migration_blockers, _ = migration_actions(repo, selected)
+        if migration_blockers:
+            raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(migration_blockers))
+        apply_plan_to_tree(baseline, source_snapshot, plan)
+        returned = set(item["path"] for item in plan["actions"] if item["action"] != "noop")
+        expected = sorted(
+            path for path in returned
+            if before.get(path, {"state": "absent", "mode": None, "content_sha256": None})
+            != bootstrap_fingerprint(baseline, path)
+        )
+        if expected != pending:
+            raise UpgradeError("pending paths do not exactly match the reconstructed upgrade")
+        if not expected:
+            return {"status": "NO_CHANGES", "changedPaths": [], "authorityIssued": False}
+        expected_fingerprints = {path: bootstrap_fingerprint(baseline, path) for path in expected}
+    pinned_source, current_source_head = resolve_pinned_source(source)
+    if pinned_source != source or current_source_head != source_head:
+        raise UpgradeError("source changed during receipt reconstruction")
+    current_identity = require_registered_task(repo, task_id)
+    current_registration = registered_worktrees(repo).get(worktree)
+    if (
+        current_identity != (task_id, branch, worktree)
+        or current_registration != (branch, authority_head)
+        or git_head(repo) != authority_head
+        or run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip() != authority_branch_oid
+    ):
+        raise UpgradeError("Task identity or HEAD changed during receipt reconstruction")
+    if pending_paths(repo) != pending:
+        raise UpgradeError("pending paths changed during receipt reconstruction")
+    current_fingerprints = {path: file_fingerprint(repo, path) for path in expected}
+    if current_fingerprints != expected_fingerprints:
+        raise UpgradeError("pending Agent Core content does not match the reconstructed upgrade")
+    receipt = {
+        "schema_version": 1, "status": "active", "task_id": task_id, "branch": branch,
+        "worktree": str(worktree), "source": str(source.resolve()), "source_revision": source_head,
+        "current_version": plan["currentVersion"], "upstream_version": plan["upstreamVersion"],
+        "changed_paths": expected, "authority_head": authority_head, "authority_nonce": secrets.token_hex(32),
+        "path_fingerprints": current_fingerprints,
+    }
+    atomic_json_write(receipt_path(repo), receipt)
+    write_authority(repo, receipt)
+    consumed_receipt_path(repo).unlink(missing_ok=True)
+    return {"status": "RECEIPT_BOOTSTRAPPED", "changedPaths": expected, "authorityIssued": True}
+
+
+def validate_receipt_path(raw: object) -> str:
+    if not isinstance(raw, str) or not raw or "\\" in raw:
+        raise UpgradeError("receipt contains an unsafe path")
+    pure = PurePosixPath(raw)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts) or pure.as_posix() != raw:
+        raise UpgradeError(f"receipt contains an unnormalized path: {raw!r}")
+    return raw
+
+
+def receipt_paths(repo: Path, receipt: dict) -> list[str]:
+    raw = receipt.get("changed_paths")
+    if not isinstance(raw, list) or not raw:
+        raise UpgradeError("automation receipt has no changed paths")
+    paths = [validate_receipt_path(item) for item in raw]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise UpgradeError("automation receipt paths must be sorted and unique")
+    secret_file = repo / ".automation" / "policy.toml"
+    policy = tomllib.loads(secret_file.read_text(encoding="utf-8")) if secret_file.is_file() else {}
+    secrets = policy.get("paths", {}).get("secret_patterns", [])
+    for path in paths:
+        relative = Path(*path.split("/"))
+        if path == ".task-state" or path.startswith(".task-state/") or not managed(relative):
+            raise UpgradeError(f"receipt path is not Agent Core managed: {path}")
+        if any(token.lower() in path.lower() for token in secrets):
+            raise UpgradeError(f"receipt path matches a configured secret pattern: {path}")
+    return paths
+
+
+def validate_receipt_schema(receipt: object) -> dict:
+    if not isinstance(receipt, dict) or set(receipt) != RECEIPT_FIELDS:
+        raise UpgradeError("automation upgrade receipt has an invalid schema")
+    if receipt.get("schema_version") != 1 or receipt.get("status") != "active":
+        raise UpgradeError("unsupported automation upgrade receipt")
+    required_strings = (
+        "task_id",
+        "branch",
+        "worktree",
+        "source",
+        "current_version",
+        "upstream_version",
+        "authority_head",
+        "authority_nonce",
+    )
+    if any(not isinstance(receipt.get(field), str) or not receipt[field] for field in required_strings):
+        raise UpgradeError("automation upgrade receipt has invalid provenance fields")
+    revision = receipt.get("source_revision")
+    if revision is not None and (not isinstance(revision, str) or not revision):
+        raise UpgradeError("automation upgrade receipt has an invalid source revision")
+    if not Path(receipt["source"]).is_absolute():
+        raise UpgradeError("automation upgrade receipt source must be absolute")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", receipt["authority_head"]):
+        raise UpgradeError("automation upgrade receipt has an invalid authority HEAD")
+    if not re.fullmatch(r"[0-9a-f]{64}", receipt["authority_nonce"]):
+        raise UpgradeError("automation upgrade receipt has an invalid authority nonce")
+    return receipt
+
+
+def staged_fingerprint(
+    repo: Path,
+    path: str,
+    *,
+    env_overrides: dict[str, str],
+) -> dict[str, object]:
+    entry = run(
+        ["git", "ls-files", "--stage", "--", path],
+        cwd=repo,
+        env_overrides=env_overrides,
+    ).stdout.strip()
+    if not entry:
+        return {"state": "absent", "mode": None, "content_sha256": None}
+    fields = entry.split(maxsplit=3)
+    if len(fields) != 4 or fields[2] != "0":
+        raise UpgradeError(f"staged path has an unsupported index entry: {path}")
+    mode = fields[0]
+    result = subprocess.run(
+        [str(git_executable()), "show", f":{path}"],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+        env=git_environment(env_overrides),
+    )
+    if result.returncode != 0:
+        raise UpgradeError(f"cannot read staged content for {path}")
+    if mode not in {"100644", "100755"}:
+        raise UpgradeError(f"staged path has an unsupported mode: {path}")
+    return {
+        "state": "file",
+        "mode": 0o755 if mode == "100755" else 0o644,
+        "content_sha256": hashlib.sha256(result.stdout).hexdigest(),
+    }
+
+
+def normalized_git_fingerprint(fingerprint: object) -> dict[str, object]:
+    if not isinstance(fingerprint, dict):
+        raise UpgradeError("automation receipt contains an invalid path fingerprint")
+    state = fingerprint.get("state")
+    if state == "absent":
+        return {"state": "absent", "mode": None, "content_sha256": None}
+    if state != "file" or not isinstance(fingerprint.get("mode"), int):
+        raise UpgradeError("automation receipt authorizes an unsupported path state")
+    digest = fingerprint.get("content_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise UpgradeError("automation receipt contains an invalid content fingerprint")
+    return {
+        "state": "file",
+        "mode": 0o755 if fingerprint["mode"] & 0o111 else 0o644,
+        "content_sha256": digest,
+    }
+
+
+def commit(repo: Path, task: str, message: str) -> dict[str, str]:
+    _, branch, worktree = require_registered_task(repo, task)
+    active = receipt_path(repo)
+    private_index = repo / ".task-state" / "automation-maintenance.index"
+    require_ignored_untracked(repo, (active, consumed_receipt_path(repo), private_index))
+    if not active.is_file():
+        raise UpgradeError("no active successful automation upgrade receipt")
+    try:
+        receipt = json.loads(active.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise UpgradeError("invalid automation upgrade receipt") from exc
+    receipt = validate_receipt_schema(receipt)
+    if (receipt.get("task_id"), receipt.get("branch"), receipt.get("worktree")) != (task, branch, str(worktree)):
+        raise UpgradeError("automation receipt identity does not match the current Task worktree")
+    if receipt.get("authority_head") != git_head(repo):
+        raise UpgradeError("automation receipt authority HEAD is stale")
+    paths = receipt_paths(repo, receipt)
+    fingerprints = receipt.get("path_fingerprints")
+    if not isinstance(fingerprints, dict) or set(fingerprints) != set(paths):
+        raise UpgradeError("automation receipt fingerprints do not match its paths")
+    if any(file_fingerprint(repo, path) != fingerprints[path] for path in paths):
+        raise UpgradeError("automation receipt path content/state fingerprint changed")
+    if pending_paths(repo) != paths:
+        raise UpgradeError("pending paths do not exactly match the automation receipt")
+    validate_authority(repo, receipt)
+
+    consumed = consumed_receipt_path(repo)
+    os.replace(active, consumed)
+    consumed_receipt = dict(receipt)
+    consumed_receipt["status"] = "consumed"
+    consumed_receipt["commit_sha"] = None
+    atomic_json_write(consumed, consumed_receipt)
+    authority = authority_path(repo)
+    authority.unlink(missing_ok=True)
+    private_index.unlink(missing_ok=True)
+    index_environment = {"GIT_INDEX_FILE": str(private_index)}
+    committed = False
+    commit_sha = ""
+    try:
+        run(["git", "read-tree", "HEAD"], cwd=repo, env_overrides=index_environment)
+        run(["git", "add", "--", *paths], cwd=repo, env_overrides=index_environment)
+        run(
+            ["git", "diff", "--no-ext-diff", "--cached", "--check"],
+            cwd=repo,
+            env_overrides=index_environment,
+        )
+        staged = sorted(
+            run(
+                ["git", "diff", "--no-ext-diff", "--cached", "--name-only"],
+                cwd=repo,
+                env_overrides=index_environment,
+            ).stdout.splitlines()
+        )
+        if staged != paths:
+            raise UpgradeError("staged paths do not exactly match the automation receipt")
+        if any(file_fingerprint(repo, path) != fingerprints[path] for path in paths):
+            raise UpgradeError("automation receipt path changed while staging")
+        for path in paths:
+            if staged_fingerprint(
+                repo,
+                path,
+                env_overrides=index_environment,
+            ) != normalized_git_fingerprint(fingerprints[path]):
+                raise UpgradeError(f"staged content does not match the automation receipt: {path}")
+        commit_message = message.strip() or f"task: {task}"
+        if task not in commit_message:
+            commit_message = f"{commit_message}\n\nTask: {task}"
+        tree = run(
+            ["git", "write-tree"],
+            cwd=repo,
+            env_overrides=index_environment,
+        ).stdout.strip()
+        expected_head = receipt["authority_head"]
+        commit_sha = run(
+            ["git", "commit-tree", tree, "-p", expected_head],
+            cwd=repo,
+            input_text=commit_message + "\n",
+        ).stdout.strip()
+        run(
+            ["git", "update-ref", f"refs/heads/{branch}", commit_sha, expected_head],
+            cwd=repo,
+        )
+        committed = True
+        consumed_receipt["commit_sha"] = commit_sha
+        atomic_json_write(consumed, consumed_receipt)
+        run(["git", "reset", "-q", commit_sha, "--", *paths], cwd=repo)
+    except UpgradeError:
+        if not committed and not active.exists():
+            atomic_json_write(active, receipt)
+            write_authority(repo, receipt)
+            consumed.unlink(missing_ok=True)
+        raise
+    finally:
+        private_index.unlink(missing_ok=True)
+    return {"status": "COMMITTED", "commit_sha": commit_sha}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -542,6 +1237,11 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--source", type=Path, required=True)
     upgrade = sub.add_parser("upgrade")
     upgrade.add_argument("--source", type=Path, required=True)
+    bootstrap = sub.add_parser("bootstrap-receipt")
+    bootstrap.add_argument("--source", type=Path, required=True)
+    commit_parser = sub.add_parser("commit")
+    commit_parser.add_argument("task")
+    commit_parser.add_argument("message", nargs="?", default="")
     return p
 
 
@@ -555,6 +1255,10 @@ def main() -> int:
             result = build_plan(repo, resolve_source(args.source))
         elif args.command == "upgrade":
             result = apply(repo, resolve_source(args.source))
+        elif args.command == "bootstrap-receipt":
+            result = bootstrap_receipt(repo, resolve_source(args.source))
+        elif args.command == "commit":
+            result = commit(repo, args.task, args.message)
         else:  # pragma: no cover
             raise UpgradeError(f"unsupported command: {args.command}")
         print(json.dumps(result, indent=2, sort_keys=True))
