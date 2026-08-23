@@ -616,7 +616,27 @@ Agent Core upgrades are a separate, dedicated publication workflow, not ordinary
 AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout>
 ```
 
-The ambient variable is only an upgrade opt-in. It cannot authorize a commit; ordinary `just agent::commit <task>` continues to reject Automation Core paths. Upgrade preserves Adapter, repository, product, and CI-owned paths, and performs no commit, push, or merge.
+The source must be a trusted clean local Templates Git worktree root. The
+command pins its full, non-null `HEAD`, materializes only tracked
+`components/agent-core` objects into a temporary snapshot, and plans/copies
+only from that snapshot. Tracked modifications or non-ignored untracked paths
+under Agent Core, an invalid source root, or a source race fail closed; ignored
+generated artifacts are structurally absent. The command also refuses the
+default branch, an unregistered Task, missing Task State, or a
+non-ignored/tracked Task State path. The ambient variable is only an upgrade
+opt-in. It cannot authorize a commit; ordinary `just agent::commit <task>`
+continues to reject Automation Core paths. Upgrade preserves Adapter,
+repository, product, and CI-owned paths, and performs no commit, push, or
+merge.
+
+The read-only `automation::check-update` operation applies the same source
+contract: its Templates argument must be a trusted clean Git worktree root
+with a full `HEAD`, and tracked or non-ignored untracked changes under
+`components/agent-core` are rejected. Ignored generated artifacts are
+structurally absent; compatible `VERSION` drift remains detectable. It pins
+the source `HEAD`, materializes only tracked Agent Core objects into a
+temporary snapshot, and plans only from that snapshot. A source race fails
+closed.
 
 The canonical publication flows are:
 
@@ -632,17 +652,19 @@ The canonical publication flows are:
    ```
 
    This bridge does not trust `NO_CHANGES`, the current diff, or the environment.
-   It pins the clean source revision, materializes the tracked `HEAD` Agent Core
-   baseline, and applies canonical upgrade semantics in isolation to reconstruct
-   expected output. It then requires exact pending paths, content, and modes,
-   plus matching Task identity and `HEAD`, before issuing the existing receipt
-   and protected authority. Product, Adapter, repository, secret-pattern, or
-   `.task-state` paths and any tampering fail closed.
+   It uses the same pinned clean-source and tracked Agent Core snapshot
+   semantics as normal `automation::check-update` and `automation::upgrade`,
+   then applies canonical upgrade semantics in isolation to reconstruct
+   expected output. It requires exact pending paths, content, and modes, plus
+   matching Task identity and `HEAD`, before issuing the existing receipt and
+   protected authority. The receipt's `source_revision` is the pinned snapshot
+   `HEAD`; any source race fails closed. Product, Adapter, repository,
+   secret-pattern, or `.task-state` paths and any tampering fail closed.
 
 The bridge only repairs missing pre-receipt evidence; the existing receipt and
 authority design remains in force, and ordinary `agent::commit` continues to
-reject Automation Core changes. This is the PR #79 review fix only; no Issue #77
-behavior or scope changes.
+reject Automation Core changes. Its source and snapshot semantics align with
+the normal upgrade workflow.
 
 Successful upgrade writes or replaces the ignored `.task-state/automation-maintenance.json` receipt. Its schema-1 content records Task identity (`task_id`, `branch`, `worktree`), source and source revision, current/upstream versions, sorted unique `changed_paths`, the authority `HEAD`, and per-path content/state fingerprints. A protected record in the shared Git directory binds that receipt to the successful upgrade. `automation::commit <task> [message]` fails closed unless both records match the current Task/worktree identity and `HEAD`, fingerprints, and complete pending path set. Receipt paths must be Agent Core-managed; any mixed Adapter, repository, product, configured-secret, or `.task-state` scope is rejected. Ambient Git repository/index overrides are scrubbed; exact blobs and modes are staged and rechecked in a private index, committed as that verified tree without hooks, and published only by an atomic expected-HEAD Task branch update. The receipt is moved to `.task-state/automation-maintenance.consumed.json` after successful commit; the next successful upgrade with changes replaces the active receipt and removes the prior consumed receipt. A no-change invocation returns `NO_CHANGES` and preserves existing lifecycle evidence.
 

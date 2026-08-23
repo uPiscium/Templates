@@ -162,6 +162,30 @@ mod project 'just/project/mod.just'
         result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=True)
         return result.stdout.strip()
 
+    def _init_source_git(self, source_root: Path) -> str:
+        self._git(["init", "-b", "main"], source_root)
+        self._git(["config", "user.name", "Test User"], source_root)
+        self._git(["config", "user.email", "test@example.invalid"], source_root)
+        self._git(["add", "components/agent-core"], source_root)
+        self._git(["commit", "-m", "source fixture"], source_root)
+        return self._git(["rev-parse", "HEAD"], source_root)
+
+    def _ignore_source_path(self, source_root: Path, pattern: str) -> None:
+        exclude = source_root / ".git" / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as stream:
+            stream.write(pattern + "\n")
+
+    def _current_source_copy(self, source_root: Path) -> Path:
+        shutil.copytree(
+            ROOT / "components" / "agent-core",
+            source_root / "components" / "agent-core",
+            symlinks=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        self._init_source_git(source_root)
+        return source_root
+
     def _materialize_release_template(self, destination: Path) -> None:
         release = "a42ce1cc30e1a73e33c268a65c8957debc54d4cd"
         self.assertEqual(release, self._git(["rev-parse", "v3.0.0^{commit}"], ROOT))
@@ -267,18 +291,17 @@ mod project 'just/project/mod.just'
         exclude.write_text("/.task-state/\n", encoding="utf-8")
         return repo
 
-    def _apply_fixture(self, root: Path, *, source_git: bool = True) -> tuple[Path, Path]:
+    def _maintenance_fixture(self, root: Path, *, destination_version: int = 2) -> tuple[Path, Path]:
         repo = self._task_repo(root / "repo")
-        self._destination_repo(repo, version=2)
+        self._destination_repo(repo, version=destination_version)
         self._git(["add", "-A"], repo)
         self._git(["commit", "-m", "fixture"], repo)
         source = self._core_root_source(root, version=3)
-        if source_git:
-            self._git(["init", "-b", "main"], root)
-            self._git(["config", "user.name", "Test User"], root)
-            self._git(["config", "user.email", "test@example.invalid"], root)
-            self._git(["add", "components"], root)
-            self._git(["commit", "-m", "source"], root)
+        self._init_source_git(root)
+        return repo, source
+
+    def _apply_fixture(self, root: Path, *, destination_version: int = 2) -> tuple[Path, Path]:
+        repo, source = self._maintenance_fixture(root, destination_version=destination_version)
         with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
             upgrade.apply(repo, root)
         return repo, source
@@ -598,6 +621,7 @@ mod project 'just/project/mod.just'
             self._core_root_source(
                 root, version=3, migrations=self._migration_manifest(remove_paths=(".automation/stale.py",))
             )
+            self._init_source_git(root)
             with self._mock_maintenance(repo):
                 result = upgrade.apply(repo, root)
             self.assertIn(".automation/stale.py", result["changedPaths"])
@@ -612,6 +636,7 @@ mod project 'just/project/mod.just'
             self._write_file(repo / "opencode.json", "before\n")
             source = self._core_root_source(root, version=3, migrations=manifest)
             self._write_file(source / "opencode.json", "after\n")
+            self._init_source_git(root)
 
             plan = upgrade.build_plan(repo, root)
             self.assertTrue(plan["canApply"], plan["blockers"])
@@ -633,6 +658,7 @@ mod project 'just/project/mod.just'
             self._core_root_source(
                 root, version=3, migrations=self._migration_manifest(remove_paths=(".automation/link.py",))
             )
+            self._init_source_git(root)
             with self._mock_maintenance(repo):
                 upgrade.apply(repo, root)
             self.assertFalse((repo / ".automation/link.py").exists())
@@ -646,6 +672,7 @@ mod project 'just/project/mod.just'
             self._core_root_source(
                 root, version=3, migrations=self._migration_manifest(remove_paths=(".automation/obsolete",))
             )
+            self._init_source_git(root)
             plan = upgrade.build_plan(repo, root)
             self.assertFalse(plan["canApply"])
             self.assertIn("refuses directory deletion", "\n".join(plan["blockers"]))
@@ -659,6 +686,7 @@ mod project 'just/project/mod.just'
             (repo / "opencode.json").unlink()
             os.symlink(target, repo / "opencode.json")
             self._core_root_source(root, version=2)
+            self._init_source_git(root)
             plan = upgrade.build_plan(repo, root)
             self.assertFalse(plan["canApply"])
             self.assertIn("destination symlink", "\n".join(plan["blockers"]))
@@ -676,6 +704,7 @@ mod project 'just/project/mod.just'
             self._write_file(source / ".opencode/agents/new.md", "new\n")
             self._write_file(repo / "opencode.json", "before\n")
             self._write_file(source / "opencode.json", "after\n")
+            self._init_source_git(root)
             plan = upgrade.build_plan(repo, root)
             self.assertFalse(plan["canApply"])
             self.assertIn("non-directory ancestor .opencode", "\n".join(plan["blockers"]))
@@ -708,6 +737,7 @@ mod project 'just/project/mod.just'
             self._core_root_source(
                 root, version=3, migrations=self._migration_manifest(remove_paths=(".automation/obsolete",))
             )
+            self._init_source_git(root)
             with self._mock_maintenance(repo):
                 with self.assertRaises(upgrade.UpgradeError):
                     upgrade.apply(repo, root)
@@ -723,6 +753,7 @@ mod project 'just/project/mod.just'
             self._write_file(repo / "opencode.json", "{\"before\":1}\n")
             source = self._core_root_source(tmp, version=3, migrations=manifest)
             self._write_file(source / "opencode.json", "{\"before\":2}\n")
+            self._init_source_git(tmp)
 
             calls: list[str] = []
             original_copy2 = upgrade.shutil.copy2
@@ -751,6 +782,7 @@ mod project 'just/project/mod.just'
             source_parent = source_adp.parent
             source_parent.mkdir(parents=True, exist_ok=True)
             self._write_file(source_adp, "python\n")
+            self._init_source_git(tmp)
             plan = upgrade.build_plan(repo, tmp)
             self.assertIsNone(self._plan_action(plan, ".automation/ADAPTER"))
             with self._mock_maintenance(repo):
@@ -760,7 +792,9 @@ mod project 'just/project/mod.just'
 
     def test_current_v2_to_v3_migration_removes_obsolete_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
+            root = Path(directory)
+            repo = root / "repo"
+            source_root = self._current_source_copy(root / "source")
             shutil.copytree(ROOT / "templates/agent-base", repo, symlinks=True)
             (repo / ".automation" / "VERSION").write_text("2\n", encoding="utf-8")
             for path in self.V3_REMOVED_PATHS:
@@ -778,14 +812,16 @@ mod project 'just/project/mod.just'
             self.assertEqual((Path(".task-state/recovery.json"),), migration.require_absent_paths)
 
             with self._mock_maintenance(repo):
-                upgrade.apply(repo, ROOT)
+                upgrade.apply(repo, source_root)
             for path in self.V3_REMOVED_PATHS:
                 self.assertFalse((repo / path).exists(), path)
             self.assertEqual("3\n", (repo / ".automation" / "VERSION").read_text())
 
     def test_current_v2_to_v3_active_recovery_blocks_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
+            root = Path(directory)
+            repo = root / "repo"
+            source_root = self._current_source_copy(root / "source")
             shutil.copytree(ROOT / "templates/agent-base", repo, symlinks=True)
             (repo / ".automation" / "VERSION").write_text("2\n", encoding="utf-8")
             obsolete = repo / self.V3_REMOVED_PATHS[0]
@@ -797,15 +833,17 @@ mod project 'just/project/mod.just'
             self.assertFalse(plan["canApply"])
             self.assertIn(".task-state/recovery.json", "\n".join(plan["blockers"]))
             with self._mock_maintenance(repo):
-                with self.assertRaises(upgrade.UpgradeError):
-                    upgrade.apply(repo, ROOT)
+                with self.assertRaisesRegex(upgrade.UpgradeError, "recovery.json"):
+                    upgrade.apply(repo, source_root)
             self.assertTrue(obsolete.is_file())
             self.assertTrue(recovery.is_file())
             self.assertEqual("2\n", (repo / ".automation" / "VERSION").read_text())
 
     def test_current_v3_catches_up_obsolete_residue(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
+            root = Path(directory)
+            repo = root / "repo"
+            source_root = self._current_source_copy(root / "source")
             shutil.copytree(ROOT / "templates/agent-base", repo, symlinks=True)
             obsolete = repo / self.V3_REMOVED_PATHS[-1]
             self._write_file(obsolete, "obsolete\n")
@@ -813,7 +851,7 @@ mod project 'just/project/mod.just'
             self.assertTrue(plan["canApply"], plan["blockers"])
             self.assertEqual("delete", self._plan_action(plan, self.V3_REMOVED_PATHS[-1])["action"])
             with self._mock_maintenance(repo):
-                upgrade.apply(repo, ROOT)
+                upgrade.apply(repo, source_root)
             self.assertFalse(obsolete.exists())
             self.assertEqual("3\n", (repo / ".automation" / "VERSION").read_text())
 
@@ -892,6 +930,7 @@ mod project 'just/project/mod.just'
             second_root = root / "second"
             second_source = self._core_root_source(second_root, version=4)
             (second_source / "AGENTS.md").write_bytes((repo / "AGENTS.md").read_bytes())
+            self._init_source_git(second_root)
             with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
                 upgrade.apply(repo, second_root)
             second = self._receipt(repo)
@@ -1116,10 +1155,110 @@ mod project 'just/project/mod.just'
             self.assertTrue(upgrade.receipt_path(repo).exists())
             self.assertFalse(upgrade.consumed_receipt_path(repo).exists())
 
-    def test_source_revision_is_null_for_non_git_source(self) -> None:
+    def test_ignored_source_artifacts_are_absent_from_public_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo, source = self._apply_fixture(Path(directory), source_git=False)
-            self.assertIsNone(self._receipt(repo)["source_revision"])
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            self._ignore_source_path(root, "__pycache__/")
+            self._ignore_source_path(root, "*.pyc")
+            self._ignore_source_path(root, "*.pyo")
+            pyc = source / ".automation/bin/__pycache__/upgrade.cpython-313.pyc"
+            stale = source / ".automation/bin/model_fallback.pyc"
+            generated = source / ".automation/generated/cache.txt"
+            self._write_file(pyc, "pyc\n")
+            self._write_file(stale, "stale\n")
+            self._ignore_source_path(root, "/components/agent-core/.automation/generated/")
+            self._write_file(generated, "generated\n")
+
+            plan = upgrade.check_update(repo, root)
+            planned = {item["path"] for item in plan["actions"]}
+            self.assertNotIn(".automation/bin/__pycache__/upgrade.cpython-313.pyc", planned)
+            self.assertNotIn(".automation/bin/model_fallback.pyc", planned)
+            self.assertNotIn(".automation/generated/cache.txt", planned)
+            self.assertFalse(any(".pyc" in path for path in planned))
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                result = upgrade.apply(repo, root)
+            self.assertEqual("APPLIED", result["status"])
+            for relative in (pyc, stale, generated):
+                self.assertFalse((repo / relative.relative_to(source)).exists())
+
+    def test_untracked_nonignored_source_rejects_check_update_and_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            self._write_file(source / ".automation/bin/new.py", "new\n")
+            with self.assertRaisesRegex(upgrade.UpgradeError, "source components/agent-core must be clean"):
+                upgrade.check_update(repo, root)
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "source components/agent-core must be clean"):
+                    upgrade.apply(repo, root)
+            self.assertFalse(upgrade.receipt_path(repo).exists())
+
+    def test_tracked_source_modification_rejects_check_update_and_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            self._write_file(source / "opencode.json", "changed\n")
+            with self.assertRaisesRegex(upgrade.UpgradeError, "source components/agent-core must be clean"):
+                upgrade.check_update(repo, root)
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "source components/agent-core must be clean"):
+                    upgrade.apply(repo, root)
+            self.assertFalse(upgrade.receipt_path(repo).exists())
+
+    def test_clean_tracked_source_plan_apply_and_revision_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            head = self._git(["rev-parse", "HEAD"], root)
+            plan = upgrade.check_update(repo, root)
+            self.assertEqual(head, plan["sourceRevision"])
+            self.assertTrue(plan["canApply"], plan["blockers"])
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                result = upgrade.apply(repo, root)
+            self.assertEqual("APPLIED", result["status"])
+            self.assertEqual(head, result["sourceRevision"])
+            self.assertEqual(head, self._receipt(repo)["source_revision"])
+            self.assertEqual(head, upgrade.source_revision(root))
+
+    def test_same_version_committed_compatible_drift_is_detected_and_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root, destination_version=3)
+            self._write_file(source / "opencode.json", '{"drift": true}\n')
+            self._git(["add", "components/agent-core/opencode.json"], root)
+            self._git(["commit", "-m", "compatible source drift"], root)
+            plan = upgrade.check_update(repo, root)
+            self.assertEqual(3, int(plan["currentVersion"]))
+            self.assertEqual(3, int(plan["upstreamVersion"]))
+            self.assertEqual("replace", self._plan_action(plan, "opencode.json")["action"])
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                upgrade.apply(repo, root)
+            self.assertEqual('{"drift": true}\n', (repo / "opencode.json").read_text())
+
+    def test_source_race_fails_closed_without_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, _ = self._maintenance_fixture(root)
+            status_before = self._git(["status", "--porcelain"], repo)
+            version_before = (repo / ".automation/VERSION").read_bytes()
+            calls = 0
+
+            def race(_source: Path, _revision: str) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise upgrade.UpgradeError("source changed during upgrade planning or mutation")
+
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                with mock.patch.object(upgrade, "revalidate_source", side_effect=race):
+                    with self.assertRaisesRegex(upgrade.UpgradeError, "source changed during"):
+                        upgrade.apply(repo, root)
+            self.assertEqual(2, calls)
+            self.assertFalse(upgrade.receipt_path(repo).exists())
+            self.assertFalse(upgrade.authority_path(repo).exists())
+            self.assertEqual(status_before, self._git(["status", "--porcelain"], repo))
+            self.assertEqual(version_before, (repo / ".automation/VERSION").read_bytes())
 
     def test_pending_paths_handles_nul_delimited_git_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -22,6 +22,14 @@ Templates checkout as the source:
 AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout>
 ```
 
+The source must be a trusted clean Git worktree root with a full, non-null
+`HEAD`. Both `automation::check-update` and `automation::upgrade` reject
+tracked modifications and non-ignored untracked paths under
+`components/agent-core`; ignored generated artifacts are structurally absent.
+They pin the source `HEAD`, materialize only tracked Agent Core objects into a
+temporary snapshot, and plan/copy only from that snapshot. Compatible
+`VERSION` drift remains detectable, while a source race fails closed.
+
 The environment variable is an upgrade opt-in only. It does not authorize a
 commit; ordinary `just agent::commit <task>` rejects Automation Core changes.
 Upgrade does not commit, push, or merge and writes the ignored receipt
@@ -46,14 +54,15 @@ AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git T
 ```
 
 The bridge does not trust `NO_CHANGES`, the current diff, or the environment. It
-pins the clean source revision, materializes the tracked `HEAD` Agent Core
-baseline, applies canonical upgrade semantics in isolation, and requires exact
-pending paths/content/modes plus Task identity and `HEAD` before issuing the
-existing receipt and protected authority. Product, Adapter, repository,
-secret-pattern, or `.task-state` paths, and any tampering, fail closed. Continue
-with the existing `automation::commit` flow; ordinary `agent::commit` rejection
-and the receipt/authority design remain unchanged. This is the PR #79 review fix
-only; there are no Issue #77 changes.
+uses the same pinned clean-source and tracked Agent Core snapshot semantics as
+the normal update operations, applies canonical upgrade semantics in isolation,
+and requires exact pending paths/content/modes plus Task identity and `HEAD`
+before issuing the existing receipt and protected authority. The receipt's
+`source_revision` equals the pinned snapshot `HEAD`; any source race fails
+closed. Product, Adapter, repository, secret-pattern, or `.task-state` paths,
+and any tampering, fail closed. Continue with the existing
+`automation::commit` flow; ordinary `agent::commit` rejection and the
+receipt/authority design remain unchanged.
 
 The receipt is schema-1 JSON containing Task identity (`task_id`, `branch`, and
 `worktree`), source/source revision, current/upstream versions, sorted unique
