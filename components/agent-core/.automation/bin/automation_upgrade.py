@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tomllib
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
@@ -196,7 +197,18 @@ def require_registered_task(repo: Path, task: str) -> tuple[str, str, Path]:
     _, branch, worktree = parse_task_identity(repo, task)
     registered = registered_worktrees(repo)
     actual = registered.get(worktree)
-    if actual is None or actual[0] != branch:
+    current_branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
+    head = git_head(repo)
+    branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo, check=False).stdout.strip()
+    if (
+        actual is None
+        or current_branch != branch
+        or actual[0] != branch
+        or not head
+        or not branch_oid
+        or actual[1] != head
+        or branch_oid != head
+    ):
         raise UpgradeError("current Task worktree is not registered with the expected branch")
     default = run(["git", "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd=repo, check=False).stdout.strip().removeprefix("origin/")
     if not default:
@@ -322,6 +334,36 @@ def resolve_source(path: Path | None) -> Path:
     if not (source / "components" / "agent-core" / ".automation" / "VERSION").is_file():
         raise UpgradeError(f"not a Templates source checkout: {source}")
     return source
+
+
+def git_bytes(command: list[str], *, cwd: Path) -> bytes:
+    if not command or command[0] != "git":
+        raise UpgradeError("byte helper only accepts Git commands")
+    result = subprocess.run(
+        [str(git_executable()), *command[1:]],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+        env=git_environment(),
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip() or f"exit {result.returncode}"
+        raise UpgradeError(f"{' '.join(command)}: {detail}")
+    return result.stdout
+
+
+def resolve_pinned_source(path: Path) -> tuple[Path, str]:
+    source = resolve_source(path)
+    top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=source).stdout.strip()).resolve()
+    head = git_head(source)
+    if top != source or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise UpgradeError("source must be a Git worktree root with a full non-null HEAD")
+    status = git_bytes(
+        ["git", "status", "--porcelain=v1", "-z", "--", "components/agent-core"], cwd=source
+    )
+    if status:
+        raise UpgradeError("source components/agent-core must be clean")
+    return source, head
 
 
 def load_ownership(repo: Path) -> dict[str, str]:
@@ -621,6 +663,124 @@ def action_for(repo: Path, source_core: Path, relative: Path, ownership: dict[st
     return Action(rel, "replace", "Agent Core-owned path")
 
 
+def git_object_bytes(repo: Path, revision: str, path: str) -> bytes:
+    result = subprocess.run(
+        [str(git_executable()), "show", f"{revision}:{path}"],
+        cwd=repo,
+        capture_output=True,
+        check=False,
+        env=git_environment(),
+    )
+    if result.returncode != 0:
+        raise UpgradeError(f"cannot read Git object {path}")
+    return result.stdout
+
+
+def materialize_tree(
+    repo: Path, revision: str, destination: Path, prefix: str = "", *, surface_only: bool = False
+) -> None:
+    entries = git_bytes(["git", "ls-tree", "-r", "-z", revision, "--", prefix or "."], cwd=repo).split(b"\0")
+    destination.mkdir(parents=True, exist_ok=True)
+    prefix_bytes = (prefix.rstrip("/") + "/").encode() if prefix else b""
+    for entry in entries:
+        if not entry:
+            continue
+        header, raw_path = entry.split(b"\t", 1)
+        fields = header.split()
+        if prefix_bytes and not raw_path.startswith(prefix_bytes):
+            raise UpgradeError("Git returned an unexpected snapshot path")
+        relative_raw = raw_path[len(prefix_bytes):] if prefix_bytes else raw_path
+        try:
+            relative_text = relative_raw.decode("utf-8")
+            relative = PurePosixPath(relative_text)
+        except UnicodeDecodeError as exc:
+            raise UpgradeError("snapshot contains a non-UTF-8 path") from exc
+        if surface_only and not (
+            relative_text in {"AGENTS.md", "Justfile", "opencode.json"}
+            or relative_text.startswith(".automation/")
+            or relative_text.startswith(".opencode/")
+        ):
+            continue
+        if len(fields) != 3 or fields[0] not in {b"100644", b"100755"} or fields[1] != b"blob":
+            raise UpgradeError("Agent Core snapshot contains a symlink, submodule, or special Git entry")
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or relative.as_posix() != relative_text
+        ):
+            raise UpgradeError("snapshot contains an unsafe or unnormalized path")
+        target = destination.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(git_object_bytes(repo, revision, raw_path.decode("utf-8")))
+        target.chmod(0o755 if fields[0] == b"100755" else 0o644)
+
+
+def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict) -> list[str]:
+    actionable = [item for item in plan["actions"] if item["action"] != "noop"]
+    planned_deletes = {Path(item["path"]) for item in actionable if item["action"] == "delete"}
+    blockers: list[str] = []
+    for item in actionable:
+        relative = Path(item["path"])
+        if item["action"] == "delete":
+            target = tree / relative
+            ancestor = symlink_ancestor(tree, relative)
+            if ancestor is not None:
+                blockers.append(f"{item['path']}: delete has symlink ancestor {ancestor.as_posix()}")
+                continue
+            if path_present(target) and not (target.is_symlink() or target.is_file()):
+                blockers.append(f"{item['path']}: delete target changed to an unsafe type")
+        else:
+            blocker = write_topology_blocker(tree, relative, planned_deletes)
+            if blocker:
+                blockers.append(f"{item['path']}: {blocker}")
+    if blockers:
+        raise UpgradeError("upgrade blocked before mutation:\n- " + "\n- ".join(blockers))
+    phases = {"delete": 0, "create": 1, "replace": 2, "merge": 3}
+    ordered = sorted(
+        [item for item in actionable if item["path"] != ".automation/VERSION"],
+        key=lambda item: (phases.get(item["action"], 99), item["path"]),
+    ) + [item for item in actionable if item["path"] == ".automation/VERSION"]
+    changed: list[str] = []
+    for item in ordered:
+        relative = Path(item["path"])
+        target = tree / relative
+        source = source_core / relative
+        if item["action"] == "delete":
+            ancestor = symlink_ancestor(tree, relative)
+            if ancestor is not None:
+                raise UpgradeError(
+                    f"delete path gained symlink ancestor after planning: {ancestor.as_posix()}"
+                )
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif path_present(target):
+                raise UpgradeError(f"delete became unsafe after planning: {item['path']}")
+        else:
+            blocker = write_topology_blocker(tree, relative, set())
+            if blocker:
+                raise UpgradeError(f"managed path became unsafe after planning: {item['path']}: {blocker}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                raise UpgradeError(f"destination became a symlink after planning: {item['path']}")
+            if item["action"] in {"create", "replace"}:
+                shutil.copy2(source, target)
+            elif item["action"] == "merge" and item["path"] == "AGENTS.md":
+                merged, detail = replace_agent_rules(target.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+                if merged is None:
+                    raise UpgradeError(f"AGENTS.md merge became unsafe: {detail}")
+                target.write_text(merged, encoding="utf-8")
+            elif item["action"] == "merge" and item["path"] == "Justfile":
+                merged, detail = merge_just_router(target.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+                if merged is None:
+                    raise UpgradeError(f"Justfile merge became unsafe: {detail}")
+                target.write_text(merged, encoding="utf-8")
+            else:
+                raise UpgradeError(f"unsupported upgrade action: {item}")
+        changed.append(item["path"])
+    return sorted(set(changed))
+
+
 def build_plan(repo: Path, source: Path) -> dict:
     local = version(repo)
     remote = version(source / "components" / "agent-core")
@@ -706,73 +866,7 @@ def apply(repo: Path, source: Path) -> dict:
             "mergePerformed": False,
             "requiredNextChecks": [],
         }
-    planned_deletes = {Path(item["path"]) for item in actionable if item["action"] == "delete"}
-    preflight_blockers: list[str] = []
-    for item in actionable:
-        relative = Path(item["path"])
-        destination = repo / relative
-        if item["action"] == "delete":
-            if path_present(destination) and not (destination.is_symlink() or destination.is_file()):
-                preflight_blockers.append(f"{item['path']}: delete target changed to an unsafe type")
-        else:
-            blocker = write_topology_blocker(repo, relative, planned_deletes)
-            if blocker:
-                preflight_blockers.append(f"{item['path']}: {blocker}")
-    if preflight_blockers:
-        raise UpgradeError("upgrade blocked before mutation:\n- " + "\n- ".join(preflight_blockers))
-
-    version_actions = [item for item in actionable if item["path"] == ".automation/VERSION"]
-    ordinary_actions = [item for item in actionable if item["path"] != ".automation/VERSION"]
-    phases = {"delete": 0, "create": 1, "replace": 2, "merge": 3}
-    ordered_actions = sorted(
-        ordinary_actions,
-        key=lambda item: (phases.get(item["action"], 99), item["path"]),
-    ) + version_actions
-    for item in ordered_actions:
-        relative = Path(item["path"])
-        source_path = source_core / relative
-        destination = repo / relative
-        if item["action"] == "delete":
-            ancestor = symlink_ancestor(repo, relative)
-            if ancestor is not None:
-                raise UpgradeError(
-                    f"delete path gained symlink ancestor after planning: {ancestor.as_posix()}"
-                )
-            if destination.is_symlink() or destination.is_file():
-                destination.unlink()
-            elif path_present(destination):
-                raise UpgradeError(f"delete became unsafe after planning: {item['path']}")
-            changed.append(item["path"])
-            continue
-        topology_blocker = write_topology_blocker(repo, relative, set())
-        if topology_blocker:
-            raise UpgradeError(f"managed path became unsafe after planning: {item['path']}: {topology_blocker}")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if item["action"] in {"create", "replace"}:
-            if destination.is_symlink():
-                raise UpgradeError(f"destination became a symlink after planning: {item['path']}")
-            shutil.copy2(source_path, destination)
-        elif item["action"] == "merge" and item["path"] == "AGENTS.md":
-            if destination.is_symlink():
-                raise UpgradeError("AGENTS.md became a symlink after planning")
-            merged, detail = replace_agent_rules(
-                destination.read_text(encoding="utf-8"), source_path.read_text(encoding="utf-8")
-            )
-            if merged is None:
-                raise UpgradeError(f"AGENTS.md merge became unsafe: {detail}")
-            destination.write_text(merged, encoding="utf-8")
-        elif item["action"] == "merge" and item["path"] == "Justfile":
-            if destination.is_symlink():
-                raise UpgradeError("Justfile became a symlink after planning")
-            merged, detail = merge_just_router(
-                destination.read_text(encoding="utf-8"), source_path.read_text(encoding="utf-8")
-            )
-            if merged is None:
-                raise UpgradeError(f"Justfile merge became unsafe: {detail}")
-            destination.write_text(merged, encoding="utf-8")
-        else:
-            raise UpgradeError(f"unsupported upgrade action: {item}")
-        changed.append(item["path"])
+    changed = apply_plan_to_tree(repo, source_core, plan)
     result = {
         "status": "APPLIED",
         "repositoryRoot": str(repo),
@@ -815,13 +909,117 @@ def apply(repo: Path, source: Path) -> dict:
 def pending_paths(repo: Path) -> list[str]:
     paths: set[str] = set()
     for args in (
-        ("diff", "--no-ext-diff", "--name-only"),
-        ("diff", "--no-ext-diff", "--cached", "--name-only"),
-        ("ls-files", "--others", "--exclude-standard"),
+        ("diff", "--no-ext-diff", "--name-only", "-z"),
+        ("diff", "--no-ext-diff", "--cached", "--name-only", "-z"),
+        ("ls-files", "--others", "--exclude-standard", "-z"),
     ):
-        output = run(["git", *args], cwd=repo).stdout
-        paths.update(output.splitlines())
+        output = git_bytes(["git", *args], cwd=repo)
+        for raw in output.split(b"\0"):
+            if not raw:
+                continue
+            try:
+                paths.add(raw.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise UpgradeError("Git reported a non-UTF-8 pending path") from exc
     return sorted(paths)
+
+
+def bootstrap_fingerprint(tree: Path, raw_path: str) -> dict[str, object]:
+    return file_fingerprint(tree, raw_path)
+
+
+def reject_bootstrap_path(repo: Path, raw_path: str) -> None:
+    path = validate_receipt_path(raw_path)
+    relative = Path(*path.split("/"))
+    policy_path = repo / ".automation" / "policy.toml"
+    policy = tomllib.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
+    secret_patterns = policy.get("paths", {}).get("secret_patterns", [])
+    if path == ".task-state" or path.startswith(".task-state/"):
+        raise UpgradeError(f"pending path is Task State: {path}")
+    if any(token.lower() in path.lower() for token in secret_patterns):
+        raise UpgradeError(f"pending path matches a configured secret pattern: {path}")
+    if path.startswith("just/project/") or path == "just/local.just":
+        raise UpgradeError(f"pending path is repository-owned: {path}")
+    if path.startswith(".github/"):
+        raise UpgradeError(f"pending path is repository-owned: {path}")
+    if path == ".automation/ADAPTER" or path == ".automation/INIT.fragment.md" or path == ".automation/adoption.toml":
+        raise UpgradeError(f"pending path is Adapter-owned: {path}")
+    if not managed(relative):
+        raise UpgradeError(f"pending path is outside Agent Core: {path}")
+
+
+def bootstrap_receipt(repo: Path, source: Path) -> dict:
+    task_id, branch, worktree = require_maintenance(repo)
+    authority_head = git_head(repo)
+    authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip()
+    if receipt_path(repo).exists() or authority_path(repo).exists():
+        raise UpgradeError("cannot bootstrap with an existing receipt or authority record")
+    pending = pending_paths(repo)
+    if not pending:
+        raise UpgradeError("bootstrap requires non-empty pending paths")
+    for path in pending:
+        reject_bootstrap_path(repo, path)
+    source, source_head = resolve_pinned_source(source)
+    require_ignored_untracked(repo, (repo / ".task-state" / "automation-bootstrap.tmp",))
+    with tempfile.TemporaryDirectory(prefix="automation-bootstrap-", dir=repo / ".task-state") as temporary:
+        baseline = Path(temporary) / "baseline"
+        source_snapshot = Path(temporary) / "source" / "components" / "agent-core"
+        materialize_tree(repo, authority_head, baseline, surface_only=True)
+        materialize_tree(source, source_head, source_snapshot, "components/agent-core")
+        before = {
+            p.relative_to(baseline).as_posix(): bootstrap_fingerprint(baseline, p.relative_to(baseline).as_posix())
+            for p in baseline.rglob("*") if p.is_file()
+        }
+        plan = build_plan(baseline, source_snapshot.parent.parent)
+        if plan["blockers"]:
+            raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(plan["blockers"]))
+        selected = [
+            migration for migration in load_migrations(source_snapshot)
+            if migration.to_version <= version_number(source_snapshot)
+        ]
+        _, migration_blockers, _ = migration_actions(repo, selected)
+        if migration_blockers:
+            raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(migration_blockers))
+        apply_plan_to_tree(baseline, source_snapshot, plan)
+        returned = set(item["path"] for item in plan["actions"] if item["action"] != "noop")
+        expected = sorted(
+            path for path in returned
+            if before.get(path, {"state": "absent", "mode": None, "content_sha256": None})
+            != bootstrap_fingerprint(baseline, path)
+        )
+        if expected != pending:
+            raise UpgradeError("pending paths do not exactly match the reconstructed upgrade")
+        if not expected:
+            return {"status": "NO_CHANGES", "changedPaths": [], "authorityIssued": False}
+        expected_fingerprints = {path: bootstrap_fingerprint(baseline, path) for path in expected}
+    pinned_source, current_source_head = resolve_pinned_source(source)
+    if pinned_source != source or current_source_head != source_head:
+        raise UpgradeError("source changed during receipt reconstruction")
+    current_identity = require_registered_task(repo, task_id)
+    current_registration = registered_worktrees(repo).get(worktree)
+    if (
+        current_identity != (task_id, branch, worktree)
+        or current_registration != (branch, authority_head)
+        or git_head(repo) != authority_head
+        or run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip() != authority_branch_oid
+    ):
+        raise UpgradeError("Task identity or HEAD changed during receipt reconstruction")
+    if pending_paths(repo) != pending:
+        raise UpgradeError("pending paths changed during receipt reconstruction")
+    current_fingerprints = {path: file_fingerprint(repo, path) for path in expected}
+    if current_fingerprints != expected_fingerprints:
+        raise UpgradeError("pending Agent Core content does not match the reconstructed upgrade")
+    receipt = {
+        "schema_version": 1, "status": "active", "task_id": task_id, "branch": branch,
+        "worktree": str(worktree), "source": str(source.resolve()), "source_revision": source_head,
+        "current_version": plan["currentVersion"], "upstream_version": plan["upstreamVersion"],
+        "changed_paths": expected, "authority_head": authority_head, "authority_nonce": secrets.token_hex(32),
+        "path_fingerprints": current_fingerprints,
+    }
+    atomic_json_write(receipt_path(repo), receipt)
+    write_authority(repo, receipt)
+    consumed_receipt_path(repo).unlink(missing_ok=True)
+    return {"status": "RECEIPT_BOOTSTRAPPED", "changedPaths": expected, "authorityIssued": True}
 
 
 def validate_receipt_path(raw: object) -> str:
@@ -1039,6 +1237,8 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("--source", type=Path, required=True)
     upgrade = sub.add_parser("upgrade")
     upgrade.add_argument("--source", type=Path, required=True)
+    bootstrap = sub.add_parser("bootstrap-receipt")
+    bootstrap.add_argument("--source", type=Path, required=True)
     commit_parser = sub.add_parser("commit")
     commit_parser.add_argument("task")
     commit_parser.add_argument("message", nargs="?", default="")
@@ -1055,6 +1255,8 @@ def main() -> int:
             result = build_plan(repo, resolve_source(args.source))
         elif args.command == "upgrade":
             result = apply(repo, resolve_source(args.source))
+        elif args.command == "bootstrap-receipt":
+            result = bootstrap_receipt(repo, resolve_source(args.source))
         elif args.command == "commit":
             result = commit(repo, args.task, args.message)
         else:  # pragma: no cover

@@ -36,6 +36,25 @@ just agent::push <task>
 just agent::pr-create <task>
 ```
 
+The normal upgrade flow creates its receipt before verification. If a self-hosted
+pre-receipt upgrade leaves the exact upgraded diff without that receipt, perform
+normal verification and, before `automation::commit`, run the canonical recovery
+bridge:
+
+```sh
+AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git Templates checkout>
+```
+
+The bridge does not trust `NO_CHANGES`, the current diff, or the environment. It
+pins the clean source revision, materializes the tracked `HEAD` Agent Core
+baseline, applies canonical upgrade semantics in isolation, and requires exact
+pending paths/content/modes plus Task identity and `HEAD` before issuing the
+existing receipt and protected authority. Product, Adapter, repository,
+secret-pattern, or `.task-state` paths, and any tampering, fail closed. Continue
+with the existing `automation::commit` flow; ordinary `agent::commit` rejection
+and the receipt/authority design remain unchanged. This is the PR #79 review fix
+only; there are no Issue #77 changes.
+
 The receipt is schema-1 JSON containing Task identity (`task_id`, `branch`, and
 `worktree`), source/source revision, current/upstream versions, sorted unique
 `changed_paths`, `authority_head`, and exact per-path content/state

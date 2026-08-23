@@ -14,5 +14,9 @@ upgrade source:
     python3 {{quote(script)}} upgrade --source {{quote(source)}}
 
 [working-directory: root]
+bootstrap-receipt source:
+    python3 {{quote(script)}} bootstrap-receipt --source {{quote(source)}}
+
+[working-directory: root]
 commit task message="":
     python3 {{quote(script)}} commit {{quote(task)}} {{quote(message)}}

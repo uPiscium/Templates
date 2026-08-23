@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 import os
 import shutil
 import subprocess
+import tarfile
 from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
@@ -160,6 +162,93 @@ mod project 'just/project/mod.just'
         result = subprocess.run(["git", *args], cwd=cwd, text=True, capture_output=True, check=True)
         return result.stdout.strip()
 
+    def _materialize_release_template(self, destination: Path) -> None:
+        release = "a42ce1cc30e1a73e33c268a65c8957debc54d4cd"
+        self.assertEqual(release, self._git(["rev-parse", "v3.0.0^{commit}"], ROOT))
+        archive = subprocess.run(
+            ["git", "archive", "--format=tar", "v3.0.0", "templates/agent-base"],
+            cwd=ROOT, capture_output=True, check=True,
+        ).stdout
+        prefix = "templates/agent-base/"
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+            for member in tar.getmembers():
+                relative = member.name.removeprefix(prefix)
+                if not relative or relative == member.name:
+                    continue
+                target = destination / relative
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif member.issym():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.symlink_to(member.linkname)
+                elif member.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    extracted = tar.extractfile(member)
+                    assert extracted is not None
+                    target.write_bytes(extracted.read())
+                    target.chmod(member.mode)
+
+    def _real_cli_fixture(self, root: Path) -> tuple[Path, Path, dict]:
+        main = root / "consumer-main"
+        main.mkdir(parents=True)
+        self._materialize_release_template(main)
+        self._write_file(root / "outside-product", "product\n")
+        (main / "product-link").symlink_to(root / "outside-product")
+        self._git(["init", "-b", "main"], main)
+        self._git(["config", "user.name", "Test User"], main)
+        self._git(["config", "user.email", "test@example.invalid"], main)
+        self._git(["add", "-A"], main)
+        self._git(["commit", "-m", "release fixture"], main)
+        head = self._git(["rev-parse", "HEAD"], main)
+        self._git(["update-ref", "refs/remotes/origin/main", head], main)
+        self._git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], main)
+        task = root / "consumer-task"
+        self._git(["worktree", "add", "-b", "task/TASK-78-maintenance", str(task)], main)
+        self._write_file(task / ".task-state/task.md", f"- Task ID: TASK-78\n- Branch: task/TASK-78-maintenance\n- Worktree: {task.resolve()}\n")
+        exclude = Path(self._git(["rev-parse", "--git-path", "info/exclude"], task))
+        if not exclude.is_absolute():
+            exclude = task / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text("/.task-state/\n", encoding="utf-8")
+        self.assertEqual("origin/main", self._git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], task))
+        self.assertIn(str(task.resolve()), self._git(["worktree", "list", "--porcelain"], main))
+        ignored = subprocess.run(["git", "check-ignore", "-q", ".task-state/task.md"], cwd=task)
+        self.assertEqual(0, ignored.returncode)
+        source = root / "templates-source"
+        shutil.copytree(
+            ROOT / "components" / "agent-core",
+            source / "components" / "agent-core",
+            symlinks=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+        self._git(["init", "-b", "main"], source)
+        self._git(["config", "user.name", "Test User"], source)
+        self._git(["config", "user.email", "test@example.invalid"], source)
+        self._git(["add", "components/agent-core"], source)
+        self._git(["commit", "-m", "current Agent Core source"], source)
+        return task, source, {"release_head": head}
+
+    def _cli(self, repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["AUTOMATION_MAINTENANCE"] = "1"
+        result = subprocess.run(["python3", ".automation/bin/automation_upgrade.py", *args], cwd=repo, env=environment, text=True, capture_output=True, check=False)
+        if check:
+            self.assertEqual(0, result.returncode, result.stderr)
+        return result
+
+    def _old_process_fixture(self, root: Path) -> tuple[Path, Path, dict]:
+        task, source, metadata = self._real_cli_fixture(root)
+        metadata["release_version"] = (task / ".automation/VERSION").read_text(encoding="utf-8").strip()
+        metadata["source_version"] = (source / "components/agent-core/.automation/VERSION").read_text(encoding="utf-8").strip()
+        recipe = (task / ".automation/just/automation.just").read_text(encoding="utf-8")
+        self.assertIn("upgrade source:", recipe)
+        self.assertIn("python3 '{{script}}' upgrade --source '{{source}}'", recipe)
+        result = json.loads(self._cli(task, ["upgrade", "--source", str(source)]).stdout)
+        self.assertEqual("APPLIED", result["status"])
+        self.assertFalse(upgrade.receipt_path(task).exists())
+        self.assertFalse(upgrade.authority_path(task).exists())
+        return task, source, result | metadata
+
     def _task_repo(self, repo: Path, *, task: str = "TASK-78") -> Path:
         repo.mkdir(parents=True)
         self._git(["init", "-b", "main"], repo)
@@ -241,6 +330,10 @@ mod project 'just/project/mod.just'
         self.assertEqual(bash["just automation::version"], "allow")
         self.assertEqual(bash["just automation::check-update *"], "allow")
         self.assertEqual(bash["just automation::upgrade *"], "ask")
+        self.assertEqual(bash["just automation::bootstrap-receipt *"], "ask")
+        recipe = (ROOT / "components" / "agent-core" / ".automation" / "just" / "automation.just").read_text()
+        self.assertIn("bootstrap-receipt source:", recipe)
+        self.assertIn("python3 {{quote(script)}} bootstrap-receipt --source {{quote(source)}}", recipe)
 
     def test_upgrade_preserves_adapter_and_repository_owned_paths(self) -> None:
         script = SCRIPT.read_text()
@@ -1027,6 +1120,80 @@ mod project 'just/project/mod.just'
         with tempfile.TemporaryDirectory() as directory:
             repo, source = self._apply_fixture(Path(directory), source_git=False)
             self.assertIsNone(self._receipt(repo)["source_revision"])
+
+    def test_pending_paths_handles_nul_delimited_git_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self._task_repo(Path(directory) / "repo")
+            odd = repo / ".automation" / "pending\nname"
+            self._write_file(odd, "pending\n")
+            self.assertEqual([".automation/pending\nname"], upgrade.pending_paths(repo))
+
+    def test_real_two_generation_cli_bootstrap_and_commit_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task, source, old_result = self._old_process_fixture(Path(directory))
+            self.assertEqual(old_result["release_head"], self._git(["rev-parse", "HEAD"], task))
+            self.assertEqual(sorted(old_result["changedPaths"]), upgrade.pending_paths(task))
+            self.assertEqual("product\n", (Path(directory) / "outside-product").read_text())
+            boot = json.loads(self._cli(task, ["bootstrap-receipt", "--source", str(source)]).stdout)
+            self.assertEqual("RECEIPT_BOOTSTRAPPED", boot["status"])
+            receipt = self._receipt(task)
+            self.assertEqual(str(source.resolve()), receipt["source"])
+            self.assertEqual(self._git(["rev-parse", "HEAD"], source), receipt["source_revision"])
+            self.assertEqual(
+                [old_result["release_version"], old_result["source_version"]],
+                [receipt["current_version"], receipt["upstream_version"]],
+            )
+            self.assertEqual(sorted(old_result["changedPaths"]), receipt["changed_paths"])
+            self.assertEqual(set(receipt["changed_paths"]), set(receipt["path_fingerprints"]))
+            self.assertTrue(upgrade.authority_path(task).is_file())
+            committed = json.loads(self._cli(task, ["commit", "TASK-78", "maintenance"]).stdout)
+            self.assertEqual("COMMITTED", committed["status"])
+            self.assertFalse(upgrade.receipt_path(task).exists())
+            paths = sorted(self._git(["show", "--pretty=", "--name-only", "HEAD"], task).splitlines())
+            self.assertEqual(receipt["changed_paths"], paths)
+            self.assertFalse(any(path.startswith("just/project/") for path in paths))
+            self.assertNotIn(".automation/ADAPTER", paths)
+            self.assertNotIn("product-link", paths)
+
+    def test_real_bridge_rejects_protected_paths_and_core_tampering(self) -> None:
+        for pending_path in ("product.txt", ".automation/ADAPTER", "just/project/mod.just"):
+            with self.subTest(pending_path=pending_path), tempfile.TemporaryDirectory() as directory:
+                task, source, _ = self._old_process_fixture(Path(directory))
+                self._write_file(task / pending_path, "unauthorized\n")
+                result = self._cli(task, ["bootstrap-receipt", "--source", str(source)], check=False)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("pending path", result.stderr)
+                self.assertFalse(upgrade.receipt_path(task).exists())
+                self.assertFalse(upgrade.authority_path(task).exists())
+        with tempfile.TemporaryDirectory() as directory:
+            task, source, old_result = self._old_process_fixture(Path(directory))
+            path = old_result["changedPaths"][0]
+            target = task / Path(*path.split("/"))
+            target.write_bytes(target.read_bytes() + b"tampered\n")
+            result = self._cli(task, ["bootstrap-receipt", "--source", str(source)], check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("reconstructed", result.stderr)
+            self.assertFalse(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+
+        with tempfile.TemporaryDirectory() as directory:
+            task, source, _ = self._old_process_fixture(Path(directory))
+            self._write_file(source / "components/agent-core/.automation/dirty", "dirty\n")
+            result = self._cli(task, ["bootstrap-receipt", "--source", str(source)], check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("must be clean", result.stderr)
+            self.assertFalse(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+
+    def test_real_bridge_rejects_no_change_without_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task, source, _ = self._old_process_fixture(Path(directory))
+            self._git(["add", "-A"], task)
+            self._git(["commit", "-m", "simulate already published upgrade"], task)
+            result = self._cli(task, ["bootstrap-receipt", "--source", str(source)], check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("non-empty pending paths", result.stderr)
+            self.assertFalse(upgrade.authority_path(task).exists())
 
 
 if __name__ == "__main__":

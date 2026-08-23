@@ -234,6 +234,24 @@ just agent::push <task>
 just agent::pr-create <task>
 ```
 
+The normal flow creates the receipt before verification. A self-hosted pre-receipt
+upgrade may instead leave the exact upgraded diff without a receipt. After normal
+verification and immediately before `automation::commit`, recover it with:
+
+```sh
+AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git Templates checkout>
+```
+
+The bridge does not trust `NO_CHANGES`, the current diff, or the environment. It
+pins the clean source revision, reconstructs expected output by materializing the
+tracked `HEAD` Agent Core baseline and applying canonical upgrade semantics in
+isolation, then requires exact pending paths, content, modes, and Task
+identity/`HEAD` before issuing the existing receipt and protected authority. Any
+product, Adapter, repository, secret-pattern, or `.task-state` path, or tampering,
+fails closed. Continue with the existing commit/push/Draft-PR flow; ordinary
+`agent::commit` rejection and the receipt/authority design remain unchanged.
+This is the PR #79 review fix only; it does not change Issue #77.
+
 `automation::commit` is the only commit path for this upgrade. It fails closed unless the schema-1 JSON receipt contains Task `task_id`, `branch`, `worktree`, source/source revision, current/upstream versions, sorted unique `changed_paths`, `authority_head`, and matching `path_fingerprints`. Receipt identity must match the current Task/worktree and `authority_head` must equal current `HEAD`; every fingerprint and the complete pending path set must still match. A protected record under the shared Git directory binds the active receipt to the preceding successful upgrade, so an ambient variable or fabricated Task State receipt is not commit authority. Receipt paths must be Agent Core-managed only: mixed Adapter, repository, product, secret-pattern, or `.task-state` paths are rejected. The command scrubs ambient Git repository/index overrides, stages into a private Task State index, checks the exact staged blobs and modes, creates the commit from that verified tree without hooks, and atomically advances only the expected Task branch HEAD.
 
 After a successful commit, the active receipt is consumed as `.task-state/automation-maintenance.consumed.json`. A later successful upgrade with changes replaces the active receipt and removes the prior consumed receipt; a no-change invocation returns `NO_CHANGES` and preserves existing receipt lifecycle evidence. There is no raw Git/GitHub bypass, and merge is excluded: the Main Orchestrator performs the separately gated integration/merge workflow.
