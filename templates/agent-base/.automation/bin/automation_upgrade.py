@@ -233,6 +233,13 @@ class Migration:
     require_absent_paths: tuple[Path, ...]
 
 
+@dataclass(frozen=True)
+class SavedPath:
+    kind: str
+    content: bytes | str | None
+    mode: int | None
+
+
 def git_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
     environment = {
         key: value
@@ -716,6 +723,25 @@ def materialize_tree(
         target.chmod(0o755 if fields[0] == b"100755" else 0o644)
 
 
+def materialize_source_snapshot(source: Path, revision: str, temporary: Path) -> tuple[Path, Path]:
+    """Reconstruct only Agent Core from a pinned source revision.
+
+    The returned paths are (synthetic Templates root, synthetic Agent Core
+    root).  In particular, callers must not use the live source checkout for
+    planning or copying after this point.
+    """
+    snapshot_root = temporary / "source"
+    source_core = snapshot_root / "components" / "agent-core"
+    materialize_tree(source, revision, source_core, "components/agent-core")
+    return snapshot_root, source_core
+
+
+def revalidate_source(source: Path, revision: str) -> None:
+    current, current_revision = resolve_pinned_source(source)
+    if current != source or current_revision != revision:
+        raise UpgradeError("source changed during upgrade planning or mutation")
+
+
 def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict) -> list[str]:
     actionable = [item for item in plan["actions"] if item["action"] != "noop"]
     planned_deletes = {Path(item["path"]) for item in actionable if item["action"] == "delete"}
@@ -779,6 +805,44 @@ def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict) -> list[str]:
                 raise UpgradeError(f"unsupported upgrade action: {item}")
         changed.append(item["path"])
     return sorted(set(changed))
+
+
+def capture_paths(tree: Path, paths: list[str]) -> dict[str, SavedPath]:
+    saved: dict[str, SavedPath] = {}
+    for raw_path in paths:
+        target = tree / Path(*raw_path.split("/"))
+        try:
+            metadata = target.lstat()
+        except FileNotFoundError:
+            saved[raw_path] = SavedPath("absent", None, None)
+            continue
+        mode = stat.S_IMODE(metadata.st_mode)
+        if target.is_symlink():
+            saved[raw_path] = SavedPath("symlink", os.readlink(target), mode)
+        elif target.is_file():
+            saved[raw_path] = SavedPath("file", target.read_bytes(), mode)
+        else:
+            raise UpgradeError(f"cannot snapshot unsafe upgrade destination path: {raw_path}")
+    return saved
+
+
+def restore_paths(tree: Path, saved: dict[str, SavedPath]) -> None:
+    for raw_path, state in saved.items():
+        target = tree / Path(*raw_path.split("/"))
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif path_present(target):
+            raise UpgradeError(f"cannot restore upgrade destination path: {raw_path}")
+        if state.kind == "absent":
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if state.kind == "file" and isinstance(state.content, bytes) and state.mode is not None:
+            target.write_bytes(state.content)
+            target.chmod(state.mode)
+        elif state.kind == "symlink" and isinstance(state.content, str):
+            target.symlink_to(state.content)
+        else:  # pragma: no cover - capture_paths constructs only valid states
+            raise UpgradeError(f"invalid saved upgrade destination state: {raw_path}")
 
 
 def build_plan(repo: Path, source: Path) -> dict:
@@ -846,64 +910,93 @@ def require_maintenance(repo: Path) -> tuple[str, str, Path]:
     return identity
 
 
-def apply(repo: Path, source: Path) -> dict:
+def check_update(repo: Path, source_path: Path) -> dict:
+    source, revision = resolve_pinned_source(source_path)
+    with tempfile.TemporaryDirectory(prefix="automation-update-") as temporary:
+        snapshot, _ = materialize_source_snapshot(source, revision, Path(temporary))
+        plan = build_plan(repo, snapshot)
+        revalidate_source(source, revision)
+    plan["source"] = str(source)
+    plan["sourceRevision"] = revision
+    return plan
+
+
+def apply(repo: Path, source_path: Path) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
-    plan = build_plan(repo, source)
-    if plan["blockers"]:
-        raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(plan["blockers"]))
-    source_core = source / "components" / "agent-core"
-    changed: list[str] = []
-    actionable = [item for item in plan["actions"] if item["action"] != "noop"]
-    if not actionable:
-        return {
-            "status": "NO_CHANGES",
+    source, revision = resolve_pinned_source(source_path)
+    with tempfile.TemporaryDirectory(prefix="automation-upgrade-") as temporary:
+        snapshot, source_core = materialize_source_snapshot(source, revision, Path(temporary))
+        plan = build_plan(repo, snapshot)
+        if plan["blockers"]:
+            raise UpgradeError("upgrade blocked:\n- " + "\n- ".join(plan["blockers"]))
+        # This check is deliberately before any destination mutation, including
+        # the no-change return path.
+        revalidate_source(source, revision)
+        actionable = [item for item in plan["actions"] if item["action"] != "noop"]
+        if not actionable:
+            return {
+                "status": "NO_CHANGES",
+                "repositoryRoot": str(repo),
+                "sourceCore": str(source / "components" / "agent-core"),
+                "sourceRevision": revision,
+                "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
+                "changedPaths": [],
+                "commitCreated": False,
+                "pushPerformed": False,
+                "mergePerformed": False,
+                "requiredNextChecks": [],
+            }
+        expected_paths = sorted({item["path"] for item in actionable})
+        saved_paths = capture_paths(repo, expected_paths)
+        changed = apply_plan_to_tree(repo, source_core, plan)
+        # A source race after mutation fails closed: no receipt is issued.
+        try:
+            revalidate_source(source, revision)
+        except UpgradeError as source_error:
+            try:
+                restore_paths(repo, saved_paths)
+            except UpgradeError as restore_error:
+                raise UpgradeError(
+                    f"{source_error}; destination rollback failed: {restore_error}"
+                ) from restore_error
+            raise
+        changed_paths = sorted(set(changed))
+        result = {
+            "status": "APPLIED",
             "repositoryRoot": str(repo),
-            "sourceCore": str(source_core),
+            "sourceCore": str(source / "components" / "agent-core"),
+            "sourceRevision": revision,
             "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
-            "changedPaths": [],
+            "changedPaths": changed_paths,
             "commitCreated": False,
             "pushPerformed": False,
             "mergePerformed": False,
-            "requiredNextChecks": [],
+            "requiredNextChecks": [
+                "git diff --check",
+                "just agent::doctor",
+                "just project::check",
+                "repository CI/smoke tests",
+            ],
         }
-    changed = apply_plan_to_tree(repo, source_core, plan)
-    result = {
-        "status": "APPLIED",
-        "repositoryRoot": str(repo),
-        "sourceCore": str(source_core),
-        "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
-        "changedPaths": changed,
-        "commitCreated": False,
-        "pushPerformed": False,
-        "mergePerformed": False,
-        "requiredNextChecks": [
-            "git diff --check",
-            "just agent::doctor",
-            "just project::check",
-            "repository CI/smoke tests",
-        ],
-    }
-    changed_paths = sorted(set(changed))
-    result["changedPaths"] = changed_paths
-    receipt = {
-        "schema_version": 1,
-        "status": "active",
-        "task_id": task_id,
-        "branch": branch,
-        "worktree": str(worktree),
-        "source": str(source.resolve()),
-        "source_revision": source_revision(source),
-        "current_version": plan["currentVersion"],
-        "upstream_version": plan["upstreamVersion"],
-        "changed_paths": changed_paths,
-        "authority_head": git_head(repo),
-        "authority_nonce": secrets.token_hex(32),
-        "path_fingerprints": {path: file_fingerprint(repo, path) for path in changed_paths},
-    }
-    atomic_json_write(receipt_path(repo), receipt)
-    write_authority(repo, receipt)
-    consumed_receipt_path(repo).unlink(missing_ok=True)
-    return result
+        receipt = {
+            "schema_version": 1,
+            "status": "active",
+            "task_id": task_id,
+            "branch": branch,
+            "worktree": str(worktree),
+            "source": str(source),
+            "source_revision": revision,
+            "current_version": plan["currentVersion"],
+            "upstream_version": plan["upstreamVersion"],
+            "changed_paths": changed_paths,
+            "authority_head": git_head(repo),
+            "authority_nonce": secrets.token_hex(32),
+            "path_fingerprints": {path: file_fingerprint(repo, path) for path in changed_paths},
+        }
+        atomic_json_write(receipt_path(repo), receipt)
+        write_authority(repo, receipt)
+        consumed_receipt_path(repo).unlink(missing_ok=True)
+        return result
 
 
 def pending_paths(repo: Path) -> list[str]:
@@ -948,7 +1041,7 @@ def reject_bootstrap_path(repo: Path, raw_path: str) -> None:
         raise UpgradeError(f"pending path is outside Agent Core: {path}")
 
 
-def bootstrap_receipt(repo: Path, source: Path) -> dict:
+def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
     authority_head = git_head(repo)
     authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip()
@@ -959,13 +1052,13 @@ def bootstrap_receipt(repo: Path, source: Path) -> dict:
         raise UpgradeError("bootstrap requires non-empty pending paths")
     for path in pending:
         reject_bootstrap_path(repo, path)
-    source, source_head = resolve_pinned_source(source)
+    source, source_head = resolve_pinned_source(source_path)
     require_ignored_untracked(repo, (repo / ".task-state" / "automation-bootstrap.tmp",))
     with tempfile.TemporaryDirectory(prefix="automation-bootstrap-", dir=repo / ".task-state") as temporary:
         baseline = Path(temporary) / "baseline"
         source_snapshot = Path(temporary) / "source" / "components" / "agent-core"
         materialize_tree(repo, authority_head, baseline, surface_only=True)
-        materialize_tree(source, source_head, source_snapshot, "components/agent-core")
+        materialize_source_snapshot(source, source_head, Path(temporary))
         before = {
             p.relative_to(baseline).as_posix(): bootstrap_fingerprint(baseline, p.relative_to(baseline).as_posix())
             for p in baseline.rglob("*") if p.is_file()
@@ -990,11 +1083,10 @@ def bootstrap_receipt(repo: Path, source: Path) -> dict:
         if expected != pending:
             raise UpgradeError("pending paths do not exactly match the reconstructed upgrade")
         if not expected:
+            revalidate_source(source, source_head)
             return {"status": "NO_CHANGES", "changedPaths": [], "authorityIssued": False}
         expected_fingerprints = {path: bootstrap_fingerprint(baseline, path) for path in expected}
-    pinned_source, current_source_head = resolve_pinned_source(source)
-    if pinned_source != source or current_source_head != source_head:
-        raise UpgradeError("source changed during receipt reconstruction")
+    revalidate_source(source, source_head)
     current_identity = require_registered_task(repo, task_id)
     current_registration = registered_worktrees(repo).get(worktree)
     if (
@@ -1252,11 +1344,11 @@ def main() -> int:
         if args.command == "version":
             result = context(repo)
         elif args.command == "check-update":
-            result = build_plan(repo, resolve_source(args.source))
+            result = check_update(repo, args.source)
         elif args.command == "upgrade":
-            result = apply(repo, resolve_source(args.source))
+            result = apply(repo, args.source)
         elif args.command == "bootstrap-receipt":
-            result = bootstrap_receipt(repo, resolve_source(args.source))
+            result = bootstrap_receipt(repo, args.source)
         elif args.command == "commit":
             result = commit(repo, args.task, args.message)
         else:  # pragma: no cover
