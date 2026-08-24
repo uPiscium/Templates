@@ -1254,6 +1254,77 @@ mod project 'just/project/mod.just'
             self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy maintenance")["status"])
             self.assertFalse(legacy_path.exists())
 
+    def test_linked_worktree_ignores_legacy_authority_under_escaped_common_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _, linked, source = self._separate_git_topology_fixture(root)
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                upgrade.apply(linked, source)
+            receipt = self._receipt(linked)
+            new_path, legacy_path = upgrade._authority_locations(linked)
+            self.assertIsNotNone(legacy_path)
+            assert legacy_path is not None
+            authority_bytes = new_path.read_bytes()
+            new_path.unlink()
+            self.assertFalse(new_path.exists())
+
+            common = upgrade.common_git_dir(linked)
+            external = root / "escaped-authority"
+            external.mkdir()
+            common_opencode = common / "opencode"
+            self.assertFalse(common_opencode.exists())
+            common_opencode.symlink_to(external, target_is_directory=True)
+            (external / "automation-maintenance").mkdir()
+            legacy_path.write_bytes(authority_bytes)
+            external_authority = external / "automation-maintenance" / legacy_path.name
+            external_before = external_authority.read_bytes()
+
+            locations = upgrade._authority_locations(linked)
+            self.assertIsNone(locations[1])
+            with self.assertRaises(upgrade.UpgradeError):
+                upgrade.validate_authority(linked, receipt)
+            with self.assertRaises(upgrade.UpgradeError):
+                upgrade.commit(linked, "TASK-83", "maintenance")
+            self.assertEqual(external_before, external_authority.read_bytes())
+            self.assertEqual(authority_bytes, external_authority.read_bytes())
+
+            with self.assertRaises(upgrade.UpgradeError):
+                upgrade._write_authority_at(
+                    common / "opencode" / "automation-maintenance" / "escaped.json",
+                    json.loads(authority_bytes),
+                    admin=common.resolve(),
+                )
+            self.assertEqual(external_before, external_authority.read_bytes())
+
+    def test_legacy_authority_is_restored_when_commit_fails_after_consumption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            new_path, legacy_path = upgrade._authority_locations(repo)
+            self.assertIsNotNone(legacy_path)
+            assert legacy_path is not None
+            authority_bytes = new_path.read_bytes()
+            active_bytes = upgrade.receipt_path(repo).read_bytes()
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_bytes(authority_bytes)
+            new_path.unlink()
+
+            original_run = upgrade.run
+
+            def fail_staging_check(command, *args, **kwargs):
+                if command == ["git", "diff", "--no-ext-diff", "--cached", "--check"]:
+                    raise upgrade.UpgradeError("injected staging check failure")
+                return original_run(command, *args, **kwargs)
+
+            with mock.patch.object(upgrade, "run", side_effect=fail_staging_check):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "injected staging check failure"):
+                    upgrade.commit(repo, "TASK-78", "legacy rollback")
+            self.assertEqual(active_bytes, upgrade.receipt_path(repo).read_bytes())
+            self.assertEqual(authority_bytes, legacy_path.read_bytes())
+            self.assertFalse(new_path.exists())
+            self.assertFalse(upgrade.consumed_receipt_path(repo).exists())
+            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy retry")["status"])
+            self.assertFalse(legacy_path.exists())
+
     def test_malformed_new_authority_blocks_legacy_fallback_and_non_directory_common_git_is_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

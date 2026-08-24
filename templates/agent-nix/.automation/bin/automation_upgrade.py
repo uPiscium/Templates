@@ -92,7 +92,7 @@ def worktree_admin_dir(repo: Path) -> Path:
         if not admin.is_dir():
             raise UpgradeError("worktree administrative directory does not exist")
         return admin
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         raise UpgradeError("cannot resolve worktree administrative directory") from exc
 
 
@@ -101,19 +101,29 @@ def _authority_locations(repo: Path) -> tuple[Path, Path | None]:
     new_parent = admin / "opencode" / "automation-maintenance"
     try:
         resolved_parent = new_parent.resolve()
-    except OSError as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         raise UpgradeError("cannot resolve authority directory") from exc
     if resolved_parent != admin and admin not in resolved_parent.parents:
         raise UpgradeError("authority directory escapes the worktree administrative directory")
-    legacy: Path | None = None
+    legacy_location = _safe_legacy_location(repo)
+    legacy = legacy_location[0] if legacy_location is not None else None
+    return new_parent / "authority.json", legacy
+
+
+def _safe_legacy_location(repo: Path) -> tuple[Path, Path] | None:
+    """Return the legacy record and its containment guard only when safe."""
     try:
         common = common_git_dir(repo)
-        if common.is_dir():
-            key = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
-            legacy = common / "opencode" / "automation-maintenance" / f"{key}.json"
-    except (OSError, UpgradeError):
-        legacy = None
-    return new_parent / "authority.json", legacy
+        if not common.is_dir():
+            return None
+        parent = common / "opencode" / "automation-maintenance"
+        resolved_parent = parent.resolve()
+        if resolved_parent != common and common not in resolved_parent.parents:
+            return None
+        key = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
+        return parent / f"{key}.json", common
+    except (OSError, ValueError, RuntimeError, UpgradeError):
+        return None
 
 
 def authority_path(repo: Path) -> Path:
@@ -168,8 +178,17 @@ def _write_authority_at(path: Path, value: dict, *, admin: Path | None = None) -
             os.link(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         raise UpgradeError(f"cannot publish authority record: {path}") from exc
+
+
+def _rollback_authority_guard(repo: Path, authority: Path) -> Path:
+    legacy = _safe_legacy_location(repo)
+    if legacy is not None and authority == legacy[0]:
+        return legacy[1]
+    if authority == authority_path(repo):
+        return worktree_admin_dir(repo)
+    raise UpgradeError("cannot safely resolve authority location for rollback")
 
 
 def validate_authority(repo: Path, receipt: dict) -> Path:
@@ -1568,7 +1587,7 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
                         "authority_nonce": receipt["authority_nonce"],
                         "receipt_sha256": receipt_digest(receipt),
                     },
-                    admin=worktree_admin_dir(repo) if authority == authority_path(repo) else None,
+                    admin=_rollback_authority_guard(repo, authority),
                 )
         except (OSError, UpgradeError) as rollback_error:
             rollback_errors.append(f"authority restore failed: {rollback_error}")
