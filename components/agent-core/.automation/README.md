@@ -53,30 +53,40 @@ bridge:
 AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git Templates checkout>
 ```
 
-The bridge does not trust `NO_CHANGES`, the current diff, or the environment. It
-uses the same pinned clean-source and tracked Agent Core snapshot semantics as
-the normal update operations, applies canonical upgrade semantics in isolation,
-and requires exact pending paths/content/modes plus Task identity and `HEAD`
-before issuing the existing receipt and protected authority. The receipt's
-`source_revision` equals the pinned snapshot `HEAD`; any source race fails
-closed. Product, Adapter, repository, secret-pattern, or `.task-state` paths,
-and any tampering, fail closed. Continue with the existing
-`automation::commit` flow; ordinary `agent::commit` rejection and the
-receipt/authority design remain unchanged.
+The bridge supports exactly two strict cases: canonical pre-receipt
+reconstruction, and recovery of an exact active receipt whose authority is
+missing. It does not trust `NO_CHANGES`, the current diff, or the environment.
+It uses the same pinned clean-source and tracked Agent Core snapshot semantics as
+the normal update operations, reruns pinned clean-source canonical
+reconstruction, and requires Task/branch/worktree/`HEAD`, the pinned source
+revision, and exact pending safe paths/content/modes and fingerprints. Recovery
+additionally requires receipt exact equality and that it is unchanged, then
+issues only the missing authority. A receipt with authority, or stale, forged,
+or tampered state, fails closed. Product, Adapter, repository, secret-pattern,
+or `.task-state` paths also fail closed. Continue with the existing
+`automation::commit` flow; ordinary `agent::commit` rejection remains unchanged.
 
 The receipt is schema-1 JSON containing Task identity (`task_id`, `branch`, and
 `worktree`), source/source revision, current/upstream versions, sorted unique
 `changed_paths`, `authority_head`, and exact per-path content/state
 `path_fingerprints`. Commit fails closed if the receipt is absent, malformed,
 stale, from another Task/worktree, has a different `HEAD`, changed fingerprints,
-or does not exactly equal all pending paths. A protected shared-Git-directory
-record binds it to the preceding successful upgrade; a fabricated Task State
-receipt is not authority. Ambient Git repository/index overrides are scrubbed.
-The exact paths are staged and rechecked in a private Task State index, then the
-commit is created from that verified tree without hooks and the expected Task
-branch HEAD is advanced atomically. Only Agent Core-managed paths are
-accepted; mixed Adapter, repository, product, secret-pattern, or `.task-state`
-scopes are rejected. After a successful commit it is consumed at
+or does not exactly equal all pending paths. Receipt and authority publication
+is a logical pair. Authority records live under the Git-resolved per-worktree
+administrative directory returned by `--absolute-git-dir`, not an assumed
+visible `.git` or shared Git directory; linked and special administrative
+topologies are supported, and worktrees do not share authority. Existing safe
+legacy shared-common-dir hashed records remain validation/commit compatible. A
+protected record binds it to the preceding successful upgrade; a fabricated
+Task State receipt is not authority. Ambient Git repository/index overrides are
+scrubbed. The exact paths are staged and rechecked in a private Task State
+index, then the commit is created from that verified tree without hooks and the
+expected Task branch HEAD is advanced atomically. Only Agent Core-managed paths
+are accepted; mixed Adapter, repository, product, secret-pattern, or
+`.task-state` scopes are rejected. A handled authority-write failure removes the
+newly written receipt if it is unchanged; an interruption half-state is
+recoverable only through the strict bootstrap path. No cross-filesystem
+atomicity is claimed. After a successful commit it is consumed at
 `.task-state/automation-maintenance.consumed.json`; a subsequent successful
 upgrade with changes replaces the active receipt and removes the previous consumed
 receipt. A no-change invocation returns `NO_CHANGES` without discarding existing

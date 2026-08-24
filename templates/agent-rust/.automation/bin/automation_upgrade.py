@@ -42,6 +42,23 @@ RECEIPT_FIELDS = {
 _GIT_EXECUTABLE: Path | None = None
 
 
+def task_state_dir(repo: Path) -> Path:
+    try:
+        root = repo.resolve()
+        state = root / ".task-state"
+        metadata = state.lstat()
+        resolved = state.resolve()
+    except OSError as exc:
+        raise UpgradeError("Task State directory is unavailable") from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or (resolved != root and root not in resolved.parents)
+    ):
+        raise UpgradeError("Task State directory is unsafe")
+    return resolved
+
+
 def git_head(repo: Path) -> str:
     result = run(["git", "rev-parse", "HEAD"], cwd=repo, check=False)
     return result.stdout.strip() if result.returncode == 0 else ""
@@ -53,11 +70,11 @@ def source_revision(source: Path) -> str | None:
 
 
 def receipt_path(repo: Path) -> Path:
-    return repo / ".task-state" / RECEIPT_NAME
+    return task_state_dir(repo) / RECEIPT_NAME
 
 
 def consumed_receipt_path(repo: Path) -> Path:
-    return repo / ".task-state" / CONSUMED_RECEIPT_NAME
+    return task_state_dir(repo) / CONSUMED_RECEIPT_NAME
 
 
 def common_git_dir(repo: Path) -> Path:
@@ -65,9 +82,52 @@ def common_git_dir(repo: Path) -> Path:
     return value.resolve() if value.is_absolute() else (repo / value).resolve()
 
 
+def worktree_admin_dir(repo: Path) -> Path:
+    try:
+        raw = run(["git", "rev-parse", "--absolute-git-dir"], cwd=repo).stdout.strip()
+        candidate = Path(raw)
+        if not raw or not candidate.is_absolute():
+            raise UpgradeError("Git returned an invalid absolute worktree administrative directory")
+        admin = candidate.resolve()
+        if not admin.is_dir():
+            raise UpgradeError("worktree administrative directory does not exist")
+        return admin
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise UpgradeError("cannot resolve worktree administrative directory") from exc
+
+
+def _authority_locations(repo: Path) -> tuple[Path, Path | None]:
+    admin = worktree_admin_dir(repo)
+    new_parent = admin / "opencode" / "automation-maintenance"
+    try:
+        resolved_parent = new_parent.resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise UpgradeError("cannot resolve authority directory") from exc
+    if resolved_parent != admin and admin not in resolved_parent.parents:
+        raise UpgradeError("authority directory escapes the worktree administrative directory")
+    legacy_location = _safe_legacy_location(repo)
+    legacy = legacy_location[0] if legacy_location is not None else None
+    return new_parent / "authority.json", legacy
+
+
+def _safe_legacy_location(repo: Path) -> tuple[Path, Path] | None:
+    """Return the legacy record and its containment guard only when safe."""
+    try:
+        common = common_git_dir(repo)
+        if not common.is_dir():
+            return None
+        parent = common / "opencode" / "automation-maintenance"
+        resolved_parent = parent.resolve()
+        if resolved_parent != common and common not in resolved_parent.parents:
+            return None
+        key = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
+        return parent / f"{key}.json", common
+    except (OSError, ValueError, RuntimeError, UpgradeError):
+        return None
+
+
 def authority_path(repo: Path) -> Path:
-    key = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()
-    return common_git_dir(repo) / "opencode" / "automation-maintenance" / f"{key}.json"
+    return _authority_locations(repo)[0]
 
 
 def canonical_json(value: dict) -> bytes:
@@ -79,7 +139,7 @@ def receipt_digest(receipt: dict) -> str:
 
 
 def write_authority(repo: Path, receipt: dict) -> None:
-    atomic_json_write(
+    _write_authority_at(
         authority_path(repo),
         {
             "schema_version": 1,
@@ -89,12 +149,59 @@ def write_authority(repo: Path, receipt: dict) -> None:
             "authority_nonce": receipt["authority_nonce"],
             "receipt_sha256": receipt_digest(receipt),
         },
+        admin=worktree_admin_dir(repo),
     )
 
 
-def validate_authority(repo: Path, receipt: dict) -> None:
-    path = authority_path(repo)
+def _write_authority_at(path: Path, value: dict, *, admin: Path | None = None) -> None:
     try:
+        if admin is not None:
+            parent_before = path.parent.resolve()
+            if parent_before != admin and admin not in parent_before.parents:
+                raise UpgradeError("authority directory escapes the worktree administrative directory")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if admin is not None:
+            parent_after = path.parent.resolve()
+            if parent_after != admin and admin not in parent_after.parents:
+                raise UpgradeError("authority directory escapes the worktree administrative directory")
+        # The caller has validated the parent; do not replace an existing record.
+        fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n")
+                stream.flush()
+                try:
+                    os.fsync(stream.fileno())
+                except OSError:
+                    pass
+            os.link(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise UpgradeError(f"cannot publish authority record: {path}") from exc
+
+
+def _rollback_authority_guard(repo: Path, authority: Path) -> Path:
+    legacy = _safe_legacy_location(repo)
+    if legacy is not None and authority == legacy[0]:
+        return legacy[1]
+    if authority == authority_path(repo):
+        return worktree_admin_dir(repo)
+    raise UpgradeError("cannot safely resolve authority location for rollback")
+
+
+def validate_authority(repo: Path, receipt: dict) -> Path:
+    new_path, legacy_path = _authority_locations(repo)
+    path = new_path
+    if not os.path.lexists(path):
+        if legacy_path is None or not os.path.lexists(legacy_path):
+            raise UpgradeError("missing or invalid successful-upgrade authority record")
+        path = legacy_path
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise UpgradeError("missing or invalid successful-upgrade authority record")
         authority = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise UpgradeError("missing or invalid successful-upgrade authority record") from exc
@@ -108,6 +215,29 @@ def validate_authority(repo: Path, receipt: dict) -> None:
     }
     if authority != expected:
         raise UpgradeError("automation receipt does not match successful-upgrade authority")
+    return path
+
+
+def authority_exists(repo: Path) -> bool:
+    new_path, legacy_path = _authority_locations(repo)
+    return os.path.lexists(new_path) or (legacy_path is not None and os.path.lexists(legacy_path))
+
+
+def issue_pair(repo: Path, receipt: dict) -> None:
+    destination = receipt_path(repo)
+    published: tuple[int, int] | None = None
+    try:
+        published = exclusive_json_write(destination, receipt)
+        write_authority(repo, receipt)
+    except (OSError, UpgradeError):
+        if published is not None:
+            try:
+                current = destination.lstat()
+                if (current.st_dev, current.st_ino) == published:
+                    destination.unlink()
+            except OSError as exc:
+                raise UpgradeError("receipt publication failed and rollback failed") from exc
+        raise
 
 
 def require_ignored_untracked(repo: Path, paths: tuple[Path, ...]) -> None:
@@ -126,13 +256,53 @@ def require_ignored_untracked(repo: Path, paths: tuple[Path, ...]) -> None:
 
 
 def atomic_json_write(path: Path, value: dict) -> None:
+    atomic_bytes_write(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def atomic_bytes_write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+    temporary = Path(temporary_name)
     try:
-        temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
         os.replace(temporary, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            raise UpgradeError(f"cannot clean temporary JSON record: {temporary}") from exc
+
+
+def exclusive_json_write(path: Path, value: dict) -> tuple[int, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n")
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
+        os.link(temporary, path, follow_symlinks=False)
+        metadata = path.lstat()
+        return metadata.st_dev, metadata.st_ino
+    except FileExistsError as exc:
+        raise UpgradeError("cannot publish an automation receipt over an existing receipt") from exc
+    except OSError as exc:
+        raise UpgradeError(f"cannot publish JSON record: {path}") from exc
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as exc:
+            raise UpgradeError(f"cannot clean temporary JSON record: {temporary}") from exc
 
 
 def file_fingerprint(repo: Path, raw_path: str) -> dict[str, object]:
@@ -156,7 +326,7 @@ def file_fingerprint(repo: Path, raw_path: str) -> dict[str, object]:
 def parse_task_identity(repo: Path, task: str) -> tuple[str, str, Path]:
     if not TASK_ID_RE.fullmatch(task):
         raise UpgradeError(f"invalid Task ID: {task!r}")
-    state_path = repo / ".task-state" / "task.md"
+    state_path = task_state_dir(repo) / "task.md"
     if not state_path.is_file():
         raise UpgradeError("operation requires a Task worktree with Task State")
     text = state_path.read_text(encoding="utf-8")
@@ -190,6 +360,21 @@ def registered_worktrees(repo: Path) -> dict[Path, tuple[str | None, str | None]
             continue
         key, _, value = line.partition(" ")
         current[key] = value
+    visible_top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=repo).stdout.strip())
+    if visible_top.is_absolute():
+        visible_top = visible_top.resolve()
+        current_repo = repo.resolve()
+        admin = worktree_admin_dir(repo)
+        current_branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip() or None
+        current_head = git_head(repo) or None
+        admin_record = records.get(admin)
+        if (
+            visible_top == current_repo
+            and visible_top not in records
+            and admin_record is not None
+            and admin_record == (current_branch, current_head)
+        ):
+            records[visible_top] = admin_record
     return records
 
 
@@ -895,7 +1080,7 @@ def require_maintenance(repo: Path) -> tuple[str, str, Path]:
     branch = run(["git", "branch", "--show-current"], cwd=repo).stdout.strip()
     if not branch:
         raise UpgradeError("detached HEAD is not supported")
-    state = repo / ".task-state" / "task.md"
+    state = task_state_dir(repo) / "task.md"
     task_match = re.search(r"(?m)^- Task ID: (.+)$", state.read_text(encoding="utf-8")) if state.is_file() else None
     if not task_match:
         raise UpgradeError("upgrade requires a registered non-default Task branch")
@@ -903,7 +1088,7 @@ def require_maintenance(repo: Path) -> tuple[str, str, Path]:
     identity = require_registered_task(repo, task_id)
     require_ignored_untracked(
         repo,
-        (repo / ".task-state" / "task.md", receipt_path(repo), consumed_receipt_path(repo)),
+        (task_state_dir(repo) / "task.md", receipt_path(repo), consumed_receipt_path(repo)),
     )
     if os.environ.get("AUTOMATION_MAINTENANCE") != "1":
         raise UpgradeError("upgrade requires AUTOMATION_MAINTENANCE=1 in a dedicated Automation Maintenance Task")
@@ -923,6 +1108,8 @@ def check_update(repo: Path, source_path: Path) -> dict:
 
 def apply(repo: Path, source_path: Path) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
+    if os.path.lexists(receipt_path(repo)) or authority_exists(repo):
+        raise UpgradeError("cannot apply with an existing receipt or authority record")
     source, revision = resolve_pinned_source(source_path)
     with tempfile.TemporaryDirectory(prefix="automation-upgrade-") as temporary:
         snapshot, source_core = materialize_source_snapshot(source, revision, Path(temporary))
@@ -993,9 +1180,11 @@ def apply(repo: Path, source_path: Path) -> dict:
             "authority_nonce": secrets.token_hex(32),
             "path_fingerprints": {path: file_fingerprint(repo, path) for path in changed_paths},
         }
-        atomic_json_write(receipt_path(repo), receipt)
-        write_authority(repo, receipt)
-        consumed_receipt_path(repo).unlink(missing_ok=True)
+        issue_pair(repo, receipt)
+        try:
+            consumed_receipt_path(repo).unlink(missing_ok=True)
+        except OSError as exc:
+            raise UpgradeError("cannot remove stale consumed receipt") from exc
         return result
 
 
@@ -1045,16 +1234,33 @@ def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
     authority_head = git_head(repo)
     authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip()
-    if receipt_path(repo).exists() or authority_path(repo).exists():
+    existing: dict | None = None
+    existing_bytes: bytes | None = None
+    if os.path.lexists(receipt_path(repo)):
+        try:
+            existing_bytes = receipt_path(repo).read_bytes()
+            existing = validate_receipt_schema(json.loads(existing_bytes.decode("utf-8")))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise UpgradeError("invalid automation upgrade receipt") from exc
+        if (existing["task_id"], existing["branch"], existing["worktree"]) != (task_id, branch, str(worktree)):
+            raise UpgradeError("automation receipt identity does not match the current Task worktree")
+        if authority_exists(repo):
+            raise UpgradeError("cannot bootstrap with an existing receipt or authority record")
+    elif authority_exists(repo):
         raise UpgradeError("cannot bootstrap with an existing receipt or authority record")
     pending = pending_paths(repo)
-    if not pending:
+    if not pending and existing is None:
         raise UpgradeError("bootstrap requires non-empty pending paths")
     for path in pending:
         reject_bootstrap_path(repo, path)
     source, source_head = resolve_pinned_source(source_path)
-    require_ignored_untracked(repo, (repo / ".task-state" / "automation-bootstrap.tmp",))
-    with tempfile.TemporaryDirectory(prefix="automation-bootstrap-", dir=repo / ".task-state") as temporary:
+    if existing is not None:
+        if str(source) != existing["source"] or source_head != existing["source_revision"]:
+            raise UpgradeError("receipt source or revision is stale")
+        pending = receipt_paths(repo, existing)
+    state_dir = task_state_dir(repo)
+    require_ignored_untracked(repo, (state_dir / "automation-bootstrap.tmp",))
+    with tempfile.TemporaryDirectory(prefix="automation-bootstrap-", dir=state_dir) as temporary:
         baseline = Path(temporary) / "baseline"
         source_snapshot = Path(temporary) / "source" / "components" / "agent-core"
         materialize_tree(repo, authority_head, baseline, surface_only=True)
@@ -1108,9 +1314,47 @@ def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
         "changed_paths": expected, "authority_head": authority_head, "authority_nonce": secrets.token_hex(32),
         "path_fingerprints": current_fingerprints,
     }
-    atomic_json_write(receipt_path(repo), receipt)
-    write_authority(repo, receipt)
-    consumed_receipt_path(repo).unlink(missing_ok=True)
+    revalidate_source(source, source_head)
+    current_identity = require_registered_task(repo, task_id)
+    current_registration = registered_worktrees(repo).get(worktree)
+    if (
+        current_identity != (task_id, branch, worktree)
+        or current_registration != (branch, authority_head)
+        or git_head(repo) != authority_head
+        or run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip() != authority_branch_oid
+    ):
+        raise UpgradeError("Task identity or HEAD changed before authority publication")
+    if pending_paths(repo) != pending:
+        raise UpgradeError("pending paths changed before authority publication")
+    current_fingerprints = {path: file_fingerprint(repo, path) for path in expected}
+    if current_fingerprints != expected_fingerprints:
+        raise UpgradeError("pending Agent Core content changed before authority publication")
+    if existing is not None:
+        receipt["authority_nonce"] = existing["authority_nonce"]
+        receipt["path_fingerprints"] = current_fingerprints
+        if receipt != existing:
+            raise UpgradeError("existing receipt does not match the reconstructed upgrade")
+        if receipt_path(repo).read_bytes() != existing_bytes or authority_exists(repo):
+            raise UpgradeError("receipt or authority changed during authority recovery")
+        _write_authority_at(authority_path(repo), {
+            "schema_version": 1,
+            "task_id": receipt["task_id"],
+            "branch": receipt["branch"],
+            "worktree": receipt["worktree"],
+            "authority_nonce": receipt["authority_nonce"],
+            "receipt_sha256": receipt_digest(receipt),
+        }, admin=worktree_admin_dir(repo))
+        try:
+            consumed_receipt_path(repo).unlink(missing_ok=True)
+        except OSError as exc:
+            raise UpgradeError("cannot remove stale consumed receipt") from exc
+        return {"status": "AUTHORITY_RECOVERED", "changedPaths": expected, "authorityIssued": True}
+    revalidate_source(source, source_head)
+    issue_pair(repo, receipt)
+    try:
+        consumed_receipt_path(repo).unlink(missing_ok=True)
+    except OSError as exc:
+        raise UpgradeError("cannot remove stale consumed receipt") from exc
     return {"status": "RECEIPT_BOOTSTRAPPED", "changedPaths": expected, "authorityIssued": True}
 
 
@@ -1227,7 +1471,8 @@ def normalized_git_fingerprint(fingerprint: object) -> dict[str, object]:
 def commit(repo: Path, task: str, message: str) -> dict[str, str]:
     _, branch, worktree = require_registered_task(repo, task)
     active = receipt_path(repo)
-    private_index = repo / ".task-state" / "automation-maintenance.index"
+    state_dir = task_state_dir(repo)
+    private_index = state_dir / "automation-maintenance.index"
     require_ignored_untracked(repo, (active, consumed_receipt_path(repo), private_index))
     if not active.is_file():
         raise UpgradeError("no active successful automation upgrade receipt")
@@ -1248,21 +1493,35 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
         raise UpgradeError("automation receipt path content/state fingerprint changed")
     if pending_paths(repo) != paths:
         raise UpgradeError("pending paths do not exactly match the automation receipt")
-    validate_authority(repo, receipt)
+    authority = validate_authority(repo, receipt)
 
     consumed = consumed_receipt_path(repo)
-    os.replace(active, consumed)
     consumed_receipt = dict(receipt)
     consumed_receipt["status"] = "consumed"
     consumed_receipt["commit_sha"] = None
-    atomic_json_write(consumed, consumed_receipt)
-    authority = authority_path(repo)
-    authority.unlink(missing_ok=True)
-    private_index.unlink(missing_ok=True)
-    index_environment = {"GIT_INDEX_FILE": str(private_index)}
+    private_index = state_dir / "automation-maintenance.index"
     committed = False
     commit_sha = ""
+    active_moved = False
+    authority_removed = False
+    consumed_instances: set[tuple[int, int]] = set()
     try:
+        if os.path.lexists(consumed):
+            existing = consumed.lstat()
+            if not stat.S_ISREG(existing.st_mode) or stat.S_ISLNK(existing.st_mode):
+                raise UpgradeError("existing consumed receipt has an unsafe type")
+        os.replace(active, consumed)
+        active_moved = True
+        moved_metadata = consumed.lstat()
+        consumed_instances.add((moved_metadata.st_dev, moved_metadata.st_ino))
+        atomic_json_write(consumed, consumed_receipt)
+        consumed_metadata = consumed.lstat()
+        consumed_instances.add((consumed_metadata.st_dev, consumed_metadata.st_ino))
+        authority.unlink(missing_ok=True)
+        authority_removed = True
+        task_state_dir(repo)
+        private_index.unlink(missing_ok=True)
+        index_environment = {"GIT_INDEX_FILE": str(private_index)}
         run(["git", "read-tree", "HEAD"], cwd=repo, env_overrides=index_environment)
         run(["git", "add", "--", *paths], cwd=repo, env_overrides=index_environment)
         run(
@@ -1310,14 +1569,59 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
         consumed_receipt["commit_sha"] = commit_sha
         atomic_json_write(consumed, consumed_receipt)
         run(["git", "reset", "-q", commit_sha, "--", *paths], cwd=repo)
-    except UpgradeError:
-        if not committed and not active.exists():
-            atomic_json_write(active, receipt)
-            write_authority(repo, receipt)
-            consumed.unlink(missing_ok=True)
+    except (UpgradeError, OSError) as failure:
+        if committed:
+            if isinstance(failure, OSError):
+                raise UpgradeError("commit finalization failed") from failure
+            raise
+        rollback_errors: list[str] = []
+        try:
+            if authority_removed:
+                _write_authority_at(
+                    authority,
+                    {
+                        "schema_version": 1,
+                        "task_id": receipt["task_id"],
+                        "branch": receipt["branch"],
+                        "worktree": receipt["worktree"],
+                        "authority_nonce": receipt["authority_nonce"],
+                        "receipt_sha256": receipt_digest(receipt),
+                    },
+                    admin=_rollback_authority_guard(repo, authority),
+                )
+        except (OSError, UpgradeError) as rollback_error:
+            rollback_errors.append(f"authority restore failed: {rollback_error}")
+        try:
+            if consumed_instances:
+                current = consumed.lstat()
+                if (current.st_dev, current.st_ino) in consumed_instances:
+                    consumed.unlink()
+                else:
+                    raise UpgradeError("consumed receipt changed during rollback")
+        except OSError as rollback_error:
+            rollback_errors.append(f"consumed receipt cleanup failed: {rollback_error}")
+        except UpgradeError as rollback_error:
+            rollback_errors.append(f"consumed receipt cleanup failed: {rollback_error}")
+        try:
+            if active_moved:
+                if os.path.lexists(active):
+                    raise UpgradeError("active receipt appeared during rollback")
+                exclusive_json_write(active, receipt)
+        except (OSError, UpgradeError) as rollback_error:
+            rollback_errors.append(f"active receipt restore failed: {rollback_error}")
+        if rollback_errors:
+            raise UpgradeError(
+                f"commit failed: {failure}; rollback failed: {'; '.join(rollback_errors)}"
+            ) from failure
+        if isinstance(failure, OSError):
+            raise UpgradeError("commit failed during filesystem operation") from failure
         raise
     finally:
-        private_index.unlink(missing_ok=True)
+        try:
+            task_state_dir(repo)
+            private_index.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            raise UpgradeError("private index cleanup failed") from cleanup_error
     return {"status": "COMMITTED", "commit_sha": commit_sha}
 
 

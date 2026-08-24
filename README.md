@@ -261,19 +261,20 @@ verification and immediately before `automation::commit`, recover it with:
 AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git Templates checkout>
 ```
 
-The bridge does not trust `NO_CHANGES`, the current diff, or the environment. It
-uses the same pinned clean-source and tracked Agent Core snapshot semantics as
-normal `automation::check-update` and `automation::upgrade`, reconstructs
-expected output by applying canonical upgrade semantics in isolation, then
-requires exact pending paths, content, modes, and Task identity/`HEAD` before
-issuing the existing receipt and protected authority. The receipt's
-`source_revision` is the pinned snapshot `HEAD`; any source race fails closed.
-Any product, Adapter, repository, secret-pattern, or `.task-state` path, or
-tampering, fails closed. Continue with the existing commit/push/Draft-PR flow;
-ordinary `agent::commit` rejection and the receipt/authority design remain
-unchanged.
+The bridge supports exactly two strict cases: canonical pre-receipt
+reconstruction, and recovery of an exact active receipt whose authority is
+missing. It does not trust `NO_CHANGES`, the current diff, or the environment.
+In either case it uses the same pinned clean-source and tracked Agent Core
+snapshot semantics as normal `automation::check-update` and
+`automation::upgrade`, reconstructs canonical output in isolation, and checks
+Task/branch/worktree/`HEAD`, the pinned source revision, and exact pending safe
+paths, content, modes, and fingerprints. Recovery additionally requires the
+active receipt to be exactly equal and unchanged, then issues only the missing
+authority. A receipt with authority, or stale, forged, or tampered state, fails
+closed. Continue with the existing commit/push/Draft-PR flow; ordinary
+`agent::commit` rejection remains unchanged.
 
-`automation::commit` is the only commit path for this upgrade. It fails closed unless the schema-1 JSON receipt contains Task `task_id`, `branch`, `worktree`, source/source revision, current/upstream versions, sorted unique `changed_paths`, `authority_head`, and matching `path_fingerprints`. Receipt identity must match the current Task/worktree and `authority_head` must equal current `HEAD`; every fingerprint and the complete pending path set must still match. A protected record under the shared Git directory binds the active receipt to the preceding successful upgrade, so an ambient variable or fabricated Task State receipt is not commit authority. Receipt paths must be Agent Core-managed only: mixed Adapter, repository, product, secret-pattern, or `.task-state` paths are rejected. The command scrubs ambient Git repository/index overrides, stages into a private Task State index, checks the exact staged blobs and modes, creates the commit from that verified tree without hooks, and atomically advances only the expected Task branch HEAD.
+`automation::commit` is the only commit path for this upgrade. It fails closed unless the schema-1 JSON receipt contains Task `task_id`, `branch`, `worktree`, source/source revision, current/upstream versions, sorted unique `changed_paths`, `authority_head`, and matching `path_fingerprints`. Receipt identity must match the current Task/worktree and `authority_head` must equal current `HEAD`; every fingerprint and the complete pending path set must still match. Receipt and authority are a logical pair. Authority records live under the Git-resolved per-worktree administrative directory returned by `--absolute-git-dir`, not an assumed visible `.git` or shared Git directory; linked and special administrative topologies are supported, and worktrees do not share authority. Existing safe legacy shared-common-dir hashed records remain validation/commit compatible. A protected record binds the active receipt to the preceding successful upgrade, so an ambient variable or fabricated Task State receipt is not commit authority. Receipt paths must be Agent Core-managed only: mixed Adapter, repository, product, secret-pattern, or `.task-state` paths are rejected. The command scrubs ambient Git repository/index overrides, stages into a private Task State index, checks the exact staged blobs and modes, creates the commit from that verified tree without hooks, and atomically advances only the expected Task branch HEAD. A handled authority-write failure removes the newly written receipt if it is unchanged; an interruption half-state is recoverable only through the strict bootstrap path. No cross-filesystem atomicity is claimed.
 
 After a successful commit, the active receipt is consumed as `.task-state/automation-maintenance.consumed.json`. A later successful upgrade with changes replaces the active receipt and removes the prior consumed receipt; a no-change invocation returns `NO_CHANGES` and preserves existing receipt lifecycle evidence. There is no raw Git/GitHub bypass, and merge is excluded: the Main Orchestrator performs the separately gated integration/merge workflow.
 
