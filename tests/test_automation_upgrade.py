@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+import threading
 from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
@@ -273,6 +274,39 @@ mod project 'just/project/mod.just'
         self.assertFalse(upgrade.authority_path(task).exists())
         return task, source, result | metadata
 
+    def _separate_git_topology_fixture(self, root: Path) -> tuple[Path, Path, Path]:
+        """Create a separate-git-dir checkout and a linked worktree from it."""
+        primary = root / "primary"
+        primary.mkdir(parents=True)
+        self._materialize_release_template(primary)
+        admin = root / "primary-admin"
+        self._git(["init", "-b", "main", "--separate-git-dir", str(admin)], primary)
+        self._git(["config", "user.name", "Test User"], primary)
+        self._git(["config", "user.email", "test@example.invalid"], primary)
+        self._git(["add", "-A"], primary)
+        self._git(["commit", "-m", "release fixture"], primary)
+        head = self._git(["rev-parse", "HEAD"], primary)
+        self._git(["update-ref", "refs/remotes/origin/main", head], primary)
+        self._git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"], primary)
+        self._git(["switch", "-c", "task/TASK-83-primary"], primary)
+        linked = root / "linked"
+        self._git(["worktree", "add", "-b", "task/TASK-83-linked", str(linked), "HEAD"], primary)
+        for repo, branch in ((primary, "task/TASK-83-primary"), (linked, "task/TASK-83-linked")):
+            self._write_file(
+                repo / ".task-state/task.md",
+                f"- Task ID: TASK-83\n- Branch: {branch}\n- Worktree: {repo.resolve()}\n",
+            )
+            exclude = Path(self._git(["rev-parse", "--git-path", "info/exclude"], repo))
+            if not exclude.is_absolute():
+                exclude = repo / exclude
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with exclude.open("a", encoding="utf-8") as stream:
+                stream.write("/.task-state/\n")
+        source_root = root / "source"
+        self._core_root_source(source_root, version=3)
+        self._init_source_git(source_root)
+        return primary, linked, source_root
+
     def _task_repo(self, repo: Path, *, task: str = "TASK-78") -> Path:
         repo.mkdir(parents=True)
         self._git(["init", "-b", "main"], repo)
@@ -309,12 +343,17 @@ mod project 'just/project/mod.just'
     def _receipt(self, repo: Path) -> dict:
         return json.loads(upgrade.receipt_path(repo).read_text(encoding="utf-8"))
 
+    def _bootstrap_receipt(self, repo: Path, source_root: Path) -> dict:
+        with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+            return upgrade.bootstrap_receipt(repo, source_root)
+
     def _commit_error(self, repo: Path, task: str = "TASK-78") -> str:
         with self.assertRaises(upgrade.UpgradeError) as raised:
             upgrade.commit(repo, task, "maintenance")
         return str(raised.exception)
 
     def _mock_maintenance(self, repo: Path) -> ExitStack:
+        (repo / ".task-state").mkdir(parents=True, exist_ok=True)
         stack = ExitStack()
         stack.enter_context(
             mock.patch.object(
@@ -323,6 +362,7 @@ mod project 'just/project/mod.just'
                 return_value=("TASK-TEST", "task/TASK-TEST-test", repo),
             )
         )
+        stack.enter_context(mock.patch.object(upgrade, "authority_exists", return_value=False))
         stack.enter_context(mock.patch.object(upgrade, "write_authority"))
         return stack
 
@@ -918,6 +958,59 @@ mod project 'just/project/mod.just'
             self.assertEqual(result["commit_sha"], consumed["commit_sha"])
             self.assertEqual([], upgrade.pending_paths(repo))
 
+    def test_normal_primary_and_linked_worktree_authority_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            primary = self._task_repo(root / "primary")
+            linked = root / "linked"
+            self._git(["worktree", "add", "-b", "task/TASK-79-linked", str(linked), "HEAD"], primary)
+
+            primary_admin = Path(self._git(["rev-parse", "--absolute-git-dir"], primary))
+            linked_admin = Path(self._git(["rev-parse", "--absolute-git-dir"], linked))
+            self.assertTrue((primary / ".git").is_dir())
+            self.assertTrue((linked / ".git").is_file())
+            for repo, admin in ((primary, primary_admin), (linked, linked_admin)):
+                with self.subTest(repo=repo.name):
+                    self.assertTrue(admin.is_absolute())
+                    self.assertTrue(admin.is_dir())
+                    authority = upgrade.authority_path(repo).resolve()
+                    self.assertIn(admin.resolve(), authority.parents)
+                    if (repo / ".git").is_file():
+                        self.assertNotIn(repo / ".git", authority.parents)
+            self.assertNotEqual(primary_admin.resolve(), linked_admin.resolve())
+            self.assertNotEqual(upgrade.authority_path(primary), upgrade.authority_path(linked))
+
+    def test_authority_is_beneath_exact_admin_dir_for_separate_and_linked_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            primary, linked, source = self._separate_git_topology_fixture(Path(directory))
+            for repo, task, branch in (
+                (primary, "TASK-83", "task/TASK-83-primary"),
+                (linked, "TASK-83", "task/TASK-83-linked"),
+            ):
+                with self.subTest(repo=repo.name):
+                    admin = Path(self._git(["rev-parse", "--absolute-git-dir"], repo))
+                    self.assertTrue(admin.is_absolute())
+                    self.assertTrue(admin.is_dir())
+                    visible_git = repo / ".git"
+                    self.assertTrue(visible_git.is_file())
+                    self.assertNotIn(visible_git, upgrade.authority_path(repo).parents)
+                    with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                        upgrade.apply(repo, source)
+                    authority = upgrade.authority_path(repo).resolve()
+                    self.assertIn(admin.resolve(), authority.parents)
+                    self.assertNotIn(visible_git, authority.parents)
+            self.assertNotEqual(upgrade.authority_path(primary), upgrade.authority_path(linked))
+            self.assertNotEqual(
+                upgrade.authority_path(primary).parent.resolve(),
+                upgrade.authority_path(linked).parent.resolve(),
+            )
+            with self.assertRaises(upgrade.UpgradeError):
+                upgrade.validate_authority(primary, self._receipt(linked))
+            with self.assertRaises(upgrade.UpgradeError):
+                upgrade.validate_authority(linked, self._receipt(primary))
+            self.assertEqual("COMMITTED", upgrade.commit(primary, "TASK-83", "maintenance")["status"])
+            self.assertEqual("COMMITTED", upgrade.commit(linked, "TASK-83", "maintenance")["status"])
+
     def test_second_successful_upgrade_replaces_consumed_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -941,6 +1034,241 @@ mod project 'just/project/mod.just'
             self.assertEqual("4", second["upstream_version"])
             self.assertEqual([".automation/VERSION"], second["changed_paths"])
             self.assertNotIn("README.md", second["changed_paths"])
+
+    def test_apply_rolls_back_receipt_when_authority_publication_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False), \
+                    mock.patch.object(upgrade, "write_authority", side_effect=upgrade.UpgradeError("injected authority failure")):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "injected authority failure"):
+                    upgrade.apply(repo, source.parents[1])
+            self.assertFalse(upgrade.receipt_path(repo).exists())
+            self.assertFalse(upgrade.authority_path(repo).exists())
+            recovered = self._bootstrap_receipt(repo, source.parents[1])
+            self.assertEqual("RECEIPT_BOOTSTRAPPED", recovered["status"])
+            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "maintenance")["status"])
+
+    def test_issue_pair_does_not_overwrite_a_concurrent_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            receipt = self._receipt(repo)
+            authority = upgrade.authority_path(repo)
+            upgrade.receipt_path(repo).unlink()
+            authority.unlink()
+            first = dict(receipt)
+            second = dict(receipt, authority_nonce="1" * 64)
+            entered = threading.Event()
+            release = threading.Event()
+            first_errors: list[BaseException] = []
+            second_errors: list[BaseException] = []
+            original_write = upgrade.write_authority
+
+            def blocked_write(target: Path, value: dict) -> None:
+                if value["authority_nonce"] == first["authority_nonce"]:
+                    entered.set()
+                    if not release.wait(timeout=5):
+                        raise AssertionError("timed out waiting to release first issuer")
+                original_write(target, value)
+
+            def issue(value: dict, errors: list[BaseException]) -> None:
+                try:
+                    upgrade.issue_pair(repo, value)
+                except BaseException as exc:  # capture thread failures for the test thread
+                    errors.append(exc)
+
+            with mock.patch.object(upgrade, "write_authority", side_effect=blocked_write):
+                first_thread = threading.Thread(target=issue, args=(first, first_errors))
+                first_thread.start()
+                self.assertTrue(entered.wait(timeout=5))
+                second_thread = threading.Thread(target=issue, args=(second, second_errors))
+                second_thread.start()
+                second_thread.join(timeout=5)
+                self.assertFalse(second_thread.is_alive())
+                release.set()
+                first_thread.join(timeout=5)
+            self.assertFalse(first_thread.is_alive())
+            self.assertEqual([], first_errors)
+            self.assertEqual(1, len(second_errors))
+            self.assertIsInstance(second_errors[0], upgrade.UpgradeError)
+            self.assertEqual(first, self._receipt(repo))
+            self.assertEqual(authority, upgrade.validate_authority(repo, first))
+
+    def test_task_state_symlink_is_rejected_without_writing_outside_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            state = repo / ".task-state"
+            outside = root / "outside-state"
+            outside.mkdir()
+            shutil.rmtree(state)
+            state.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(upgrade.UpgradeError):
+                self._bootstrap_receipt(repo, source.parents[1])
+            self.assertEqual([], list(outside.iterdir()))
+
+    def test_commit_rolls_back_when_consumed_receipt_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            active = upgrade.receipt_path(repo)
+            authority = upgrade.authority_path(repo)
+            active_bytes = active.read_bytes()
+            authority_bytes = authority.read_bytes()
+            original_replace = upgrade.os.replace
+
+            def fail_active_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+                if Path(source) == active and Path(destination) == upgrade.consumed_receipt_path(repo):
+                    raise OSError("injected receipt consume failure")
+                original_replace(source, destination)
+
+            with mock.patch.object(upgrade.os, "replace", side_effect=fail_active_replace):
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.commit(repo, "TASK-78", "maintenance")
+            self.assertEqual(active_bytes, active.read_bytes())
+            self.assertEqual(authority_bytes, authority.read_bytes())
+            self.assertFalse(upgrade.consumed_receipt_path(repo).exists())
+            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "maintenance")["status"])
+
+    def test_commit_rolls_back_when_authority_unlink_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            active = upgrade.receipt_path(repo)
+            authority = upgrade.authority_path(repo)
+            active_bytes = active.read_bytes()
+            authority_bytes = authority.read_bytes()
+            original_unlink = Path.unlink
+
+            def fail_authority_unlink(path: Path, *args, **kwargs) -> None:
+                if path == authority:
+                    raise OSError("injected authority consume failure")
+                original_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_authority_unlink):
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.commit(repo, "TASK-78", "maintenance")
+            self.assertEqual(active_bytes, active.read_bytes())
+            self.assertEqual(authority_bytes, authority.read_bytes())
+            self.assertFalse(upgrade.consumed_receipt_path(repo).exists())
+            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "maintenance")["status"])
+
+    def test_fresh_bootstrap_rolls_back_receipt_when_authority_publication_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task, source, _ = self._old_process_fixture(Path(directory))
+            with mock.patch.object(
+                upgrade,
+                "write_authority",
+                side_effect=upgrade.UpgradeError("injected authority failure"),
+            ):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "injected authority failure"):
+                    self._bootstrap_receipt(task, source)
+            self.assertFalse(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+            result = self._bootstrap_receipt(task, source)
+            self.assertEqual("RECEIPT_BOOTSTRAPPED", result["status"])
+            self.assertEqual("COMMITTED", upgrade.commit(task, "TASK-78", "maintenance")["status"])
+
+    def test_existing_receipt_without_authority_is_recovered_without_rewriting_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, source = self._apply_fixture(Path(directory))
+            receipt_path = upgrade.receipt_path(repo)
+            receipt_bytes = receipt_path.read_bytes()
+            upgrade.authority_path(repo).unlink()
+            result = self._bootstrap_receipt(repo, source.parents[1])
+            self.assertEqual("AUTHORITY_RECOVERED", result["status"])
+            self.assertEqual(receipt_bytes, receipt_path.read_bytes())
+            self.assertTrue(upgrade.authority_path(repo).is_file())
+            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "maintenance")["status"])
+
+    def test_rebootstrap_with_receipt_and_authority_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, source = self._apply_fixture(Path(directory))
+            with self.assertRaisesRegex(upgrade.UpgradeError, "existing receipt or authority"):
+                self._bootstrap_receipt(repo, source.parents[1])
+
+    def test_bootstrap_recovery_fails_closed_for_receipt_and_pending_state_tampering(self) -> None:
+        receipt_fields = (
+            ("schema_version", 2),
+            ("task_id", "OTHER"),
+            ("branch", "task/OTHER-maintenance"),
+            ("worktree", "/other/worktree"),
+            ("source", "/other/source"),
+            ("source_revision", "0" * 40),
+            ("authority_head", "0" * 40),
+        )
+        for field, value in receipt_fields:
+            with self.subTest(kind=f"receipt:{field}"), tempfile.TemporaryDirectory() as directory:
+                repo, source = self._apply_fixture(Path(directory))
+                upgrade.authority_path(repo).unlink()
+                receipt = self._receipt(repo)
+                receipt[field] = value
+                upgrade.atomic_json_write(upgrade.receipt_path(repo), receipt)
+                with self.assertRaises(upgrade.UpgradeError):
+                    self._bootstrap_receipt(repo, source.parents[1])
+                self.assertFalse(upgrade.authority_path(repo).exists())
+
+        for kind in ("changed_paths", "fingerprint", "head", "source_revision", "pending_added", "pending_removed", "content", "mode"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, source = self._apply_fixture(root)
+                upgrade.authority_path(repo).unlink()
+                receipt = self._receipt(repo)
+                if kind == "changed_paths":
+                    receipt["changed_paths"] = receipt["changed_paths"][:-1]
+                elif kind == "fingerprint":
+                    path = receipt["changed_paths"][0]
+                    receipt["path_fingerprints"][path]["content_sha256"] = "0" * 64
+                elif kind == "head":
+                    self._write_file(repo / "README.md", "head changed\n")
+                    self._git(["add", "README.md"], repo)
+                    self._git(["commit", "-m", "changed head"], repo)
+                elif kind == "source_revision":
+                    self._write_file(source / "source-change", "changed\n")
+                    self._git(["add", "source-change"], source)
+                    self._git(["commit", "-m", "changed source"], source)
+                elif kind == "pending_added":
+                    self._write_file(repo / ".automation/pending-added", "added\n")
+                else:
+                    path = receipt["changed_paths"][0]
+                    target = repo / Path(*path.split("/"))
+                    if kind == "pending_removed":
+                        self._git(["restore", "--source=HEAD", "--", path], repo)
+                    elif kind == "content":
+                        target.write_bytes(target.read_bytes() + b"tampered")
+                    elif kind == "mode":
+                        target.chmod(target.stat().st_mode ^ 0o100)
+                if kind in ("changed_paths", "fingerprint"):
+                    upgrade.atomic_json_write(upgrade.receipt_path(repo), receipt)
+                with self.assertRaises(upgrade.UpgradeError):
+                    self._bootstrap_receipt(repo, source.parents[1])
+                self.assertFalse(upgrade.authority_path(repo).exists())
+
+    def test_legacy_authority_is_consumed_only_when_new_record_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            new_path, legacy_path = upgrade._authority_locations(repo)
+            self.assertIsNotNone(legacy_path)
+            assert legacy_path is not None
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_bytes(new_path.read_bytes())
+            new_path.unlink()
+            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy maintenance")["status"])
+            self.assertFalse(legacy_path.exists())
+
+    def test_malformed_new_authority_blocks_legacy_fallback_and_non_directory_common_git_is_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, _ = self._apply_fixture(root)
+            new_path, legacy_path = upgrade._authority_locations(repo)
+            assert legacy_path is not None
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_bytes(new_path.read_bytes())
+            new_path.write_text("not json\n", encoding="utf-8")
+            self.assertIn("invalid successful-upgrade authority", self._commit_error(repo))
+            new_path.unlink()
+            common_file = root / "common-file"
+            common_file.write_text("not a git directory\n", encoding="utf-8")
+            with mock.patch.object(upgrade, "common_git_dir", return_value=common_file):
+                self.assertIn("missing or invalid successful-upgrade authority", self._commit_error(repo))
 
     def test_no_change_upgrade_preserves_consumed_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1129,11 +1457,13 @@ mod project 'just/project/mod.just'
             updated = self._receipt(repo)
             updated["path_fingerprints"][path] = upgrade.file_fingerprint(repo, path)
             upgrade.atomic_json_write(upgrade.receipt_path(repo), updated)
+            upgrade.authority_path(repo).unlink()
             upgrade.write_authority(repo, updated)
             self.assertIn("git diff --no-ext-diff --cached --check", self._commit_error(repo))
             target.write_bytes(original_bytes)
             self._git(["reset", "--mixed", "HEAD"], repo)
             upgrade.atomic_json_write(upgrade.receipt_path(repo), receipt)
+            upgrade.authority_path(repo).unlink()
             upgrade.write_authority(repo, receipt)
             original_run = upgrade.run
 
