@@ -1,4 +1,4 @@
-root := justfile_directory() / ".." / ".."
+root := justfile_directory()
 script := root / ".automation" / "bin" / "automation_upgrade.py"
 
 [working-directory: root]
