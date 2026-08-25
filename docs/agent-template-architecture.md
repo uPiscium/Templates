@@ -643,33 +643,34 @@ The canonical publication flows are:
 1. **Normal upgrade:** run `automation::upgrade` from the dedicated Automation
    Maintenance Task, inspect the resulting diff, perform normal verification,
    then use `automation::commit`, `agent::push`, and `agent::pr-create`.
-2. **Pre-receipt consumer recovery:** a self-hosted upgrade may leave the exact
-   upgraded diff without a receipt. After normal verification and before
-   `automation::commit`, run:
+2. **Issue #85 source-side recovery:** only when fixing a consumer worktree with
+   the exact active receipt and missing authority, run from the Templates
+   checkout:
 
    ```sh
-   AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted clean Git Templates checkout>
+   just agent-core::recover-maintenance-authority <consumer-task-worktree>
+   just agent-core::commit-recovered-maintenance <consumer-task-worktree> <task> [message]
    ```
 
-    This bridge supports exactly two strict cases: canonical pre-receipt
-    reconstruction, and recovery of an exact active receipt whose authority is
-    missing. It does not trust `NO_CHANGES`, the current diff, or the
-    environment. It uses the same pinned clean-source and tracked Agent Core
-    snapshot semantics as normal `automation::check-update` and
-    `automation::upgrade`, then reruns pinned clean-source canonical
-    reconstruction. It requires Task/branch/worktree/`HEAD`, the pinned source
-    revision, and exact pending safe paths, content, modes, and fingerprints.
-    Recovery additionally requires receipt exact equality and that it is
-    unchanged, then issues only the missing authority. A receipt with authority,
-    or stale, forged, or tampered state, fails closed. Product, Adapter,
-    repository, secret-pattern, or `.task-state` paths also fail closed.
+   Do not edit or delete the receipt, replace receipt-bound Agent Core files,
+   use `python -c`/monkeypatches, or modify downstream files directly outside
+   the bridge. Recovery uses the current clean, pinned Templates `HEAD`; the
+   receipt source revision remains historical and is materialized from tracked
+   Git objects, without checking out current source to that old revision or
+   using live files. `receipt.source` must be the exact same Templates Git
+   repository/common object store worktree; unrelated or missing sources fail.
+   Recovery leaves the receipt and target files unchanged, writes per-worktree
+   schema-2 bridge authority and proof, and reports `AUTHORITY_RECOVERED`.
+   Publication uses exact receipt paths, private-index blob/mode validation,
+   `commit-tree`, and expected-`HEAD` `update-ref`. A failure before the atomic
+   branch update restores the retryable pair; successful expected-`HEAD`
+   `update-ref` is the publication boundary. A later finalization error is
+   reported as already published and must not be retried as an uncommitted pair.
+   It consumes receipt, authority, and proof. It does not push or merge. The existing consumer script need not and must not be
+   replaced first. This is not a generic external apply/upgrade/commit
+   primitive; normal consumer bootstrap and commit remain distinct.
 
-The bridge only reconstructs a canonical pre-receipt or repairs missing
-authority for an exact active receipt; ordinary `agent::commit` continues to
-reject Automation Core changes. Its source and snapshot semantics align with
-the normal upgrade workflow.
-
-Successful upgrade writes or replaces the ignored `.task-state/automation-maintenance.json` receipt. Its schema-1 content records Task identity (`task_id`, `branch`, `worktree`), source and source revision, current/upstream versions, sorted unique `changed_paths`, the authority `HEAD`, and per-path content/state fingerprints. Receipt and authority publication is a logical pair. Authority records live under the Git-resolved per-worktree administrative directory returned by `--absolute-git-dir`, not an assumed visible `.git` or shared Git directory; linked and special administrative topologies are supported, and worktrees do not share authority. Existing safe legacy shared-common-dir hashed records remain validation/commit compatible. `automation::commit <task> [message]` fails closed unless both records match the current Task/worktree identity and `HEAD`, fingerprints, and complete pending path set. Receipt paths must be Agent Core-managed; any mixed Adapter, repository, product, configured-secret, or `.task-state` scope is rejected. Ambient Git repository/index overrides are scrubbed; exact blobs and modes are staged and rechecked in a private index, committed as that verified tree without hooks, and published only by an atomic expected-HEAD Task branch update. A handled authority-write failure removes the newly written receipt if it is unchanged; an interruption half-state is recoverable only through the strict bootstrap path. No cross-filesystem atomicity is claimed. The receipt is moved to `.task-state/automation-maintenance.consumed.json` after successful commit; the next successful upgrade with changes replaces the active receipt and removes the prior consumed receipt. A no-change invocation returns `NO_CHANGES` and preserves existing lifecycle evidence.
+ Successful upgrade writes or replaces the ignored `.task-state/automation-maintenance.json` receipt. Its schema-1 content records Task identity (`task_id`, `branch`, `worktree`), source and source revision, current/upstream versions, sorted unique `changed_paths`, the authority `HEAD`, and per-path content/state fingerprints. Receipt and authority publication is a logical pair. Authority records live under the Git-resolved per-worktree administrative directory returned by `--absolute-git-dir`, not an assumed visible `.git` or shared Git directory; linked and special administrative topologies are supported, and worktrees do not share authority. Existing safe legacy shared-common-dir hashed records remain validation/commit compatible. `automation::commit <task> [message]` fails closed unless both records match the current Task/worktree identity and `HEAD`, fingerprints, and complete pending path set. Receipt paths must be Agent Core-managed; any mixed Adapter, repository, product, configured-secret, or `.task-state` scope is rejected. Ambient Git repository/index overrides are scrubbed; exact blobs and modes are staged and rechecked in a private index, committed as that verified tree without hooks, and published only by an expected-HEAD Task branch update. A handled authority-write failure removes the newly written receipt if it is unchanged; an interruption half-state is recoverable only through the strict source-side bridge above. No cross-filesystem atomicity is claimed. The receipt is moved to `.task-state/automation-maintenance.consumed.json` after successful commit; the next successful upgrade with changes replaces the active receipt and removes the prior consumed receipt. A no-change invocation returns `NO_CHANGES` and preserves existing lifecycle evidence.
 
 The required sequence is `git diff --check`, `just agent::doctor`, `just project::check`, and the repository CI/smoke suite, followed by `just automation::commit <task> [message]`, existing `just agent::push <task>`, and `just agent::pr-create <task>` (Draft PR). Raw Git/GitHub bypass is not permitted. Merge is excluded from this workflow and remains a separately gated Main Orchestrator operation.
 

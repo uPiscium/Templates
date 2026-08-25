@@ -23,6 +23,7 @@ class UpgradeError(RuntimeError):
 
 RECEIPT_NAME = "automation-maintenance.json"
 CONSUMED_RECEIPT_NAME = "automation-maintenance.consumed.json"
+SOURCE_RECOVERY_PROOF_NAME = "source-recovery-proof.json"
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RECEIPT_FIELDS = {
     "schema_version",
@@ -130,6 +131,12 @@ def authority_path(repo: Path) -> Path:
     return _authority_locations(repo)[0]
 
 
+def source_recovery_proof_path(repo: Path) -> Path:
+    """Return the proof path, using the same containment guard as authority."""
+    authority = authority_path(repo)
+    return authority.parent / SOURCE_RECOVERY_PROOF_NAME
+
+
 def canonical_json(value: dict) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -218,6 +225,48 @@ def validate_authority(repo: Path, receipt: dict) -> Path:
     return path
 
 
+def _read_json_record(path: Path, error: str) -> dict:
+    _, value = _read_json_record_bytes(path, error)
+    return value
+
+
+def _read_json_record_bytes(path: Path, error: str) -> tuple[bytes, dict]:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or path.is_symlink():
+            raise UpgradeError(error)
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UpgradeError(error) from exc
+    if not isinstance(value, dict):
+        raise UpgradeError(error)
+    return raw, value
+
+
+def _bridge_authority_path(repo: Path) -> Path:
+    return authority_path(repo)
+
+
+def _bridge_authority(receipt: dict, proof_digest: str) -> dict:
+    return {
+        "schema_version": 2,
+        "kind": "source-recovery-bridge",
+        "task_id": receipt["task_id"],
+        "branch": receipt["branch"],
+        "worktree": receipt["worktree"],
+        "authority_nonce": receipt["authority_nonce"],
+        "receipt_sha256": receipt_digest(receipt),
+        "proof_sha256": proof_digest,
+    }
+
+
+def _validate_no_authority(repo: Path) -> None:
+    new_path, legacy_path = _authority_locations(repo)
+    if os.path.lexists(new_path) or (legacy_path is not None and os.path.lexists(legacy_path)):
+        raise UpgradeError("cannot recover with an existing authority record")
+
+
 def authority_exists(repo: Path) -> bool:
     new_path, legacy_path = _authority_locations(repo)
     return os.path.lexists(new_path) or (legacy_path is not None and os.path.lexists(legacy_path))
@@ -303,6 +352,53 @@ def exclusive_json_write(path: Path, value: dict) -> tuple[int, int]:
             temporary.unlink(missing_ok=True)
         except OSError as exc:
             raise UpgradeError(f"cannot clean temporary JSON record: {temporary}") from exc
+
+
+def exclusive_bytes_write(path: Path, content: bytes) -> tuple[int, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
+        os.link(temporary, path, follow_symlinks=False)
+        metadata = path.lstat()
+        return metadata.st_dev, metadata.st_ino
+    except FileExistsError as exc:
+        raise UpgradeError(f"cannot publish record over an existing record: {path}") from exc
+    except OSError as exc:
+        raise UpgradeError(f"cannot publish record: {path}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _validate_admin_record_parent(path: Path, admin: Path) -> None:
+    try:
+        resolved_admin = admin.resolve()
+        parent = path.parent.resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise UpgradeError("record path containment cannot be validated") from exc
+    if parent != resolved_admin and resolved_admin not in parent.parents:
+        raise UpgradeError("record path escapes the worktree administrative directory")
+
+
+def exclusive_json_write_contained(path: Path, value: dict, *, admin: Path) -> tuple[int, int]:
+    _validate_admin_record_parent(path, admin)
+    result = exclusive_json_write(path, value)
+    _validate_admin_record_parent(path, admin)
+    return result
+
+
+def exclusive_bytes_write_contained(path: Path, content: bytes, *, admin: Path) -> tuple[int, int]:
+    _validate_admin_record_parent(path, admin)
+    result = exclusive_bytes_write(path, content)
+    _validate_admin_record_parent(path, admin)
+    return result
 
 
 def file_fingerprint(repo: Path, raw_path: str) -> dict[str, object]:
@@ -556,6 +652,41 @@ def resolve_pinned_source(path: Path) -> tuple[Path, str]:
     if status:
         raise UpgradeError("source components/agent-core must be clean")
     return source, head
+
+
+def resolve_clean_source_worktree(path: Path) -> tuple[Path, str]:
+    """Validate the whole Templates checkout for source-side recovery."""
+    source = resolve_source(path)
+    top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=source).stdout.strip()).resolve()
+    head = git_head(source)
+    if top != source or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        raise UpgradeError("source must be a Git worktree root with a full non-null HEAD")
+    if git_bytes(["git", "status", "--porcelain=v1", "-z"], cwd=source):
+        raise UpgradeError("Templates source worktree must be clean")
+    return source, head
+
+
+def _source_is_compatible(receipt_source: str, source: Path) -> bool:
+    candidate = Path(receipt_source)
+    if not candidate.is_absolute() or not candidate.exists() or not candidate.is_dir():
+        return False
+    try:
+        candidate = candidate.resolve()
+        top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=candidate).stdout.strip()).resolve()
+        return top == candidate and (
+            candidate == source or common_git_dir(candidate) == common_git_dir(source)
+        )
+    except (OSError, UpgradeError, ValueError, RuntimeError):
+        return False
+
+
+def _validate_source_revision(source: Path, revision: object) -> str:
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+        raise UpgradeError("receipt source_revision must be a full lowercase hexadecimal Git revision")
+    result = run(["git", "rev-parse", "--verify", f"{revision}^{{commit}}"], cwd=source, check=False)
+    if result.returncode != 0 or result.stdout.strip() != revision:
+        raise UpgradeError("receipt source_revision is not a commit in the current source object database")
+    return revision
 
 
 def load_ownership(repo: Path) -> dict[str, str]:
@@ -1358,6 +1489,178 @@ def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
     return {"status": "RECEIPT_BOOTSTRAPPED", "changedPaths": expected, "authorityIssued": True}
 
 
+PROOF_FIELDS = {
+    "schema_version", "kind", "task_id", "branch", "worktree", "authority_head",
+    "authority_nonce", "receipt_sha256", "receipt_bytes_sha256", "changed_paths_sha256",
+    "path_fingerprints_sha256", "implementation_source", "implementation_revision",
+    "receipt_source", "receipt_source_revision",
+}
+
+
+def _recovery_proof(receipt: dict, *, implementation_source: Path, implementation_revision: str,
+                    raw_receipt: bytes, paths: list[str], fingerprints: dict) -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "source-recovery-proof",
+        "task_id": receipt["task_id"],
+        "branch": receipt["branch"],
+        "worktree": receipt["worktree"],
+        "authority_head": receipt["authority_head"],
+        "authority_nonce": receipt["authority_nonce"],
+        "receipt_sha256": receipt_digest(receipt),
+        "receipt_bytes_sha256": hashlib.sha256(raw_receipt).hexdigest(),
+        "changed_paths_sha256": hashlib.sha256(canonical_json({"changed_paths": paths})).hexdigest(),
+        "path_fingerprints_sha256": hashlib.sha256(canonical_json(fingerprints)).hexdigest(),
+        "implementation_source": str(implementation_source),
+        "implementation_revision": implementation_revision,
+        "receipt_source": receipt["source"],
+        "receipt_source_revision": receipt["source_revision"],
+    }
+
+
+def _validate_recovery_proof(proof: object) -> dict:
+    if not isinstance(proof, dict) or set(proof) != PROOF_FIELDS or proof.get("schema_version") != 1 \
+            or proof.get("kind") != "source-recovery-proof":
+        raise UpgradeError("missing or invalid source-recovery proof")
+    for key in ("task_id", "branch", "worktree", "authority_head", "authority_nonce",
+                "receipt_sha256", "receipt_bytes_sha256", "changed_paths_sha256",
+                "path_fingerprints_sha256", "implementation_source", "implementation_revision",
+                "receipt_source", "receipt_source_revision"):
+        if not isinstance(proof[key], str) or not proof[key]:
+            raise UpgradeError("missing or invalid source-recovery proof")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", proof["implementation_revision"]):
+        raise UpgradeError("invalid source-recovery implementation revision")
+    for key in ("receipt_sha256", "receipt_bytes_sha256", "changed_paths_sha256", "path_fingerprints_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", proof[key]):
+            raise UpgradeError("invalid source-recovery proof digest")
+    return proof
+
+
+def _validate_recovery_records(repo: Path, receipt: dict, raw_receipt: bytes, proof: dict) -> Path:
+    expected = _recovery_proof(
+        receipt,
+        implementation_source=Path(proof["implementation_source"]),
+        implementation_revision=proof["implementation_revision"],
+        raw_receipt=raw_receipt,
+        paths=receipt["changed_paths"],
+        fingerprints=receipt["path_fingerprints"],
+    )
+    if proof != expected:
+        raise UpgradeError("source-recovery proof does not match the reconstructed receipt")
+    authority = _read_json_record(_bridge_authority_path(repo), "missing or invalid source-recovery authority")
+    if authority != _bridge_authority(receipt, hashlib.sha256(canonical_json(proof)).hexdigest()):
+        raise UpgradeError("source-recovery authority does not match its proof")
+    return _bridge_authority_path(repo)
+
+
+def recover_maintenance_authority_from_source(target_repo: Path, templates_source_root: Path) -> dict:
+    """Reconstruct and publish the source-recovery proof/bridge without touching target files."""
+    task_id, branch, worktree = require_maintenance(target_repo)
+    source, implementation_revision = resolve_clean_source_worktree(templates_source_root)
+    active = receipt_path(target_repo)
+    if not active.is_file():
+        raise UpgradeError("no active automation upgrade receipt")
+    try:
+        raw_receipt = active.read_bytes()
+        receipt = validate_receipt_schema(json.loads(raw_receipt.decode("utf-8")))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise UpgradeError("invalid automation upgrade receipt") from exc
+    receipt_scope = receipt_paths(target_repo, receipt)
+    if receipt["source_revision"] is None or not _source_is_compatible(receipt["source"], source):
+        raise UpgradeError("receipt source is not compatible with the current Templates source")
+    receipt_revision = _validate_source_revision(source, receipt["source_revision"])
+    if (receipt["task_id"], receipt["branch"], receipt["worktree"]) != (task_id, branch, str(worktree)):
+        raise UpgradeError("automation receipt identity does not match the current Task worktree")
+    _validate_no_authority(target_repo)
+    authority_head = receipt["authority_head"]
+    authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=target_repo).stdout.strip()
+    authority_registration = registered_worktrees(target_repo).get(worktree)
+    pending_before = pending_paths(target_repo)
+    for pending in pending_before:
+        reject_bootstrap_path(target_repo, pending)
+    with tempfile.TemporaryDirectory(prefix="automation-source-recovery-", dir=task_state_dir(target_repo)) as temporary:
+        baseline = Path(temporary) / "baseline"
+        snapshot, source_core = materialize_source_snapshot(source, receipt_revision, Path(temporary))
+        materialize_tree(target_repo, authority_head, baseline, surface_only=True)
+        before = {
+            path.relative_to(baseline).as_posix(): bootstrap_fingerprint(baseline, path.relative_to(baseline).as_posix())
+            for path in baseline.rglob("*") if path.is_file()
+        }
+        plan = build_plan(baseline, snapshot)
+        if plan["blockers"]:
+            raise UpgradeError("reconstruction blocked:\n- " + "\n- ".join(plan["blockers"]))
+        selected = [migration for migration in load_migrations(source_core)
+                    if migration.to_version <= version_number(source_core)]
+        _, migration_blockers, _ = migration_actions(target_repo, selected)
+        if migration_blockers:
+            raise UpgradeError("reconstruction blocked:\n- " + "\n- ".join(migration_blockers))
+        returned = {item["path"] for item in plan["actions"] if item["action"] != "noop"}
+        apply_plan_to_tree(baseline, source_core, plan)
+        expected = sorted(path for path in returned
+                          if before.get(path, {"state": "absent", "mode": None, "content_sha256": None})
+                          != bootstrap_fingerprint(baseline, path))
+        expected_fingerprints = {path: bootstrap_fingerprint(baseline, path) for path in expected}
+        candidate_versions = (plan["currentVersion"], plan["upstreamVersion"])
+    if pending_before != expected or expected != receipt_scope \
+            or any(file_fingerprint(target_repo, p) != expected_fingerprints[p] for p in expected):
+        raise UpgradeError("pending target paths do not match the reconstructed upgrade")
+    if git_head(target_repo) != authority_head or authority_branch_oid != authority_head \
+            or require_registered_task(target_repo, task_id) != (task_id, branch, worktree) \
+            or registered_worktrees(target_repo).get(worktree) != authority_registration:
+        raise UpgradeError("Task identity or HEAD changed during source recovery")
+    actual_fingerprints = {p: file_fingerprint(target_repo, p) for p in expected}
+    candidate = {
+        "schema_version": 1, "status": "active", "task_id": task_id, "branch": branch,
+        "worktree": str(worktree), "source": receipt["source"], "source_revision": receipt_revision,
+        "current_version": candidate_versions[0], "upstream_version": candidate_versions[1],
+        "changed_paths": receipt_scope, "authority_head": authority_head,
+        "authority_nonce": receipt["authority_nonce"], "path_fingerprints": actual_fingerprints,
+    }
+    if active.read_bytes() != raw_receipt or candidate != receipt:
+        raise UpgradeError("receipt or target changed during source recovery")
+    proof = _recovery_proof(receipt, implementation_source=source, implementation_revision=implementation_revision,
+                            raw_receipt=raw_receipt, paths=expected, fingerprints=actual_fingerprints)
+    proof_path = source_recovery_proof_path(target_repo)
+    created_proof: tuple[int, int] | None = None
+    try:
+        proof_admin = worktree_admin_dir(target_repo)
+        _validate_admin_record_parent(proof_path, proof_admin)
+        if os.path.lexists(proof_path):
+            existing = _validate_recovery_proof(_read_json_record(proof_path, "missing or invalid source-recovery proof"))
+            if existing != proof:
+                raise UpgradeError("existing source-recovery proof does not match reconstruction")
+        else:
+            created_proof = exclusive_json_write_contained(proof_path, proof, admin=proof_admin)
+        current_source, current_implementation_revision = resolve_clean_source_worktree(source)
+        if current_source != source or current_implementation_revision != implementation_revision:
+            raise UpgradeError("source changed before source-recovery publication")
+        if active.read_bytes() != raw_receipt or authority_exists(target_repo):
+            raise UpgradeError("receipt or authority changed before source-recovery bridge publication")
+        if (git_head(target_repo) != authority_head
+                or run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=target_repo).stdout.strip() != authority_branch_oid
+                or require_registered_task(target_repo, task_id) != (task_id, branch, worktree)
+                or registered_worktrees(target_repo).get(worktree) != authority_registration
+                or pending_paths(target_repo) != pending_before
+                or receipt_paths(target_repo, receipt) != receipt_scope
+                or any(file_fingerprint(target_repo, p) != expected_fingerprints[p] for p in expected)):
+            raise UpgradeError("target changed before source-recovery bridge publication")
+        if _validate_recovery_proof(_read_json_record(proof_path, "missing or invalid source-recovery proof")) != proof:
+            raise UpgradeError("source-recovery proof changed before bridge publication")
+        _write_authority_at(_bridge_authority_path(target_repo), _bridge_authority(receipt, hashlib.sha256(canonical_json(proof)).hexdigest()),
+                            admin=worktree_admin_dir(target_repo))
+    except (OSError, UpgradeError):
+        if created_proof is not None:
+            try:
+                metadata = proof_path.lstat()
+                if (metadata.st_dev, metadata.st_ino) == created_proof:
+                    proof_path.unlink()
+            except OSError as exc:
+                raise UpgradeError("source-recovery publication failed and proof rollback failed") from exc
+        raise
+    return {"status": "AUTHORITY_RECOVERED", "changedPaths": expected,
+            "implementationRevision": implementation_revision, "receiptSourceRevision": receipt_revision}
+
+
 def validate_receipt_path(raw: object) -> str:
     if not isinstance(raw, str) or not raw or "\\" in raw:
         raise UpgradeError("receipt contains an unsafe path")
@@ -1468,7 +1771,7 @@ def normalized_git_fingerprint(fingerprint: object) -> dict[str, object]:
     }
 
 
-def commit(repo: Path, task: str, message: str) -> dict[str, str]:
+def _commit_mode(repo: Path, task: str, message: str, mode: str, *, source_root: Path | None = None) -> dict[str, object]:
     _, branch, worktree = require_registered_task(repo, task)
     active = receipt_path(repo)
     state_dir = task_state_dir(repo)
@@ -1478,7 +1781,7 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
         raise UpgradeError("no active successful automation upgrade receipt")
     try:
         receipt = json.loads(active.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise UpgradeError("invalid automation upgrade receipt") from exc
     receipt = validate_receipt_schema(receipt)
     if (receipt.get("task_id"), receipt.get("branch"), receipt.get("worktree")) != (task, branch, str(worktree)):
@@ -1493,7 +1796,29 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
         raise UpgradeError("automation receipt path content/state fingerprint changed")
     if pending_paths(repo) != paths:
         raise UpgradeError("pending paths do not exactly match the automation receipt")
-    authority = validate_authority(repo, receipt)
+    proof_path = source_recovery_proof_path(repo)
+    proof: dict | None = None
+    proof_raw: bytes | None = None
+    if mode == "standard":
+        authority = validate_authority(repo, receipt)
+    elif mode == "source_recovery":
+        proof_admin = worktree_admin_dir(repo)
+        _validate_admin_record_parent(proof_path, proof_admin)
+        proof_raw, proof_record = _read_json_record_bytes(proof_path, "missing or invalid source-recovery proof")
+        proof = _validate_recovery_proof(proof_record)
+        source, current_revision = resolve_clean_source_worktree(Path(proof["implementation_source"]))
+        if (proof["implementation_source"] != str(source)
+                or proof["implementation_revision"] != current_revision
+                or (source_root is not None and source_root != source)):
+            raise UpgradeError("source-recovery proof implementation is stale")
+        if not _source_is_compatible(receipt["source"], source):
+            raise UpgradeError("source-recovery receipt source is incompatible")
+        _validate_source_revision(source, receipt["source_revision"])
+        authority = _validate_recovery_records(repo, receipt, active.read_bytes(), proof)
+        if proof_path.read_bytes() != proof_raw:
+            raise UpgradeError("source-recovery proof changed before commit mutation")
+    else:  # pragma: no cover
+        raise UpgradeError("unsupported commit mode")
 
     consumed = consumed_receipt_path(repo)
     consumed_receipt = dict(receipt)
@@ -1504,6 +1829,7 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
     commit_sha = ""
     active_moved = False
     authority_removed = False
+    proof_removed = False
     consumed_instances: set[tuple[int, int]] = set()
     try:
         if os.path.lexists(consumed):
@@ -1519,6 +1845,9 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
         consumed_instances.add((consumed_metadata.st_dev, consumed_metadata.st_ino))
         authority.unlink(missing_ok=True)
         authority_removed = True
+        if mode == "source_recovery" and proof is not None:
+            proof_path.unlink()
+            proof_removed = True
         task_state_dir(repo)
         private_index.unlink(missing_ok=True)
         index_environment = {"GIT_INDEX_FILE": str(private_index)}
@@ -1571,24 +1900,25 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
         run(["git", "reset", "-q", commit_sha, "--", *paths], cwd=repo)
     except (UpgradeError, OSError) as failure:
         if committed:
-            if isinstance(failure, OSError):
-                raise UpgradeError("commit finalization failed") from failure
-            raise
+            raise UpgradeError(
+                f"commit {commit_sha} was published but finalization failed"
+            ) from failure
         rollback_errors: list[str] = []
         try:
+            if proof_removed and proof is not None:
+                if proof_raw is None:
+                    raise UpgradeError("source-recovery proof bytes were not captured")
+                exclusive_bytes_write_contained(proof_path, proof_raw, admin=worktree_admin_dir(repo))
+        except (OSError, UpgradeError) as rollback_error:
+            rollback_errors.append(f"proof restore failed: {rollback_error}")
+        try:
             if authority_removed:
-                _write_authority_at(
-                    authority,
-                    {
-                        "schema_version": 1,
-                        "task_id": receipt["task_id"],
-                        "branch": receipt["branch"],
-                        "worktree": receipt["worktree"],
-                        "authority_nonce": receipt["authority_nonce"],
-                        "receipt_sha256": receipt_digest(receipt),
-                    },
-                    admin=_rollback_authority_guard(repo, authority),
-                )
+                restored = _bridge_authority(receipt, hashlib.sha256(canonical_json(proof)).hexdigest()) if mode == "source_recovery" and proof is not None else {
+                    "schema_version": 1, "task_id": receipt["task_id"], "branch": receipt["branch"],
+                    "worktree": receipt["worktree"], "authority_nonce": receipt["authority_nonce"],
+                    "receipt_sha256": receipt_digest(receipt),
+                }
+                _write_authority_at(authority, restored, admin=_rollback_authority_guard(repo, authority))
         except (OSError, UpgradeError) as rollback_error:
             rollback_errors.append(f"authority restore failed: {rollback_error}")
         try:
@@ -1622,7 +1952,29 @@ def commit(repo: Path, task: str, message: str) -> dict[str, str]:
             private_index.unlink(missing_ok=True)
         except OSError as cleanup_error:
             raise UpgradeError("private index cleanup failed") from cleanup_error
-    return {"status": "COMMITTED", "commit_sha": commit_sha}
+    result: dict[str, str | bool | list[str]] = {
+        "status": "COMMITTED", "commit_sha": commit_sha,
+    }
+    if mode == "source_recovery":
+        result.update({
+            "commitCreated": True,
+            "changedPaths": paths,
+            "pushPerformed": False,
+            "mergePerformed": False,
+        })
+    return result
+
+
+def commit(repo: Path, task: str, message: str) -> dict[str, object]:
+    return _commit_mode(repo, task, message, "standard")
+
+
+def commit_recovered_maintenance(target_repo: Path, templates_source_root: Path, task: str, message: str) -> dict[str, object]:
+    """Commit only a proof-bound source recovery; no network or merge operation is performed."""
+    # The source argument is deliberately checked before the receipt is opened, and
+    # is not a target mutation/apply hook.
+    source, _ = resolve_clean_source_worktree(templates_source_root)
+    return _commit_mode(target_repo, task, message, "source_recovery", source_root=source)
 
 
 def parser() -> argparse.ArgumentParser:

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import os
 import shutil
+import shlex
 import subprocess
 import tarfile
 import threading
@@ -257,6 +258,73 @@ mod project 'just/project/mod.just'
         environment = os.environ.copy()
         environment["AUTOMATION_MAINTENANCE"] = "1"
         result = subprocess.run(["python3", ".automation/bin/automation_upgrade.py", *args], cwd=repo, env=environment, text=True, capture_output=True, check=False)
+        if check:
+            self.assertEqual(0, result.returncode, result.stderr)
+        return result
+
+    def _source_recovery_bridge_fixture(self, root: Path) -> tuple[Path, Path, Path, dict]:
+        """Build the two-generation, shared-object source-recovery topology."""
+        bridge = root / "templates-bridge"
+        self._git(["clone", "--shared", "--no-checkout", str(ROOT), str(bridge)], ROOT)
+        self._git(["switch", "--detach", "HEAD"], bridge)
+        implementation = (
+            "components/agent-core/.automation/bin/automation_upgrade.py",
+            "tools/automation_recovery_bridge.py",
+            "just/agent-core.just",
+        )
+        for relative in implementation:
+            destination = bridge / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, destination)
+        self._git(["config", "user.name", "Test User"], bridge)
+        self._git(["config", "user.email", "test@example.invalid"], bridge)
+        self._git(["add", *implementation], bridge)
+        self._git(["commit", "--allow-empty", "-m", "source recovery bridge implementation"], bridge)
+        bridge_head = self._git(["rev-parse", "HEAD"], bridge)
+        source = root / "source-v3.0.1"
+        source_revision = "b61341feee36eaf16fc37c91323f1da9cb3d671f"
+        self.assertEqual(source_revision, self._git(["rev-parse", "v3.0.1^{commit}"], bridge))
+        self._git(["worktree", "add", "--detach", str(source), source_revision], bridge)
+        self.assertEqual(source_revision, self._git(["rev-parse", "HEAD"], source))
+        self.assertNotEqual(source_revision, bridge_head)
+        _, task, _ = self._separate_git_topology_fixture(root / "consumer")
+        self.assertTrue((task / ".git").is_file())
+        old_script = task / ".automation/bin/automation_upgrade.py"
+        old_result = json.loads(self._cli(task, ["upgrade", "--source", str(source)]).stdout)
+        self.assertEqual("APPLIED", old_result["status"])
+        old_script_bytes = old_script.read_bytes()
+        bootstrap_result = json.loads(self._cli(task, ["bootstrap-receipt", "--source", str(source)]).stdout)
+        self.assertEqual("RECEIPT_BOOTSTRAPPED", bootstrap_result["status"])
+        receipt = self._receipt(task)
+        receipt_bound = {
+            path: ((task / Path(*path.split("/"))).read_bytes(), (task / Path(*path.split("/"))).stat().st_mode & 0o777)
+            for path in receipt["changed_paths"]
+        }
+        new_authority, legacy_authority = upgrade._authority_locations(task)
+        self.assertFalse(new_authority.exists())
+        self.assertIsNotNone(legacy_authority)
+        assert legacy_authority is not None
+        self.assertTrue(legacy_authority.is_file())
+        legacy_authority.unlink()
+        metadata = {
+            "bridge_head": bridge_head,
+            "source_revision": source_revision,
+            "old_script": old_script_bytes,
+            "receipt_bound": receipt_bound,
+            "receipt": receipt,
+            "old_result": old_result,
+            "legacy_authority": legacy_authority,
+            "remote_refs": self._git(["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes"], task),
+        }
+        return bridge, source, task, metadata
+
+    def _bridge_cli(self, bridge: Path, command: str, target: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        environment["AUTOMATION_MAINTENANCE"] = "1"
+        result = subprocess.run(
+            ["python3", "tools/automation_recovery_bridge.py", command, str(target), *args],
+            cwd=bridge, env=environment, text=True, capture_output=True, check=False,
+        )
         if check:
             self.assertEqual(0, result.returncode, result.stderr)
         return result
@@ -1734,6 +1802,350 @@ mod project 'just/project/mod.just'
             self.assertNotEqual(0, result.returncode)
             self.assertIn("non-empty pending paths", result.stderr)
             self.assertFalse(upgrade.authority_path(task).exists())
+
+    def test_issue_85_real_bridge_recovers_and_commits_only_the_old_upgrade(self) -> None:
+        repository_status = self._git(["status", "--porcelain=v1"], ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, source, task, metadata = self._source_recovery_bridge_fixture(Path(directory))
+            receipt_before = metadata["receipt"]
+            receipt_bytes = upgrade.receipt_path(task).read_bytes()
+            recovered = json.loads(self._bridge_cli(bridge, "recover-maintenance-authority", task).stdout)
+            self.assertEqual("AUTHORITY_RECOVERED", recovered["status"])
+            self.assertEqual(metadata["source_revision"], recovered["receiptSourceRevision"])
+            self.assertNotEqual(metadata["source_revision"], recovered["implementationRevision"])
+            self.assertEqual(metadata["source_revision"], receipt_before["source_revision"])
+            self.assertEqual(receipt_bytes, upgrade.receipt_path(task).read_bytes())
+            self.assertEqual(metadata["old_script"], (task / ".automation/bin/automation_upgrade.py").read_bytes())
+            for path, (content, mode) in metadata["receipt_bound"].items():
+                target = task / Path(*path.split("/"))
+                self.assertEqual(content, target.read_bytes(), path)
+                self.assertEqual(mode, target.stat().st_mode & 0o777, path)
+            proof = json.loads(upgrade.source_recovery_proof_path(task).read_text(encoding="utf-8"))
+            authority = json.loads(upgrade.authority_path(task).read_text(encoding="utf-8"))
+            self.assertEqual(1, proof["schema_version"])
+            self.assertEqual("source-recovery-proof", proof["kind"])
+            self.assertEqual(2, authority["schema_version"])
+            self.assertEqual("source-recovery-bridge", authority["kind"])
+            self.assertEqual(str(bridge.resolve()), proof["implementation_source"])
+            self.assertEqual(metadata["bridge_head"], proof["implementation_revision"])
+
+            old_head = self._git(["rev-parse", "HEAD"], task)
+            committed = json.loads(self._bridge_cli(
+                bridge, "commit-recovered-maintenance", task, "TASK-83", "source recovery"
+            ).stdout)
+            self.assertEqual("COMMITTED", committed["status"])
+            self.assertTrue(committed["commitCreated"])
+            self.assertFalse(committed["pushPerformed"])
+            self.assertFalse(committed["mergePerformed"])
+            self.assertEqual(receipt_before["changed_paths"], committed["changedPaths"])
+            self.assertEqual(committed["commit_sha"], self._git(["rev-parse", "HEAD"], task))
+            self.assertNotEqual(receipt_before["authority_head"], committed["commit_sha"])
+            self.assertEqual(receipt_before["authority_head"], old_head)
+            self.assertEqual(old_head, self._git(["show", "-s", "--format=%P", "HEAD"], task))
+            self.assertEqual(receipt_before["changed_paths"], sorted(self._git(
+                ["show", "--pretty=", "--name-only", "HEAD"], task
+            ).splitlines()))
+            self.assertFalse(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+            self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+            consumed = json.loads(upgrade.consumed_receipt_path(task).read_text(encoding="utf-8"))
+            self.assertEqual("consumed", consumed["status"])
+            self.assertEqual(committed["commit_sha"], consumed["commit_sha"])
+            self.assertNotIn(".automation/ADAPTER", receipt_before["changed_paths"])
+            self.assertFalse(any(path.startswith("just/project/") for path in receipt_before["changed_paths"]))
+            self.assertNotIn(".task-state/task.md", receipt_before["changed_paths"])
+            self.assertEqual(metadata["remote_refs"], self._git(
+                ["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes"], task
+            ))
+        self.assertEqual(repository_status, self._git(["status", "--porcelain=v1"], ROOT))
+
+    def test_issue_85_bridge_contract_and_rejection_matrix(self) -> None:
+        root_justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+        self.assertIn("mod agent-core 'just/agent-core.just'", root_justfile)
+        justfile = (ROOT / "just/agent-core.just").read_text(encoding="utf-8")
+        self.assertIn("root := justfile_directory()", justfile)
+        self.assertIn("tools/automation_recovery_bridge.py", justfile)
+        self.assertIn("recover-maintenance-authority", justfile)
+        self.assertIn("commit-recovered-maintenance", justfile)
+        for forbidden in ("git push", "git merge", "apply"):
+            self.assertNotIn(forbidden, justfile)
+        if shutil.which("just") is None:
+            self.skipTest("just is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "target with spaces"
+            for recipe, arguments in (
+                ("agent-core::recover-maintenance-authority", [str(target)]),
+                ("agent-core::commit-recovered-maintenance", [str(target), "TASK-83", "quoted message"]),
+            ):
+                result = subprocess.run(
+                    ["just", "--dry-run", recipe, *arguments],
+                    cwd=ROOT, text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                output = result.stdout + result.stderr
+                self.assertIn(str((ROOT / "tools/automation_recovery_bridge.py").resolve()), output)
+                self.assertIn(shlex.quote(str(target)), output)
+                self.assertNotIn(".automation/bin/automation_upgrade.py", output)
+                if recipe.endswith("commit-recovered-maintenance"):
+                    self.assertIn(shlex.quote("TASK-83"), output)
+                    self.assertIn(shlex.quote("quoted message"), output)
+
+        for kind in ("missing", "unrelated", "unknown-revision", "unclean-bridge"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                bridge, source, task, metadata = self._source_recovery_bridge_fixture(Path(directory))
+                if kind == "missing":
+                    missing = Path(directory) / "missing-source"
+                    receipt = metadata["receipt"] | {"source": str(missing.resolve())}
+                    upgrade.atomic_json_write(upgrade.receipt_path(task), receipt)
+                elif kind == "unrelated":
+                    unrelated = Path(directory) / "unrelated"
+                    self._task_repo(unrelated)
+                    receipt = metadata["receipt"] | {"source": str(unrelated.resolve())}
+                    upgrade.atomic_json_write(upgrade.receipt_path(task), receipt)
+                elif kind == "unknown-revision":
+                    receipt = metadata["receipt"] | {"source_revision": "0" * 40}
+                    upgrade.atomic_json_write(upgrade.receipt_path(task), receipt)
+                else:
+                    self._write_file(bridge / "dirty-bridge", "dirty\n")
+                result = self._bridge_cli(bridge, "recover-maintenance-authority", task, check=False)
+                self.assertNotEqual(0, result.returncode)
+                self.assertFalse(upgrade.authority_path(task).exists())
+
+    def test_issue_85_bridge_rolls_back_source_recovery_publication_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, source, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+            original = upgrade._write_authority_at
+            calls = 0
+
+            def fail_once(path: Path, value: dict, *, admin: Path | None = None) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise upgrade.UpgradeError("injected bridge publication failure")
+                original(path, value, admin=admin)
+
+            with mock.patch.object(upgrade, "_write_authority_at", side_effect=fail_once):
+                with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                    with self.assertRaisesRegex(upgrade.UpgradeError, "injected bridge publication failure"):
+                        upgrade.recover_maintenance_authority_from_source(task, bridge)
+            self.assertTrue(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+            self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+            retry = json.loads(self._bridge_cli(bridge, "recover-maintenance-authority", task).stdout)
+            self.assertEqual("AUTHORITY_RECOVERED", retry["status"])
+
+    def test_issue_85_recovery_rejects_authority_appearing_during_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+            with mock.patch.object(upgrade, "authority_exists", return_value=True):
+                with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                    with self.assertRaisesRegex(upgrade.UpgradeError, "changed before source-recovery bridge publication"):
+                        upgrade.recover_maintenance_authority_from_source(task, bridge)
+            self.assertTrue(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+            self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+
+    def test_issue_85_proof_only_interruption_retries_without_rewriting_receipt_or_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+            first = json.loads(self._bridge_cli(bridge, "recover-maintenance-authority", task).stdout)
+            self.assertEqual("AUTHORITY_RECOVERED", first["status"])
+            receipt_bytes = upgrade.receipt_path(task).read_bytes()
+            proof_bytes = upgrade.source_recovery_proof_path(task).read_bytes()
+            authority = upgrade.authority_path(task)
+            authority_record = json.loads(authority.read_text(encoding="utf-8"))
+            self.assertEqual(2, authority_record["schema_version"])
+            authority.unlink()
+            retry = json.loads(self._bridge_cli(bridge, "recover-maintenance-authority", task).stdout)
+            self.assertEqual("AUTHORITY_RECOVERED", retry["status"])
+            self.assertEqual(receipt_bytes, upgrade.receipt_path(task).read_bytes())
+            self.assertEqual(proof_bytes, upgrade.source_recovery_proof_path(task).read_bytes())
+            self.assertTrue(upgrade.authority_path(task).is_file())
+            committed = json.loads(self._bridge_cli(
+                bridge, "commit-recovered-maintenance", task, "TASK-83", "proof retry"
+            ).stdout)
+            self.assertEqual("COMMITTED", committed["status"])
+
+    def test_issue_85_cli_rejects_unregistered_outside_and_malformed_targets(self) -> None:
+        for kind in ("unregistered", "outside", "malformed"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+                target = task
+                if kind == "unregistered":
+                    state = task / ".task-state/task.md"
+                    state.write_text(state.read_text(encoding="utf-8").replace(
+                        "task/TASK-83-linked", "task/TASK-83-unregistered"
+                    ), encoding="utf-8")
+                elif kind == "outside":
+                    target = Path(directory) / "outside-target"
+                    self._task_repo(target, task="TASK-OUTSIDE")
+                else:
+                    upgrade.receipt_path(task).write_text("not-json\n", encoding="utf-8")
+                result = self._bridge_cli(bridge, "recover-maintenance-authority", target, check=False)
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+                self.assertFalse(upgrade.authority_path(task).exists())
+                self.assertFalse(upgrade.source_recovery_proof_path(target).exists())
+                self.assertFalse(upgrade.authority_path(target).exists())
+
+    def test_issue_85_tampered_proof_cannot_commit_or_change_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+            self._bridge_cli(bridge, "recover-maintenance-authority", task)
+            active = upgrade.receipt_path(task)
+            authority = upgrade.authority_path(task)
+            proof = upgrade.source_recovery_proof_path(task)
+            active_bytes = active.read_bytes()
+            authority_bytes = authority.read_bytes()
+            record = json.loads(proof.read_text(encoding="utf-8"))
+            record["proof_sha256"] = "0" * 64
+            proof.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+            head = self._git(["rev-parse", "HEAD"], task)
+            refs = self._git(["for-each-ref", "--format=%(refname) %(objectname)"], task)
+            result = self._bridge_cli(
+                bridge, "commit-recovered-maintenance", task, "TASK-83", "tampered proof", check=False
+            )
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn("ERROR:", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(active_bytes, active.read_bytes())
+            self.assertEqual(authority_bytes, authority.read_bytes())
+            self.assertEqual(head, self._git(["rev-parse", "HEAD"], task))
+            self.assertEqual(refs, self._git(["for-each-ref", "--format=%(refname) %(objectname)"], task))
+
+    def test_issue_85_commit_cli_rejects_malformed_and_invalid_utf8_active_receipts(self) -> None:
+        for payload in (b"not-json\n", b"\xff\xfe\n"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as directory:
+                bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+                self._bridge_cli(bridge, "recover-maintenance-authority", task)
+                upgrade.receipt_path(task).write_bytes(payload)
+                upgrade.source_recovery_proof_path(task).unlink()
+                upgrade.authority_path(task).unlink()
+                result = self._bridge_cli(
+                    bridge, "commit-recovered-maintenance", task, "TASK-83", "malformed receipt", check=False
+                )
+                self.assertEqual(2, result.returncode)
+                self.assertIn("ERROR:", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+                self.assertFalse(upgrade.authority_path(task).exists())
+
+    def test_issue_85_published_commit_finalization_failure_is_not_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+            self._bridge_cli(bridge, "recover-maintenance-authority", task)
+            old_head = self._git(["rev-parse", "HEAD"], task)
+            remote_refs = self._git(["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes"], task)
+            original_run = upgrade.run
+
+            def fail_final_reset(command, *args, **kwargs):
+                if len(command) >= 3 and command[:3] == ["git", "reset", "-q"]:
+                    raise OSError("injected final reset failure")
+                return original_run(command, *args, **kwargs)
+
+            with mock.patch.object(upgrade, "run", side_effect=fail_final_reset):
+                with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                    with self.assertRaisesRegex(
+                        upgrade.UpgradeError,
+                        r"commit [0-9a-f]{40,64} was published but finalization failed",
+                    ):
+                        upgrade.commit_recovered_maintenance(task, bridge, "TASK-83", "published failure")
+            consumed = json.loads(upgrade.consumed_receipt_path(task).read_text(encoding="utf-8"))
+            commit_sha = consumed["commit_sha"]
+            self.assertEqual("consumed", consumed["status"])
+            self.assertEqual(commit_sha, self._git(["rev-parse", "HEAD"], task))
+            self.assertEqual(commit_sha, self._git(["rev-parse", "refs/heads/task/TASK-83-linked"], task))
+            self.assertEqual(old_head, self._git(["show", "-s", "--format=%P", "HEAD"], task))
+            self.assertEqual("1", self._git(["rev-list", "--count", f"{old_head}..{commit_sha}"], task))
+            self.assertNotEqual(old_head, commit_sha)
+            self.assertFalse(upgrade.receipt_path(task).exists())
+            self.assertFalse(upgrade.authority_path(task).exists())
+            self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+            self.assertEqual(remote_refs, self._git(
+                ["for-each-ref", "--format=%(refname) %(objectname)", "refs/remotes"], task
+            ))
+
+    def test_issue_85_source_commit_failure_restores_bridge_records_and_cli_retry_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, _, task, _ = self._source_recovery_bridge_fixture(Path(directory))
+            recovered = json.loads(self._bridge_cli(bridge, "recover-maintenance-authority", task).stdout)
+            self.assertEqual("AUTHORITY_RECOVERED", recovered["status"])
+            active = upgrade.receipt_path(task)
+            authority = upgrade.authority_path(task)
+            proof = upgrade.source_recovery_proof_path(task)
+            active_bytes, authority_bytes, proof_bytes = active.read_bytes(), authority.read_bytes(), proof.read_bytes()
+            original_run = upgrade.run
+
+            def fail_staging_check(command, *args, **kwargs):
+                if command == ["git", "diff", "--no-ext-diff", "--cached", "--check"]:
+                    raise upgrade.UpgradeError("injected source commit staging failure")
+                return original_run(command, *args, **kwargs)
+
+            with mock.patch.object(upgrade, "run", side_effect=fail_staging_check):
+                with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                    with self.assertRaisesRegex(upgrade.UpgradeError, "injected source commit staging failure"):
+                        upgrade.commit_recovered_maintenance(task, bridge, "TASK-83", "injected failure")
+            self.assertEqual(active_bytes, active.read_bytes())
+            self.assertEqual(authority_bytes, authority.read_bytes())
+            self.assertEqual(proof_bytes, proof.read_bytes())
+            self.assertFalse(upgrade.consumed_receipt_path(task).exists())
+            retry = json.loads(self._bridge_cli(
+                bridge, "commit-recovered-maintenance", task, "TASK-83", "retry"
+            ).stdout)
+            self.assertEqual("COMMITTED", retry["status"])
+
+    def test_issue_85_receipt_change_and_target_rejections_leave_no_bridge_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bridge, _, task, metadata = self._source_recovery_bridge_fixture(Path(directory))
+            active = upgrade.receipt_path(task)
+            original_read_bytes = Path.read_bytes
+            reads = 0
+
+            def changing_receipt(path: Path):
+                nonlocal reads
+                value = original_read_bytes(path)
+                if path == active:
+                    reads += 1
+                    if reads == 2:
+                        return value + b"changed during recovery"
+                return value
+
+            with mock.patch.object(Path, "read_bytes", autospec=True, side_effect=changing_receipt):
+                with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                    with self.assertRaisesRegex(upgrade.UpgradeError, "receipt or target changed"):
+                        upgrade.recover_maintenance_authority_from_source(task, bridge)
+            self.assertFalse(upgrade.authority_path(task).exists())
+            self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
+
+        for kind in ("version", "fingerprint", "head", "pending", "content", "mode"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                bridge, _, task, metadata = self._source_recovery_bridge_fixture(Path(directory))
+                receipt = metadata["receipt"]
+                path = receipt["changed_paths"][0]
+                target = task / Path(*path.split("/"))
+                if kind == "version":
+                    upgrade.atomic_json_write(active := upgrade.receipt_path(task), receipt | {"current_version": "999"})
+                elif kind == "fingerprint":
+                    fingerprints = dict(receipt["path_fingerprints"])
+                    fingerprints[path] = dict(fingerprints[path], content_sha256="0" * 64)
+                    upgrade.atomic_json_write(upgrade.receipt_path(task), receipt | {"path_fingerprints": fingerprints})
+                elif kind == "head":
+                    self._write_file(task / "HEAD-tamper", "head\n")
+                    self._git(["add", "HEAD-tamper"], task)
+                    self._git(["commit", "-m", "head tamper"], task)
+                elif kind == "pending":
+                    self._write_file(task / ".automation/pending-extra", "pending\n")
+                elif kind == "content":
+                    target.write_bytes(target.read_bytes() + b"tampered")
+                else:
+                    target.chmod(target.stat().st_mode ^ 0o100)
+                with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                    with self.assertRaises(upgrade.UpgradeError):
+                        upgrade.recover_maintenance_authority_from_source(task, bridge)
+                self.assertFalse(upgrade.authority_path(task).exists())
+                self.assertFalse(upgrade.source_recovery_proof_path(task).exists())
 
 
 if __name__ == "__main__":
