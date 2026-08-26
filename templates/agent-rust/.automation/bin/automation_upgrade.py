@@ -525,7 +525,10 @@ def git_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key != "EMAIL"
+        if not key.startswith("GIT_")
+        and not key.startswith("LD_")
+        and not key.startswith("DYLD_")
+        and key != "EMAIL"
     }
     if overrides:
         environment.update(overrides)
@@ -554,6 +557,21 @@ def git_executable() -> Path:
     return executable
 
 
+def trusted_git_command(command: list[str]) -> list[str]:
+    if not command or command[0] != "git":
+        raise UpgradeError("trusted Git command must start with git")
+    return [
+        str(git_executable()),
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.pager=",
+        *command[1:],
+    ]
+
+
 def run(
     command: list[str],
     *,
@@ -564,7 +582,7 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     is_git = bool(command and command[0] == "git")
     environment = git_environment(env_overrides) if is_git else None
-    executable_command = [str(git_executable()), *command[1:]] if is_git else command
+    executable_command = trusted_git_command(command) if is_git else command
     result = subprocess.run(
         executable_command,
         cwd=cwd,
@@ -628,7 +646,7 @@ def git_bytes(command: list[str], *, cwd: Path) -> bytes:
     if not command or command[0] != "git":
         raise UpgradeError("byte helper only accepts Git commands")
     result = subprocess.run(
-        [str(git_executable()), *command[1:]],
+        trusted_git_command(command),
         cwd=cwd,
         capture_output=True,
         check=False,
@@ -686,6 +704,14 @@ def _validate_source_revision(source: Path, revision: object) -> str:
     result = run(["git", "rev-parse", "--verify", f"{revision}^{{commit}}"], cwd=source, check=False)
     if result.returncode != 0 or result.stdout.strip() != revision:
         raise UpgradeError("receipt source_revision is not a commit in the current source object database")
+    return revision
+
+
+def _validate_expected_implementation_revision(revision: object) -> str:
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+        raise UpgradeError(
+            "expected implementation revision must be a full lowercase hexadecimal Git revision"
+        )
     return revision
 
 
@@ -988,7 +1014,7 @@ def action_for(repo: Path, source_core: Path, relative: Path, ownership: dict[st
 
 def git_object_bytes(repo: Path, revision: str, path: str) -> bytes:
     result = subprocess.run(
-        [str(git_executable()), "show", f"{revision}:{path}"],
+        trusted_git_command(["git", "show", f"{revision}:{path}"]),
         cwd=repo,
         capture_output=True,
         check=False,
@@ -1553,10 +1579,20 @@ def _validate_recovery_records(repo: Path, receipt: dict, raw_receipt: bytes, pr
     return _bridge_authority_path(repo)
 
 
-def recover_maintenance_authority_from_source(target_repo: Path, templates_source_root: Path) -> dict:
+def recover_maintenance_authority_from_source(
+    target_repo: Path,
+    templates_source_root: Path,
+    *,
+    expected_implementation_revision: str,
+) -> dict:
     """Reconstruct and publish the source-recovery proof/bridge without touching target files."""
+    expected_implementation_revision = _validate_expected_implementation_revision(
+        expected_implementation_revision
+    )
     task_id, branch, worktree = require_maintenance(target_repo)
     source, implementation_revision = resolve_clean_source_worktree(templates_source_root)
+    if implementation_revision != expected_implementation_revision:
+        raise UpgradeError("source HEAD does not match the expected implementation revision")
     active = receipt_path(target_repo)
     if not active.is_file():
         raise UpgradeError("no active automation upgrade receipt")
@@ -1618,7 +1654,8 @@ def recover_maintenance_authority_from_source(target_repo: Path, templates_sourc
     }
     if active.read_bytes() != raw_receipt or candidate != receipt:
         raise UpgradeError("receipt or target changed during source recovery")
-    proof = _recovery_proof(receipt, implementation_source=source, implementation_revision=implementation_revision,
+    proof = _recovery_proof(receipt, implementation_source=source,
+                            implementation_revision=expected_implementation_revision,
                             raw_receipt=raw_receipt, paths=expected, fingerprints=actual_fingerprints)
     proof_path = source_recovery_proof_path(target_repo)
     created_proof: tuple[int, int] | None = None
@@ -1632,7 +1669,8 @@ def recover_maintenance_authority_from_source(target_repo: Path, templates_sourc
         else:
             created_proof = exclusive_json_write_contained(proof_path, proof, admin=proof_admin)
         current_source, current_implementation_revision = resolve_clean_source_worktree(source)
-        if current_source != source or current_implementation_revision != implementation_revision:
+        if (current_source != source
+                or current_implementation_revision != expected_implementation_revision):
             raise UpgradeError("source changed before source-recovery publication")
         if active.read_bytes() != raw_receipt or authority_exists(target_repo):
             raise UpgradeError("receipt or authority changed before source-recovery bridge publication")
@@ -1658,7 +1696,7 @@ def recover_maintenance_authority_from_source(target_repo: Path, templates_sourc
                 raise UpgradeError("source-recovery publication failed and proof rollback failed") from exc
         raise
     return {"status": "AUTHORITY_RECOVERED", "changedPaths": expected,
-            "implementationRevision": implementation_revision, "receiptSourceRevision": receipt_revision}
+            "implementationRevision": expected_implementation_revision, "receiptSourceRevision": receipt_revision}
 
 
 def validate_receipt_path(raw: object) -> str:
@@ -1736,7 +1774,7 @@ def staged_fingerprint(
         raise UpgradeError(f"staged path has an unsupported index entry: {path}")
     mode = fields[0]
     result = subprocess.run(
-        [str(git_executable()), "show", f":{path}"],
+        trusted_git_command(["git", "show", f":{path}"]),
         cwd=repo,
         capture_output=True,
         check=False,
@@ -1771,7 +1809,15 @@ def normalized_git_fingerprint(fingerprint: object) -> dict[str, object]:
     }
 
 
-def _commit_mode(repo: Path, task: str, message: str, mode: str, *, source_root: Path | None = None) -> dict[str, object]:
+def _commit_mode(
+    repo: Path,
+    task: str,
+    message: str,
+    mode: str,
+    *,
+    source_root: Path | None = None,
+    expected_implementation_revision: str | None = None,
+) -> dict[str, object]:
     _, branch, worktree = require_registered_task(repo, task)
     active = receipt_path(repo)
     state_dir = task_state_dir(repo)
@@ -1802,13 +1848,19 @@ def _commit_mode(repo: Path, task: str, message: str, mode: str, *, source_root:
     if mode == "standard":
         authority = validate_authority(repo, receipt)
     elif mode == "source_recovery":
+        if expected_implementation_revision is None:
+            raise UpgradeError("source-recovery commit requires an expected implementation revision")
+        expected_implementation_revision = _validate_expected_implementation_revision(
+            expected_implementation_revision
+        )
         proof_admin = worktree_admin_dir(repo)
         _validate_admin_record_parent(proof_path, proof_admin)
         proof_raw, proof_record = _read_json_record_bytes(proof_path, "missing or invalid source-recovery proof")
         proof = _validate_recovery_proof(proof_record)
         source, current_revision = resolve_clean_source_worktree(Path(proof["implementation_source"]))
         if (proof["implementation_source"] != str(source)
-                or proof["implementation_revision"] != current_revision
+                or proof["implementation_revision"] != expected_implementation_revision
+                or current_revision != expected_implementation_revision
                 or (source_root is not None and source_root != source)):
             raise UpgradeError("source-recovery proof implementation is stale")
         if not _source_is_compatible(receipt["source"], source):
@@ -1969,12 +2021,31 @@ def commit(repo: Path, task: str, message: str) -> dict[str, object]:
     return _commit_mode(repo, task, message, "standard")
 
 
-def commit_recovered_maintenance(target_repo: Path, templates_source_root: Path, task: str, message: str) -> dict[str, object]:
+def commit_recovered_maintenance(
+    target_repo: Path,
+    templates_source_root: Path,
+    task: str,
+    message: str,
+    *,
+    expected_implementation_revision: str,
+) -> dict[str, object]:
     """Commit only a proof-bound source recovery; no network or merge operation is performed."""
     # The source argument is deliberately checked before the receipt is opened, and
     # is not a target mutation/apply hook.
-    source, _ = resolve_clean_source_worktree(templates_source_root)
-    return _commit_mode(target_repo, task, message, "source_recovery", source_root=source)
+    expected_implementation_revision = _validate_expected_implementation_revision(
+        expected_implementation_revision
+    )
+    source, source_revision = resolve_clean_source_worktree(templates_source_root)
+    if source_revision != expected_implementation_revision:
+        raise UpgradeError("source HEAD does not match the expected implementation revision")
+    return _commit_mode(
+        target_repo,
+        task,
+        message,
+        "source_recovery",
+        source_root=source,
+        expected_implementation_revision=expected_implementation_revision,
+    )
 
 
 def parser() -> argparse.ArgumentParser:

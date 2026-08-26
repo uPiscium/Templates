@@ -282,6 +282,26 @@ uncommitted pair. There is no push or merge. The existing consumer script need n
 be replaced first. This is not a generic external apply/upgrade/commit
 primitive; normal consumer bootstrap and commit remain separate workflows.
 
+Both root bridge recipes use `python3 -I` for their small stdlib-only bootstrap:
+isolated mode excludes `PYTHONPATH`, the current directory, and user-site
+shadowing from bootstrap imports. The bootstrap resolves the root and trusted,
+root-owned, non-writable Git repository with scrubbed `GIT_*`, then verifies the
+full `HEAD` and the whole clean Templates worktree. It verifies the live
+bootstrap against the tracked `HEAD` blob, obtains the engine regular blob from
+the verified `HEAD` Git objects, materializes it privately, and executes the
+engine only afterward. The verified `HEAD` is passed to the engine; the engine
+independently repeats clean-source, root, and `HEAD` validation and requires
+equality before publishing authority. Thus `implementation_revision` is proven
+to be the blob-providing `HEAD`, and source races fail closed. Dirty bridge or
+engine files and module-shadow states are rejected before target authority or
+publication changes.
+
+The live bootstrap is the small initial trust anchor: its self-check detects
+accidental or concurrent divergence, but does not claim to defeat hostile
+replacement. That requires an external trusted launcher or signing mechanism.
+Hard-crash consistency remains out of scope; these safeguards do not change
+Issue #85 semantics or claim stronger durability.
+
 After a successful commit, the active receipt is consumed as `.task-state/automation-maintenance.consumed.json`. A later successful upgrade with changes replaces the active receipt and removes the prior consumed receipt; a no-change invocation returns `NO_CHANGES` and preserves existing receipt lifecycle evidence. There is no raw Git/GitHub bypass, and merge is excluded: the Main Orchestrator performs the separately gated integration/merge workflow.
 
 The upgrade system supports versioned removal migrations. Removals name explicit, exact Agent Core-managed paths; repository-owned and protected paths cannot be removed. Migration preconditions are checked before any mutation, and `.automation/VERSION` advances only after all deletion, creation, replacement, and merge actions succeed.
