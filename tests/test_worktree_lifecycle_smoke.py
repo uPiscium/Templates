@@ -314,6 +314,23 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
             self.assertNotEqual(0, reopen.returncode)
             self.assertIn("invalid Work Unit transition", reopen.stderr)
 
+    def test_oversized_auto_allocated_id_fails_without_persistence(self) -> None:
+        task = "T" * 124
+        worktree = self.start_task(task, "oversized")
+        work_units_path = worktree / ".task-state" / "work-units.json"
+
+        for command in (
+            ("work-unit-next", task),
+            ("work-unit-create", task, "general", "Must not persist an invalid ID"),
+        ):
+            rejected = run(
+                "python3", str(self.script), *command,
+                cwd=worktree, check=False, env=self.env,
+            )
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertIn("generated Work Unit ID is invalid", rejected.stderr)
+            self.assertFalse(work_units_path.exists())
+
     def test_synthetic_corrective_autopilot_lifecycle(self) -> None:
         worktree = self.start_task("TASK-3", "corrective")
 

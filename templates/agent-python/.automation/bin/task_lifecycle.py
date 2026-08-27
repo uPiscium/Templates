@@ -370,7 +370,10 @@ def next_work_unit_id(value: dict, task: str) -> str:
         for work_unit in value["units"]
         if (sequence := canonical_work_unit_sequence(task, work_unit)) is not None
     ]
-    return f"WU-{task}-{max(sequences, default=0) + 1:02d}"
+    work_unit = f"WU-{task}-{max(sequences, default=0) + 1:02d}"
+    if not WORK_UNIT_RE.fullmatch(work_unit):
+        raise LifecycleError(f"generated Work Unit ID is invalid: {work_unit!r}")
+    return work_unit
 
 
 def new_work_unit(work_unit: str, role: str, objective: str) -> dict:

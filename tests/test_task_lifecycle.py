@@ -72,6 +72,14 @@ class TaskLifecycleTest(unittest.TestCase):
             lifecycle.canonical_work_unit_sequence("TASK-1", "WU-TASK-10-99")
         )
 
+    def test_next_work_unit_rejects_oversized_generated_id(self) -> None:
+        task = "T" * 124
+        self.assertTrue(lifecycle.TASK_RE.fullmatch(task))
+        with self.assertRaisesRegex(
+            lifecycle.LifecycleError, "generated Work Unit ID is invalid"
+        ):
+            lifecycle.next_work_unit_id({"units": {}}, task)
+
     def test_generated_lifecycle_files_match_sources(self) -> None:
         pairs = [
             (

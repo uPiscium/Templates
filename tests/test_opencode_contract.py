@@ -739,6 +739,48 @@ global permissive plan
         self.assertIn("actual verification", skill)
         self.assertIn("request approval for `push`", skill)
 
+    def test_task_autopilot_generic_blocked_branching_is_explicit(self) -> None:
+        primary = body_text("task-orchestrator").lower()
+        skill = (
+            CORE / ".opencode" / "skills" / "task-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8").lower()
+
+        for text, name in ((primary, "task-orchestrator"), (skill, "task-orchestration")):
+            self.assertIn("persist the blocked work unit as terminal", text, name)
+            self.assertIn("inspect its evidence and the task contract", text, name)
+            self.assertIn("fresh bounded in-scope corrective work unit", text, name)
+            self.assertIn("set the task `blocked`", text, name)
+            self.assertIn("surface the blocker, and stop", text, name)
+            self.assertIn("never reopen or mutate the blocked work unit", text, name)
+            self.assertIn("provider/model", text, name)
+            self.assertIn("do not substitute", text, name)
+            self.assertIn("persist the affected work unit as terminal `blocked`", text, name)
+            self.assertIn("set and surface the task as `blocked`", text, name)
+
+    def test_task_autopilot_publication_verification_gate_is_mandatory(self) -> None:
+        primary = body_text("task-orchestrator").lower()
+        skill = (
+            CORE / ".opencode" / "skills" / "task-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8").lower()
+
+        required = (
+            "before advancing task state to `publication-ready`",
+            "before guarded commit, push, or draft pr preparation",
+            "relevant focused tests and checks",
+            "`git diff --check`",
+            "`just project::check`",
+            "`just agent::verify <task>`",
+            "a reviewer work unit for non-trivial changes",
+            "a security-reviewer work unit when trust- or security-sensitive surfaces changed",
+            "no unexecuted check or work unit may count as pass",
+            "create a fresh corrective work unit and return to verification",
+            "only after",
+            "evidence gate passes",
+        )
+        for text, name in ((primary, "task-orchestrator"), (skill, "task-orchestration")):
+            for phrase in required:
+                self.assertIn(phrase, text, f"{name}: {phrase}")
+
 
 if __name__ == "__main__":
     unittest.main()
