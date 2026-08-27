@@ -36,6 +36,18 @@ work-unit-register task work_unit role objective:
     python3 {{quote(lifecycle)}} work-unit-register {{quote(task)}} {{quote(work_unit)}} {{quote(role)}} {{quote(objective)}}
 
 [working-directory: root]
+work-unit-next task:
+    python3 {{quote(lifecycle)}} work-unit-next {{quote(task)}}
+
+[working-directory: root]
+work-unit-create task role objective:
+    python3 {{quote(lifecycle)}} work-unit-create {{quote(task)}} {{quote(role)}} {{quote(objective)}}
+
+[working-directory: root]
+work-unit-dispatch-check task work_unit role objective:
+    python3 {{quote(lifecycle)}} work-unit-dispatch-check {{quote(task)}} {{quote(work_unit)}} {{quote(role)}} {{quote(objective)}}
+
+[working-directory: root]
 work-unit-status task work_unit:
     python3 {{quote(lifecycle)}} work-unit-status {{quote(task)}} {{quote(work_unit)}}
 

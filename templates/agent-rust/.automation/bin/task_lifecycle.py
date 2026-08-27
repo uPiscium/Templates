@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import re
@@ -229,13 +231,32 @@ def work_units_path(worktree: Path) -> Path:
     return worktree / ".task-state" / "work-units.json"
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def work_units_lock_path(worktree: Path) -> Path:
+    return worktree / ".task-state" / "work-units.lock"
+
+
+@contextmanager
+def work_units_lock(record: WorktreeRecord):
+    path = work_units_lock_path(record.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def atomic_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        json.dump(value, handle, sort_keys=True)
-        handle.write("\n")
+        handle.write(text)
         temporary = Path(handle.name)
     temporary.replace(path)
+
+
+def atomic_json(path: Path, value: dict) -> None:
+    atomic_text(path, json.dumps(value, sort_keys=True) + "\n")
 
 
 def append_task_evidence(path: Path, heading: str, line: str) -> None:
@@ -249,7 +270,7 @@ def append_task_evidence(path: Path, heading: str, line: str) -> None:
         text = text.replace("## Evidence", "## Evidence\n\n" + heading + "\n- " + line, 1)
     else:
         text += "\n## Evidence\n\n" + heading + "\n- " + line
-    path.write_text(text, encoding="utf-8")
+    atomic_text(path, text)
 
 
 def utc_now() -> str:
@@ -333,18 +354,31 @@ def read_work_units(record: WorktreeRecord, task: str) -> dict:
     return value
 
 
-def work_unit_register(root: Path, task: str, work_unit: str, role: str, objective: str) -> None:
-    record = require_local_task(root, task)
+def canonical_work_unit_sequence(task: str, work_unit: str) -> int | None:
+    match = re.fullmatch(rf"WU-{re.escape(task)}-([0-9]+)", work_unit)
+    if match is None:
+        return None
+    sequence = int(match.group(1))
+    if sequence < 1 or match.group(1) != f"{sequence:02d}":
+        return None
+    return sequence
+
+
+def next_work_unit_id(value: dict, task: str) -> str:
+    sequences = [
+        sequence
+        for work_unit in value["units"]
+        if (sequence := canonical_work_unit_sequence(task, work_unit)) is not None
+    ]
+    work_unit = f"WU-{task}-{max(sequences, default=0) + 1:02d}"
     if not WORK_UNIT_RE.fullmatch(work_unit):
-        raise LifecycleError(f"invalid Work Unit ID: {work_unit!r}")
-    if role not in WORK_UNIT_ROLES:
-        raise LifecycleError(f"invalid Work Unit role: {role}")
-    validate_objective(objective)
-    value = read_work_units(record, task)
-    if work_unit in value["units"]:
-        raise LifecycleError(f"Work Unit already exists: {work_unit}")
+        raise LifecycleError(f"generated Work Unit ID is invalid: {work_unit!r}")
+    return work_unit
+
+
+def new_work_unit(work_unit: str, role: str, objective: str) -> dict:
     now = utc_now()
-    unit = {
+    return {
         "id": work_unit,
         "requested_role": role,
         "objective": objective,
@@ -354,13 +388,70 @@ def work_unit_register(root: Path, task: str, work_unit: str, role: str, objecti
         "created_at": now,
         "updated_at": now,
     }
-    value["units"][work_unit] = unit
-    atomic_json(work_units_path(record.path), value)
-    append_task_evidence(
-        state_path(record.path),
-        "## Work Units",
-        f"work_unit_registered={work_unit}; requested_role={role}; semantic_sha256={unit['semantic_sha256']}; state=in-flight",
-    )
+
+
+def persist_work_units(record: WorktreeRecord, value: dict, evidence: str) -> None:
+    units_path = work_units_path(record.path)
+    previous_units = units_path.read_text(encoding="utf-8") if units_path.exists() else None
+    atomic_json(units_path, value)
+    try:
+        append_task_evidence(state_path(record.path), "## Work Units", evidence)
+    except Exception:
+        if previous_units is None:
+            units_path.unlink(missing_ok=True)
+        else:
+            atomic_text(units_path, previous_units)
+        raise
+
+
+def validate_work_unit_request(role: str, objective: str) -> None:
+    if role not in WORK_UNIT_ROLES:
+        raise LifecycleError(f"invalid Work Unit role: {role}")
+    validate_objective(objective)
+
+
+def work_unit_next(root: Path, task: str) -> None:
+    record = require_local_task(root, task)
+    work_unit = next_work_unit_id(read_work_units(record, task), task)
+    print(json.dumps({"task_id": task, "next_work_unit": work_unit}, sort_keys=True))
+
+
+def work_unit_create(root: Path, task: str, role: str, objective: str) -> None:
+    record = require_local_task(root, task)
+    validate_work_unit_request(role, objective)
+    with work_units_lock(record):
+        assert_task_identity(record, task)
+        value = read_work_units(record, task)
+        work_unit = next_work_unit_id(value, task)
+        if work_unit in value["units"]:
+            raise LifecycleError(f"Work Unit already exists: {work_unit}")
+        unit = new_work_unit(work_unit, role, objective)
+        value["units"][work_unit] = unit
+        persist_work_units(
+            record,
+            value,
+            f"work_unit_created={work_unit}; requested_role={role}; semantic_sha256={unit['semantic_sha256']}; state=in-flight",
+        )
+    print(json.dumps(unit, sort_keys=True))
+
+
+def work_unit_register(root: Path, task: str, work_unit: str, role: str, objective: str) -> None:
+    record = require_local_task(root, task)
+    if not WORK_UNIT_RE.fullmatch(work_unit):
+        raise LifecycleError(f"invalid Work Unit ID: {work_unit!r}")
+    validate_work_unit_request(role, objective)
+    with work_units_lock(record):
+        assert_task_identity(record, task)
+        value = read_work_units(record, task)
+        if work_unit in value["units"]:
+            raise LifecycleError(f"Work Unit already exists: {work_unit}")
+        unit = new_work_unit(work_unit, role, objective)
+        value["units"][work_unit] = unit
+        persist_work_units(
+            record,
+            value,
+            f"work_unit_registered={work_unit}; requested_role={role}; semantic_sha256={unit['semantic_sha256']}; state=in-flight",
+        )
     print(json.dumps(unit, sort_keys=True))
 
 
@@ -370,6 +461,47 @@ def work_unit_status(root: Path, task: str, work_unit: str) -> None:
     if unit is None:
         raise LifecycleError(f"unknown Work Unit: {work_unit}")
     print(json.dumps(unit, sort_keys=True))
+
+
+def work_unit_dispatch_check(
+    root: Path, task: str, work_unit: str, role: str, objective: str
+) -> None:
+    record = require_local_task(root, task)
+    validate_work_unit_request(role, objective)
+    unit = read_work_units(record, task)["units"].get(work_unit)
+    if not isinstance(unit, dict):
+        raise LifecycleError(f"unknown Work Unit: {work_unit}")
+    if unit.get("id") != work_unit:
+        raise LifecycleError(f"Work Unit persisted identity mismatch: {work_unit}")
+    if unit.get("state") != "in-flight":
+        raise LifecycleError(
+            f"Work Unit is not dispatchable: {work_unit} state={unit.get('state')}"
+        )
+    if unit.get("requested_role") != role:
+        raise LifecycleError(
+            "Work Unit dispatch role mismatch: "
+            f"registered={unit.get('requested_role')}, delegated={role}"
+        )
+    if unit.get("objective") != objective:
+        raise LifecycleError("Work Unit dispatch objective mismatch")
+    digest = semantic_digest(objective)
+    if unit.get("semantic_sha256") != digest:
+        raise LifecycleError("Work Unit persisted objective digest mismatch")
+    configured_model = configured_agent_model(record.path, role)
+    print(
+        json.dumps(
+            {
+                "status": "READY",
+                "task_id": task,
+                "work_unit": work_unit,
+                "requested_role": role,
+                "objective": objective,
+                "semantic_sha256": digest,
+                "configured_model": configured_model,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def work_unit_state_set(
@@ -397,48 +529,49 @@ def work_unit_state_set(
         validate_failure_field("provider", provider, 200)
         validate_failure_field("model", model, 200)
         validate_failure_field("error", error, 4000)
-    value = read_work_units(record, task)
-    unit = value["units"].get(work_unit)
-    if unit is None:
-        raise LifecycleError(f"unknown Work Unit: {work_unit}")
-    previous = unit.get("state")
-    if status == previous:
-        print(json.dumps(unit, sort_keys=True))
-        return
-    if status not in WORK_UNIT_TRANSITIONS.get(previous, set()):
-        raise LifecycleError(f"invalid Work Unit transition: {previous} -> {status}")
-    if all(supplied_failure_fields):
-        assert provider is not None and model is not None
-        configured = configured_agent_model(record.path, unit.get("requested_role"))
-        reported = f"{provider}/{model}"
-        if reported != configured:
-            raise LifecycleError(
-                "provider failure model does not match configured Work Unit role: "
-                f"role={unit.get('requested_role')}, configured={configured}, reported={reported}"
-            )
-    now = utc_now()
-    transition = {
-        "from": previous,
-        "to": status,
-        "evidence": evidence,
-        "evidence_sha256": semantic_digest(evidence),
-        "recorded_at": now,
-    }
-    if all(supplied_failure_fields):
-        transition["provider_failure"] = {
-            "provider": provider,
-            "model": model,
-            "error": error,
+    with work_units_lock(record):
+        assert_task_identity(record, task)
+        value = read_work_units(record, task)
+        unit = value["units"].get(work_unit)
+        if unit is None:
+            raise LifecycleError(f"unknown Work Unit: {work_unit}")
+        previous = unit.get("state")
+        if status == previous:
+            print(json.dumps(unit, sort_keys=True))
+            return
+        if status not in WORK_UNIT_TRANSITIONS.get(previous, set()):
+            raise LifecycleError(f"invalid Work Unit transition: {previous} -> {status}")
+        if all(supplied_failure_fields):
+            assert provider is not None and model is not None
+            configured = configured_agent_model(record.path, unit.get("requested_role"))
+            reported = f"{provider}/{model}"
+            if reported != configured:
+                raise LifecycleError(
+                    "provider failure model does not match configured Work Unit role: "
+                    f"role={unit.get('requested_role')}, configured={configured}, reported={reported}"
+                )
+        now = utc_now()
+        transition = {
+            "from": previous,
+            "to": status,
+            "evidence": evidence,
+            "evidence_sha256": semantic_digest(evidence),
+            "recorded_at": now,
         }
-    unit["state"] = status
-    unit.setdefault("transitions", []).append(transition)
-    unit["updated_at"] = now
-    atomic_json(work_units_path(record.path), value)
-    append_task_evidence(
-        state_path(record.path),
-        "## Work Units",
-        f"work_unit_state={work_unit}; previous={previous}; state={status}; evidence_sha256={transition['evidence_sha256']}; evidence={json.dumps(evidence)}",
-    )
+        if all(supplied_failure_fields):
+            transition["provider_failure"] = {
+                "provider": provider,
+                "model": model,
+                "error": error,
+            }
+        unit["state"] = status
+        unit.setdefault("transitions", []).append(transition)
+        unit["updated_at"] = now
+        persist_work_units(
+            record,
+            value,
+            f"work_unit_state={work_unit}; previous={previous}; state={status}; evidence_sha256={transition['evidence_sha256']}; evidence={json.dumps(evidence)}",
+        )
     print(json.dumps(unit, sort_keys=True))
 
 
@@ -470,7 +603,7 @@ def set_state_status(path: Path, status: str) -> None:
     )
     if count != 1:
         raise LifecycleError(f"cannot update Task State status in {path}")
-    path.write_text(updated, encoding="utf-8")
+    atomic_text(path, updated)
 
 
 def initialize_state(
@@ -602,7 +735,9 @@ def task_status(root: Path, task: str) -> None:
 
 def task_state_set(root: Path, task: str, status: str) -> None:
     record = require_local_task(root, task)
-    set_state_status(state_path(record.path), status)
+    with work_units_lock(record):
+        assert_task_identity(record, task)
+        set_state_status(state_path(record.path), status)
     print(json.dumps({"task": task, "status": status}))
 
 
@@ -800,9 +935,20 @@ def parser() -> argparse.ArgumentParser:
     work_unit_register_parser.add_argument("work_unit")
     work_unit_register_parser.add_argument("role")
     work_unit_register_parser.add_argument("objective")
+    work_unit_next_parser = sub.add_parser("work-unit-next")
+    work_unit_next_parser.add_argument("task")
+    work_unit_create_parser = sub.add_parser("work-unit-create")
+    work_unit_create_parser.add_argument("task")
+    work_unit_create_parser.add_argument("role")
+    work_unit_create_parser.add_argument("objective")
     work_unit_status_parser = sub.add_parser("work-unit-status")
     work_unit_status_parser.add_argument("task")
     work_unit_status_parser.add_argument("work_unit")
+    work_unit_dispatch_parser = sub.add_parser("work-unit-dispatch-check")
+    work_unit_dispatch_parser.add_argument("task")
+    work_unit_dispatch_parser.add_argument("work_unit")
+    work_unit_dispatch_parser.add_argument("role")
+    work_unit_dispatch_parser.add_argument("objective")
     work_unit_state_parser = sub.add_parser("work-unit-state-set")
     work_unit_state_parser.add_argument("task")
     work_unit_state_parser.add_argument("work_unit")
@@ -830,8 +976,16 @@ def main() -> int:
             batch_plan(root, args.tasks)
         elif args.command == "work-unit-register":
             work_unit_register(root, args.task, args.work_unit, args.role, args.objective)
+        elif args.command == "work-unit-next":
+            work_unit_next(root, args.task)
+        elif args.command == "work-unit-create":
+            work_unit_create(root, args.task, args.role, args.objective)
         elif args.command == "work-unit-status":
             work_unit_status(root, args.task, args.work_unit)
+        elif args.command == "work-unit-dispatch-check":
+            work_unit_dispatch_check(
+                root, args.task, args.work_unit, args.role, args.objective
+            )
         elif args.command == "work-unit-state-set":
             work_unit_state_set(
                 root,

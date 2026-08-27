@@ -53,6 +53,33 @@ class TaskLifecycleTest(unittest.TestCase):
         self.assertTrue(any("coordination surface" in reason for reason in reasons))
         self.assertTrue(any("external resource" in reason for reason in reasons))
 
+    def test_next_work_unit_uses_max_canonical_suffix_without_filling_gaps(self) -> None:
+        value = {
+            "units": {
+                "WU-TASK-1-01": {},
+                "WU-TASK-1-03": {},
+                "WU-TASK-1-003": {},
+                "WU-TASK-10-99": {},
+                "legacy-unit": {},
+            }
+        }
+        self.assertEqual("WU-TASK-1-04", lifecycle.next_work_unit_id(value, "TASK-1"))
+        self.assertEqual(3, lifecycle.canonical_work_unit_sequence("TASK-1", "WU-TASK-1-03"))
+        self.assertIsNone(
+            lifecycle.canonical_work_unit_sequence("TASK-1", "WU-TASK-1-003")
+        )
+        self.assertIsNone(
+            lifecycle.canonical_work_unit_sequence("TASK-1", "WU-TASK-10-99")
+        )
+
+    def test_next_work_unit_rejects_oversized_generated_id(self) -> None:
+        task = "T" * 124
+        self.assertTrue(lifecycle.TASK_RE.fullmatch(task))
+        with self.assertRaisesRegex(
+            lifecycle.LifecycleError, "generated Work Unit ID is invalid"
+        ):
+            lifecycle.next_work_unit_id({"units": {}}, task)
+
     def test_generated_lifecycle_files_match_sources(self) -> None:
         pairs = [
             (
