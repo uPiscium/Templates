@@ -690,14 +690,54 @@ global permissive plan
     def test_work_unit_contract_has_no_recovery_commands(self) -> None:
         primary = permission_for("task-orchestrator")
         for command in (
-            "just agent::work-unit-register *",
+            "just agent::work-unit-next *",
+            "just agent::work-unit-create *",
+            "just agent::work-unit-dispatch-check *",
             "just agent::work-unit-status *",
             "just agent::work-unit-state-set *",
         ):
             self.assertEqual(primary["bash"].get(command), "allow", command)
+        global_bash = self.config["permission"]["bash"]
+        self.assertNotIn("just agent::work-unit-register *", primary["bash"])
+        self.assertEqual(
+            "deny", global_bash.get("just agent::work-unit-register *")
+        )
+        for command in (
+            "just agent::work-unit-next *",
+            "just agent::work-unit-create *",
+            "just agent::work-unit-dispatch-check *",
+        ):
+            self.assertEqual("deny", global_bash.get(command), command)
         self.assertFalse(any("recovery" in command for command in primary["bash"]))
         self.assertFalse((CORE / ".opencode" / "commands" / "task-recover.md").exists())
         self.assertFalse((CORE / ".opencode" / "skills" / "task-recovery" / "SKILL.md").exists())
+
+    def test_task_autopilot_contract_uses_guarded_fresh_work_units(self) -> None:
+        primary = body_text("task-orchestrator").lower()
+        skill = (
+            CORE / ".opencode" / "skills" / "task-orchestration" / "SKILL.md"
+        ).read_text(encoding="utf-8").lower()
+        just_api = (CORE / ".automation" / "just" / "agent.just").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("work-unit-next task:", just_api)
+        self.assertIn("work-unit-create task role objective:", just_api)
+        self.assertIn("work-unit-dispatch-check task work_unit role objective:", just_api)
+        for text, name in ((primary, "task-orchestrator"), (skill, "task-orchestration")):
+            self.assertIn("work-unit-create", text, name)
+            self.assertIn("work-unit-dispatch-check", text, name)
+            self.assertIn("exact same role/objective", text, name)
+            self.assertIn("returned id", text, name)
+            self.assertIn("never merge", text, name)
+            self.assertIn("fresh corrective work unit", text, name)
+            self.assertTrue(
+                "never hand-author" in text or "rather than hand-authoring" in text,
+                name,
+            )
+        self.assertIn("accept exactly one canonical leaf status field", primary)
+        self.assertIn("actual verification", skill)
+        self.assertIn("request approval for `push`", skill)
 
 
 if __name__ == "__main__":

@@ -167,6 +167,14 @@ Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write pat
 
 Each role uses one fixed GPT-5.6 model. Agent Core does not substitute models or retry an objective under another model. If the configured provider/model is unavailable, preserve Task and Work Unit evidence, report the exact failure, and return `BLOCKED`.
 
+Task Orchestrators autonomously drive the persisted Work Unit loop through the
+guarded `work-unit-next`, `work-unit-create`, and `work-unit-dispatch-check`
+APIs. These Task-local APIs are globally denied and available only to the Task
+Orchestrator. Every dispatch carries an exact role and objective; only
+`COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, and `NEEDS_DECISION` are canonical
+leaf statuses. Failed review, security, verifier, or check evidence requires
+a fresh corrective Work Unit; needs-* statuses stop for human handling.
+
 ## Project Adapter API
 
 Generated language/toolchain Adapters expose the one-time bootstrap API plus the stable validation/build API:

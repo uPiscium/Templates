@@ -46,10 +46,16 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.env = dict(os.environ)
         self.env["PATH"] = f"{fake_bin}:{self.env['PATH']}"
 
+    def start_task(self, task: str = "TASK-1", slug: str = "smoke") -> Path:
+        started = run(
+            "python3", str(self.script), "start", task, slug,
+            cwd=self.repo, env=self.env,
+        )
+        self.assertIn('"status": "initialized"', started.stdout)
+        return self.repo / ".worktrees" / f"{task}-{slug}"
+
     def test_start_work_units_duplicate_and_cleanup(self) -> None:
-        first = run("python3", str(self.script), "start", "TASK-1", "smoke", cwd=self.repo, env=self.env)
-        self.assertIn('"status": "initialized"', first.stdout)
-        worktree = self.repo / ".worktrees" / "TASK-1-smoke"
+        worktree = self.start_task()
         state = worktree / ".task-state" / "task.md"
         self.assertTrue(state.is_file())
         self.assertNotIn(".task-state", run("git", "status", "--porcelain", cwd=worktree).stdout)
@@ -192,6 +198,168 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         cleanup = run("python3", str(self.script), "cleanup", "TASK-1", cwd=self.repo, env=self.env)
         self.assertIn('"taskStateDiscarded": true', cleanup.stdout)
         self.assertFalse(worktree.exists())
+
+    def test_auto_allocation_dispatch_and_concurrent_creation(self) -> None:
+        worktree = self.start_task("TASK-2", "autopilot")
+
+        next_result = run(
+            "python3", str(self.script), "work-unit-next", "TASK-2",
+            cwd=worktree, env=self.env,
+        )
+        self.assertEqual("WU-TASK-2-01", json.loads(next_result.stdout)["next_work_unit"])
+
+        objective = "Implement the bounded Autopilot fixture"
+        created = run(
+            "python3", str(self.script), "work-unit-create", "TASK-2", "general", objective,
+            cwd=worktree, env=self.env,
+        )
+        unit = json.loads(created.stdout)
+        self.assertEqual("WU-TASK-2-01", unit["id"])
+        self.assertEqual("in-flight", unit["state"])
+
+        ready = run(
+            "python3", str(self.script), "work-unit-dispatch-check", "TASK-2",
+            unit["id"], "general", objective, cwd=worktree, env=self.env,
+        )
+        dispatch = json.loads(ready.stdout)
+        self.assertEqual("READY", dispatch["status"])
+        self.assertEqual("openai/gpt-5.6-luna", dispatch["configured_model"])
+        self.assertEqual(unit["semantic_sha256"], dispatch["semantic_sha256"])
+
+        for role, delegated_objective, expected in (
+            ("verifier", objective, "dispatch role mismatch"),
+            ("general", objective + " changed", "dispatch objective mismatch"),
+        ):
+            rejected = run(
+                "python3", str(self.script), "work-unit-dispatch-check", "TASK-2",
+                unit["id"], role, delegated_objective,
+                cwd=worktree, check=False, env=self.env,
+            )
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertIn(expected, rejected.stderr)
+
+        run(
+            "python3", str(self.script), "work-unit-state-set", "TASK-2", unit["id"],
+            "completed", "Implementation leaf returned exactly status: COMPLETED",
+            cwd=worktree, env=self.env,
+        )
+        terminal_dispatch = run(
+            "python3", str(self.script), "work-unit-dispatch-check", "TASK-2",
+            unit["id"], "general", objective,
+            cwd=worktree, check=False, env=self.env,
+        )
+        self.assertNotEqual(0, terminal_dispatch.returncode)
+        self.assertIn("is not dispatchable", terminal_dispatch.stderr)
+
+        # Compatibility registrations with legacy IDs do not disturb canonical allocation.
+        run(
+            "python3", str(self.script), "work-unit-register", "TASK-2", "legacy-review",
+            "reviewer", "Review legacy registration compatibility",
+            cwd=worktree, env=self.env,
+        )
+        run(
+            "python3", str(self.script), "work-unit-register", "TASK-2", "WU-TASK-2-07",
+            "reviewer", "Reserve a later canonical allocation",
+            cwd=worktree, env=self.env,
+        )
+        next_result = run(
+            "python3", str(self.script), "work-unit-next", "TASK-2",
+            cwd=worktree, env=self.env,
+        )
+        self.assertEqual("WU-TASK-2-08", json.loads(next_result.stdout)["next_work_unit"])
+
+        processes = [
+            subprocess.Popen(
+                (
+                    "python3", str(self.script), "work-unit-create", "TASK-2", "general",
+                    f"Concurrent bounded objective {index}",
+                ),
+                cwd=worktree,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.env,
+            )
+            for index in range(12)
+        ]
+        results = [process.communicate() for process in processes]
+        for process, (_, stderr) in zip(processes, results, strict=True):
+            self.assertEqual(0, process.returncode, stderr)
+        allocated = {json.loads(stdout)["id"] for stdout, _ in results}
+        self.assertEqual({f"WU-TASK-2-{index:02d}" for index in range(8, 20)}, allocated)
+
+        persisted = json.loads(
+            (worktree / ".task-state" / "work-units.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(allocated <= set(persisted["units"]))
+        self.assertEqual(15, len(persisted["units"]))
+
+        for terminal_state in ("needs-approval", "needs-decision"):
+            terminal = run(
+                "python3", str(self.script), "work-unit-create", "TASK-2", "general",
+                f"Exercise terminal state {terminal_state}", cwd=worktree, env=self.env,
+            )
+            terminal_unit = json.loads(terminal.stdout)
+            run(
+                "python3", str(self.script), "work-unit-state-set", "TASK-2",
+                terminal_unit["id"], terminal_state,
+                f"Leaf returned canonical {terminal_state} evidence",
+                cwd=worktree, env=self.env,
+            )
+            reopen = run(
+                "python3", str(self.script), "work-unit-state-set", "TASK-2",
+                terminal_unit["id"], "in-flight", "Attempted terminal reuse",
+                cwd=worktree, check=False, env=self.env,
+            )
+            self.assertNotEqual(0, reopen.returncode)
+            self.assertIn("invalid Work Unit transition", reopen.stderr)
+
+    def test_synthetic_corrective_autopilot_lifecycle(self) -> None:
+        worktree = self.start_task("TASK-3", "corrective")
+
+        def create(role: str, objective: str) -> dict:
+            result = run(
+                "python3", str(self.script), "work-unit-create", "TASK-3", role, objective,
+                cwd=worktree, env=self.env,
+            )
+            return json.loads(result.stdout)
+
+        def finish(unit: dict, status: str, evidence: str) -> None:
+            run(
+                "python3", str(self.script), "work-unit-state-set", "TASK-3", unit["id"],
+                status, evidence, cwd=worktree, env=self.env,
+            )
+
+        implementation = create("general", "Implement the synthetic feature")
+        finish(implementation, "completed", "status: COMPLETED; feature implemented")
+        verifier = create("verifier", "Run focused tests for the synthetic feature")
+        finish(verifier, "blocked", "status: BLOCKED; focused regression test is missing")
+        corrective = create("general", "Add the missing focused regression test")
+        self.assertNotEqual(implementation["id"], corrective["id"])
+        finish(corrective, "completed", "status: COMPLETED; focused regression test added")
+        final_verifier = create("verifier", "Re-run focused tests and project checks")
+        finish(final_verifier, "completed", "status: COMPLETED; focused and project checks PASS")
+
+        for state in (
+            "planning", "implementing", "verification-pending", "local-verified",
+            "review-pending", "publication-ready",
+        ):
+            run(
+                "python3", str(self.script), "state-set", "TASK-3", state,
+                cwd=worktree, env=self.env,
+            )
+        status = run(
+            "python3", str(self.script), "status", "TASK-3", cwd=worktree, env=self.env,
+        )
+        self.assertEqual("publication-ready", json.loads(status.stdout)["status"])
+
+        persisted = json.loads(
+            (worktree / ".task-state" / "work-units.json").read_text(encoding="utf-8")
+        )["units"]
+        self.assertEqual("completed", persisted[implementation["id"]]["state"])
+        self.assertEqual("blocked", persisted[verifier["id"]]["state"])
+        self.assertEqual("completed", persisted[corrective["id"]]["state"])
+        self.assertEqual("completed", persisted[final_verifier["id"]]["state"])
 
 
 if __name__ == "__main__":

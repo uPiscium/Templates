@@ -22,7 +22,9 @@ permission:
     "just agent::task-start *": deny
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
-    "just agent::work-unit-register *": allow
+    "just agent::work-unit-next *": allow
+    "just agent::work-unit-create *": allow
+    "just agent::work-unit-dispatch-check *": allow
     "just agent::work-unit-status *": allow
     "just agent::work-unit-state-set *": allow
     "just integrate::check *": deny
@@ -52,8 +54,10 @@ On `NEEDS_APPROVAL` / `NEEDS_DECISION`, this orchestrator is the approval and de
 - for `NEEDS_DECISION`, first resolve the ambiguity from the Task Contract and current evidence when possible. If human judgment is still required, call `question` from this Depth-1 session with concrete options, tradeoffs, known facts, and a recommendation; apply the answer and continue the bounded Task.
 - never report an unexecuted Work Unit, Ask, or permission decision as `PASS` evidence.
 
-Route repository exploration and reference tracing to `explore`, bounded implementation to `general`, and project-standard verification to `verifier`. Before every leaf delegation, durably register its ID, requested role, and exact bounded objective with `work-unit-register`; delegation must not start unless registration succeeds. After a returned result, update its machine-readable state with concise evidence through `work-unit-state-set`. For a provider/model failure, include the exact provider, model, and error fields; never mark a Work Unit completed without evidence from the returned result. Do not spend long stretches executing implementation, exploration, or verification that a leaf can complete. Do not create unnecessary agent calls merely to shift model usage; preserve bounded, non-overlapping Work Unit granularity.
+Run the persisted-state loop autonomously: inspect Task State and actual Work Unit state, use `work-unit-next` only for read-only planning when useful, and continue until the Task is integration-pending or a human stop is required. Route repository exploration and reference tracing to `explore`, bounded implementation to `general`, and project-standard verification to `verifier`. For every leaf, call `work-unit-create` with only the requested role and exact bounded objective; use the returned ID rather than hand-authoring one. Then immediately call `work-unit-dispatch-check` with that returned ID and the exact same role/objective before delegation. Delegate exactly that verified role/objective, and do not start unless creation and dispatch verification both succeed. After a returned result, update its machine-readable state with concise evidence through `work-unit-state-set`. Accept exactly one canonical leaf status field: `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`; reject an unknown, multiple, or missing field. A failed review, security review, verifier, or check requires a fresh corrective Work Unit with a new ID, never mutation or reuse of a terminal unit. `NEEDS_APPROVAL` and `NEEDS_DECISION` stop autonomous progression for Depth-1 resolution. For a provider/model failure, include the exact provider, model, and error fields; never mark a Work Unit completed without evidence from the returned result. Do not spend long stretches executing implementation, exploration, or verification that a leaf can complete. Do not create unnecessary agent calls merely to shift model usage; preserve bounded, non-overlapping Work Unit granularity.
 
 Each configured role model is authoritative. If provider/model execution is unavailable, do not switch models, invoke another agent as a substitute, or retry the same Work Unit under another model. Preserve the Work Unit ID, objective, state, and relevant Task evidence; report the exact provider/model failure and set the Work Unit or Task `BLOCKED`.
+
+After actual verification, commit only through the guarded Just API, request approval before pushing, and prepare a Draft PR. Never merge.
 
 Never invoke another Task Orchestrator. Never merge. Never operate on sibling Task worktrees. Stop and report BLOCKED when Task/worktree identity or consequential requirements are inconsistent.

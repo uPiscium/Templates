@@ -1,17 +1,17 @@
 ---
 name: task-orchestration
-description: Run one already-created Task through its Task Orchestrator without merging
+description: Run one already-created Task autonomously through persisted Work Unit state without merging
 ---
 
 # Task orchestration
 
-Use this skill when the Main Orchestrator is asked to run a specific Task that already has a dedicated branch/worktree and Task State.
+Use this skill when the Main Orchestrator is asked to run a specific Task that already has a dedicated branch/worktree and Task State. The workflow is autonomous and state-driven; do not wait for conversational scheduling.
 
 1. Resolve the explicit Task ID and assigned worktree.
 2. Confirm the Task is not already owned by another active Task Orchestrator.
 3. Launch exactly one `task-orchestrator` for that Task.
-4. Require the Task Orchestrator to operate only in the assigned worktree and to use bounded Work Units. Before each leaf delegation it must call guarded `work-unit-register` with a stable ID, requested role, and exact objective; never delegate an unregistered Work Unit.
-5. Require the Task Orchestrator to enforce leaf escalation-only status contract: Depth-2 units may only return `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`.
+4. Require the Task Orchestrator to operate only in the assigned worktree and to use bounded Work Units. Inspect persisted state (`work-unit-next` is read-only planning output), then call `work-unit-create` with the chosen role and exact objective and use its returned ID. Run `work-unit-dispatch-check` with that ID and the exact same role/objective before delegation. Never hand-author an allocation or delegate an uncreated or unverified Work Unit.
+5. Require the Task Orchestrator to enforce leaf escalation-only status contract: Depth-2 units may only return `COMPLETED`, `BLOCKED`, `NEEDS_APPROVAL`, or `NEEDS_DECISION`. These are the only canonical leaf statuses.
 6. Require the Task Orchestrator to treat `NEEDS_APPROVAL`/`NEEDS_DECISION` as its own decision point:
    - re-validate scope, authority, least privilege, safety, alternatives, and evidence;
    - do not automatically relay/launder leaf requests or change a leaf's deny-default profile;
@@ -21,9 +21,10 @@ Use this skill when the Main Orchestrator is asked to run a specific Task that a
    - for unresolved `NEEDS_DECISION`, use `question` from Depth 1 with concrete options, tradeoffs, known facts, and a recommendation; apply the answer rather than relaying the Leaf request or escalating it to Depth 0.
 7. Treat each configured model as authoritative for its role. Do not substitute another model or retry the same Task or Work Unit under another model.
 8. If provider/model execution is unavailable, preserve relevant Task and Work Unit evidence, report the exact provider/model failure, and return `BLOCKED`.
-9. Accept only evidence-backed completion: changed files, verification results, review results, commit/PR state, blockers, and unverified checks.
+9. Accept only actual evidence-backed completion: changed files, verification results, review and security-review results, verifier/check results, commit/PR state, blockers, and explicitly unverified checks. A failed review/security/verifier/check creates a fresh corrective Work Unit with a new ID; it is never retried or replaced by a fallback.
 10. Confirm the Task did not report PASS for any unexecuted command or unperformed Work Unit.
-11. Stop at integration-pending. Do not merge from this skill.
+11. Persist every transition and continue the loop until integration-pending. Stop for `NEEDS_APPROVAL` or `NEEDS_DECISION` human handling, and otherwise stop at integration-pending. Do not merge from this skill.
+12. After actual verification, use guarded `commit`, request approval for `push`, and create or edit only a Draft PR. Never merge.
 
 Do not silently select another Issue or Task. Do not weaken permissions to work around a blocked approval or missing tool/model.
 Depth-2 Ask behavior is tracked as a non-gating upstream compatibility canary for anomalyco/opencode#13715; release readiness is determined by correct Leaf→Depth-1 escalation approval/rejection decisions.
