@@ -220,16 +220,97 @@ just automation::check-update /path/to/Templates
 
 This reports current/upstream versions and the ownership boundaries without mutating the repository. Agent Core upgrades must never be silently mixed into an ordinary Task.
 
+Both `automation::check-update` and `automation::upgrade` accept only a trusted
+Git worktree root for the Templates source. The source worktree must have a
+full, non-null `HEAD` and a clean `components/agent-core` scope: tracked
+modifications and non-ignored untracked paths there are rejected. Ignored
+generated artifacts are not part of the source input and are structurally
+absent from the operation. The command pins the source `HEAD`, materializes
+only the tracked `components/agent-core` objects into a temporary snapshot, and
+plans/copies only from that snapshot. A compatible Agent Core `VERSION` drift
+is still reported; a source race after pinning fails closed.
+
 ## Agent Core upgrade
 
-Use a dedicated Task worktree. The upgrade command is an Ask operation and additionally requires an explicit maintenance marker:
+Use a dedicated, registered, non-default **Automation Maintenance Task** worktree. The complete canonical publication workflow is:
 
 ```sh
-export AUTOMATION_MAINTENANCE=1
-just automation::upgrade /path/to/Templates
+AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout>
 ```
 
-It refuses the default branch and repositories without Task State. It materializes only Agent Core-owned paths and preserves Adapter-owned `.automation/ADAPTER`, `.automation/INIT.fragment.md`, `.automation/adoption.toml`, `just/project/**`, local modules, and repository CI.
+The source must be a trusted clean local Templates Git worktree root. The
+command pins its full `HEAD`, materializes only tracked
+`components/agent-core` objects into a temporary snapshot, and plans/copies
+only from that snapshot. Tracked modifications or non-ignored untracked paths
+under Agent Core, a source race, or an invalid source root fail closed; ignored
+generated artifacts are structurally absent. The command also refuses the
+default branch, an unregistered Task, missing Task State, or a
+non-ignored/tracked Task State path. The ambient `AUTOMATION_MAINTENANCE=1`
+variable grants upgrade opt-in only; it does not grant commit authority, and
+ordinary `just agent::commit <task>` still rejects Automation Core changes.
+
+It materializes only Agent Core-owned paths and preserves Adapter-owned `.automation/ADAPTER`, `.automation/INIT.fragment.md`, `.automation/adoption.toml`, `just/project/**`, local modules, and repository CI. On success it creates or replaces the ignored `.task-state/automation-maintenance.json` receipt; it does not commit, push, or merge. Inspect the diff and run:
+
+```sh
+git diff --check
+just agent::doctor
+just project::check
+# repository CI/smoke suite
+just automation::commit <task> [message]
+just agent::push <task>
+just agent::pr-create <task>
+```
+
+Issue #85 provides a narrower Templates source-side bridge for a consumer
+worktree with the exact active receipt but missing authority. From the Templates
+checkout, run:
+
+```sh
+just agent-core::recover-maintenance-authority <consumer-task-worktree>
+just agent-core::commit-recovered-maintenance <consumer-task-worktree> <task> [message]
+```
+
+Use it only before fixing that consumer. Do not edit or delete the receipt,
+replace receipt-bound Agent Core files, use `python -c` or a monkeypatch, or
+modify downstream files directly outside the bridge. Recovery uses the current
+clean, pinned Templates `HEAD`; the receipt source revision remains historical
+and is materialized from tracked Git objects, without checking out current
+source to that old revision or using live files. `receipt.source` must be the
+exact same Templates Git repository/common object store worktree; unrelated or
+missing sources are rejected.
+
+Recovery leaves the receipt and target files unchanged, writes per-worktree
+schema-2 bridge authority and proof, and reports `AUTHORITY_RECOVERED`.
+Publication uses current guarded semantics: exact receipt paths, private-index
+blob-and-mode validation, `commit-tree`, and expected-`HEAD` `update-ref`. A
+failure before the atomic branch update restores the retryable pair; successful
+expected-`HEAD` `update-ref` is the publication boundary. A later finalization
+error is reported as already published and must not be retried as an
+uncommitted pair. There is no push or merge. The existing consumer script need not and must not
+be replaced first. This is not a generic external apply/upgrade/commit
+primitive; normal consumer bootstrap and commit remain separate workflows.
+
+Both root bridge recipes use `python3 -I` for their small stdlib-only bootstrap:
+isolated mode excludes `PYTHONPATH`, the current directory, and user-site
+shadowing from bootstrap imports. The bootstrap resolves the root and trusted,
+root-owned, non-writable Git repository with scrubbed `GIT_*`, then verifies the
+full `HEAD` and the whole clean Templates worktree. It verifies the live
+bootstrap against the tracked `HEAD` blob, obtains the engine regular blob from
+the verified `HEAD` Git objects, materializes it privately, and executes the
+engine only afterward. The verified `HEAD` is passed to the engine; the engine
+independently repeats clean-source, root, and `HEAD` validation and requires
+equality before publishing authority. Thus `implementation_revision` is proven
+to be the blob-providing `HEAD`, and source races fail closed. Dirty bridge or
+engine files and module-shadow states are rejected before target authority or
+publication changes.
+
+The live bootstrap is the small initial trust anchor: its self-check detects
+accidental or concurrent divergence, but does not claim to defeat hostile
+replacement. That requires an external trusted launcher or signing mechanism.
+Hard-crash consistency remains out of scope; these safeguards do not change
+Issue #85 semantics or claim stronger durability.
+
+After a successful commit, the active receipt is consumed as `.task-state/automation-maintenance.consumed.json`. A later successful upgrade with changes replaces the active receipt and removes the prior consumed receipt; a no-change invocation returns `NO_CHANGES` and preserves existing receipt lifecycle evidence. There is no raw Git/GitHub bypass, and merge is excluded: the Main Orchestrator performs the separately gated integration/merge workflow.
 
 The upgrade system supports versioned removal migrations. Removals name explicit, exact Agent Core-managed paths; repository-owned and protected paths cannot be removed. Migration preconditions are checked before any mutation, and `.automation/VERSION` advances only after all deletion, creation, replacement, and merge actions succeed.
 

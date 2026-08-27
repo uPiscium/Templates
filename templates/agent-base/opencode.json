@@ -71,6 +71,8 @@
       "just automation::version": "allow",
       "just automation::check-update *": "allow",
       "just automation::upgrade *": "ask",
+      "just automation::bootstrap-receipt *": "ask",
+      "just automation::commit *": "allow",
       "just repository::policy-check": "allow",
       "just repository::policy-apply": "ask",
       "just agent::task-start *": "deny",
