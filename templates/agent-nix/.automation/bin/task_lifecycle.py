@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -72,9 +73,20 @@ class WorktreeRecord:
 
 
 def run(
-    command: list[str], *, cwd: Path | None = None, check: bool = True
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    remove_env: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    environment = os.environ.copy()
+    for name in [key for key in environment if key.startswith("GIT_")]:
+        environment.pop(name, None)
+    for name in remove_env:
+        environment.pop(name, None)
+    result = subprocess.run(
+        command, cwd=cwd, text=True, capture_output=True, env=environment
+    )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise LifecycleError(f"{' '.join(command)}: {detail}")
@@ -83,6 +95,10 @@ def run(
 
 def git(*args: str, cwd: Path, check: bool = True) -> str:
     return run(["git", *args], cwd=cwd, check=check).stdout.strip()
+
+
+def gh(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return run(["gh", *args], cwd=cwd, check=check, remove_env=("GH_REPO",))
 
 
 def repo_root(cwd: Path | None = None) -> Path:
@@ -106,11 +122,7 @@ def default_branch(root: Path) -> str:
     )
     if symbolic.startswith("origin/"):
         return symbolic.removeprefix("origin/")
-    result = run(
-        ["gh", "repo", "view", "--json", "defaultBranchRef"],
-        cwd=root,
-        check=False,
-    )
+    result = gh("repo", "view", "--json", "defaultBranchRef", cwd=root, check=False)
     if result.returncode == 0:
         try:
             name = json.loads(result.stdout).get("defaultBranchRef", {}).get("name")
@@ -188,6 +200,97 @@ def require_main_worktree(root: Path) -> WorktreeRecord:
             f"operation must run from the default-branch worktree: {main.path}"
         )
     return current
+
+
+def validate_branch_name(branch: str) -> None:
+    if not branch or branch.startswith("-"):
+        raise LifecycleError(f"invalid default branch name: {branch!r}")
+    result = run(
+        ["git", "check-ref-format", "--branch", branch],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LifecycleError(f"invalid default branch name: {branch!r}")
+
+
+def synchronize_default_branch(root: Path) -> dict:
+    """Fetch and fast-forward only the checked-out origin default branch."""
+    main = require_main_worktree(root)
+    base = main.branch
+    if base is None:
+        raise LifecycleError("default-branch worktree is detached")
+    validate_branch_name(base)
+    if not git("remote", "get-url", "origin", cwd=root, check=False):
+        raise LifecycleError("configured origin remote is required")
+    if git("status", "--porcelain", "--untracked-files=all", cwd=root):
+        raise LifecycleError("default-branch worktree must be clean before synchronization")
+
+    local_ref = f"refs/heads/{base}"
+    remote_ref = f"refs/remotes/origin/{base}"
+    local_before = git("rev-parse", "--verify", local_ref, cwd=root)
+    remote_before = git("rev-parse", "--verify", remote_ref, cwd=root, check=False)
+    run(
+        [
+            "git",
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"refs/heads/{base}:{remote_ref}",
+        ],
+        cwd=root,
+    )
+    fetched = git("rev-parse", "--verify", remote_ref, cwd=root)
+
+    if remote_before and run(
+        ["git", "merge-base", "--is-ancestor", remote_before, fetched],
+        cwd=root,
+        check=False,
+    ).returncode != 0:
+        raise LifecycleError("origin default branch moved non-fast-forward")
+    if run(
+        ["git", "merge-base", "--is-ancestor", local_before, fetched],
+        cwd=root,
+        check=False,
+    ).returncode != 0:
+        raise LifecycleError(
+            "local default branch cannot be fast-forwarded; local-only commits or divergence exist"
+        )
+    if git("rev-parse", "--verify", remote_ref, cwd=root) != fetched:
+        raise LifecycleError("origin default-branch ref moved during synchronization")
+    if git("status", "--porcelain", "--untracked-files=all", cwd=root):
+        raise LifecycleError("default-branch worktree changed during synchronization")
+
+    if local_before != fetched:
+        run(["git", "merge", "--ff-only", "--no-edit", fetched], cwd=root)
+
+    local_after = git("rev-parse", "--verify", local_ref, cwd=root)
+    remote_after = git("rev-parse", "--verify", remote_ref, cwd=root)
+    if local_after != fetched or remote_after != fetched:
+        raise LifecycleError("default-branch refs changed during synchronization")
+    if git("status", "--porcelain", "--untracked-files=all", cwd=root):
+        raise LifecycleError("default-branch worktree is not clean after synchronization")
+    return {
+        "branch": base,
+        "revision": fetched,
+        "previousRevision": local_before,
+        "updated": local_before != fetched,
+    }
+
+
+def require_synchronized_default_branch_revision(
+    root: Path, branch: str, revision: str
+) -> None:
+    main = require_main_worktree(root)
+    if main.branch != branch:
+        raise LifecycleError("default branch changed during guarded operation")
+    local = git("rev-parse", "--verify", f"refs/heads/{branch}", cwd=root)
+    remote = git(
+        "rev-parse", "--verify", f"refs/remotes/origin/{branch}", cwd=root
+    )
+    if local != revision or remote != revision:
+        raise LifecycleError("default-branch refs moved after synchronization")
+    if git("status", "--porcelain", "--untracked-files=all", cwd=root):
+        raise LifecycleError("default-branch worktree changed after synchronization")
 
 
 def worktree_for_task(root: Path, task: str) -> WorktreeRecord:
@@ -672,11 +775,9 @@ def task_start(root: Path, task: str, slug: str) -> None:
     ):
         raise LifecycleError(f"branch already exists: {branch}")
 
-    base = default_branch(root)
-    remote_base = f"refs/remotes/origin/{base}"
-    base_revision = git("rev-parse", "--verify", remote_base, cwd=root, check=False)
-    if not base_revision:
-        base_revision = git("rev-parse", "--verify", base, cwd=root)
+    synchronized = synchronize_default_branch(root)
+    base = synchronized["branch"]
+    base_revision = synchronized["revision"]
 
     worktree.parent.mkdir(parents=True, exist_ok=True)
     run(
@@ -739,6 +840,24 @@ def task_state_set(root: Path, task: str, status: str) -> None:
         assert_task_identity(record, task)
         set_state_status(state_path(record.path), status)
     print(json.dumps({"task": task, "status": status}))
+
+
+def mark_task_merged_from_integration(record: WorktreeRecord, task: str) -> str:
+    """Dedicated terminal transition used only after guarded merge reconciliation."""
+    validate_task(task)
+    with work_units_lock(record):
+        assert_task_identity(record, task)
+        path = state_path(record.path)
+        previous = state_status(path)
+        if previous == "merged":
+            return "already-finalized"
+        if previous != "integration-pending":
+            raise LifecycleError(
+                "post-merge finalization requires Task status integration-pending or merged; "
+                f"found {previous}"
+            )
+        set_state_status(path, "merged")
+    return "finalized"
 
 
 def extract_identity_value(path: Path, label: str) -> str | None:
