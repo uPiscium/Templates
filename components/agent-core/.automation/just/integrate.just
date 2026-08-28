@@ -8,3 +8,7 @@ check pr:
 [working-directory: root]
 merge pr:
     python3 {{quote(script)}} integrate merge {{quote(pr)}}
+
+[working-directory: root]
+finalize task pr:
+    python3 {{quote(script)}} integrate finalize {{quote(task)}} {{quote(pr)}}

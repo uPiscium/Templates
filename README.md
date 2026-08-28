@@ -160,10 +160,12 @@ Main
   -> Draft PR
   -> integration check
   -> Ask: merge (Main only)
-  -> cleanup
+  -> guarded post-merge finalize and default-branch sync (Main only)
+  -> Ask: cleanup
+  -> dependency re-evaluation and next Task
 ```
 
-Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write path. Push, merge, cleanup, unknown Bash, and designated external paths require Ask.
+Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write path. After merge, Main uses `just integrate::finalize <task> <pr>` to bind actual GitHub merge evidence to a narrow fast-forward-only default-branch synchronization and the dedicated `integration-pending -> merged` transition. `task-start` repeats that synchronization at execution time. Push, merge, cleanup, unknown Bash, and designated external paths require Ask; finalization is non-destructive and cleanup remains separate.
 
 Each role uses one fixed GPT-5.6 model. Agent Core does not substitute models or retry an objective under another model. If the configured provider/model is unavailable, preserve Task and Work Unit evidence, report the exact failure, and return `BLOCKED`.
 

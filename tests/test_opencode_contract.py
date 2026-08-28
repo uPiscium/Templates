@@ -310,6 +310,23 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(bash["just agent::push *"], "ask")
         self.assertEqual(bash["just integrate::merge *"], "ask")
 
+    def test_guarded_finalize_permission_boundaries(self) -> None:
+        bash = self.config["permission"]["bash"]
+        self.assertEqual(bash["just integrate::finalize *"], "allow")
+        self.assertEqual(bash["just agent::state-set *"], "deny")
+        self.assertEqual(bash["just agent::cleanup *"], "ask")
+        self.assertEqual(bash["just integrate::merge *"], "ask")
+        orchestrator = permission_for("task-orchestrator")["bash"]
+        self.assertEqual(orchestrator["just integrate::finalize *"], "deny")
+        self.assertEqual(orchestrator["just integrate::merge *"], "deny")
+        main = permission_for("build")["bash"]
+        self.assertEqual(main["just integrate::finalize *"], "allow")
+        self.assertEqual(main["just agent::state-set *"], "deny")
+        self.assertEqual(main["just agent::cleanup *"], "ask")
+        self.assertEqual(main["just integrate::merge *"], "ask")
+        self.assertEqual(bash["git fetch *"], "deny")
+        self.assertEqual(bash["git pull *"], "deny")
+
     def test_runtime_preflight_is_narrowly_allowlisted(self) -> None:
         self.assertEqual(
             "allow", self.config["permission"]["bash"]["just agent::preflight"]
@@ -627,7 +644,7 @@ global permissive plan
                     self.assertNotRegex(
                         command,
                         r"(agent::task-start|agent::state-set|agent::batch-plan|agent::commit|agent::push|agent::pr-"
-                        r"create|agent::pr-edit|agent::pr-ready|agent::cleanup|integrate::check|integrate::merge|"
+                        r"create|agent::pr-edit|agent::pr-ready|agent::cleanup|integrate::check|integrate::finalize|integrate::merge|"
                         r"integrate::status|project::commit|project::publish|project::release)",
                         leaf,
                     )

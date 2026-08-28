@@ -186,6 +186,51 @@ class InitContractTest(unittest.TestCase):
                 init.task_state(root)
             self.assertEqual(before, state.read_bytes())
 
+    def test_git_runtime_scrubs_ambient_config_and_disables_fsmonitor(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        injected = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "/tmp/attacker",
+            "GIT_SSH_COMMAND": "/tmp/attacker",
+        }
+        with mock.patch.dict(os.environ, injected), mock.patch.object(
+            init.subprocess, "run", return_value=completed
+        ) as invoked:
+            init.git(Path("/tmp"), "status", "--short")
+        command = invoked.call_args.args[0]
+        environment = invoked.call_args.kwargs["env"]
+        self.assertIn("core.fsmonitor=false", command)
+        self.assertIn("core.hooksPath=/dev/null", command)
+        self.assertFalse(any(key.startswith("GIT_") and key not in {
+            "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"
+        } for key in environment))
+        self.assertEqual(os.devnull, environment["GIT_CONFIG_GLOBAL"])
+
+    def test_github_default_branch_fallback_is_origin_bound(self) -> None:
+        def fake_git(_root: Path, *args: str, check: bool = True) -> str:
+            if args[:2] == ("symbolic-ref", "--quiet"):
+                return ""
+            if args == ("remote", "get-url", "origin"):
+                return "https://github.com/acme/widgets.git"
+            raise AssertionError(args)
+
+        response = subprocess.CompletedProcess(
+            [], 0, '{"default_branch":"main"}', ""
+        )
+        with mock.patch.object(init, "git", side_effect=fake_git), mock.patch.object(
+            init, "run", return_value=response
+        ) as invoked:
+            self.assertEqual("main", init.default_branch(Path("/tmp")))
+        self.assertEqual(
+            ["gh", "api", "--hostname", "github.com", "repos/acme/widgets"],
+            invoked.call_args.args[0],
+        )
+        self.assertEqual(
+            ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"),
+            invoked.call_args.kwargs["remove_env"],
+        )
+
     def test_orphaned_canonical_contract_marker_blocks_initialization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -351,6 +396,8 @@ class InitContractTest(unittest.TestCase):
     def test_real_repository_identity_modes_preserve_strictness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repository"
+            remote = Path(directory) / "origin.git"
+            self.run_fixture(Path(directory), "git", "init", "--bare", "--initial-branch=main", str(remote))
             shutil.copytree(ROOT / "templates" / "agent-base", root)
             self.run_fixture(root, "git", "init", "-b", "main")
             self.run_fixture(root, "git", "config", "user.name", "Preflight Test")
@@ -359,7 +406,8 @@ class InitContractTest(unittest.TestCase):
             )
             self.run_fixture(root, "git", "add", ".")
             self.run_fixture(root, "git", "commit", "-m", "fixture")
-            self.run_fixture(root, "git", "update-ref", "refs/remotes/origin/main", "HEAD")
+            self.run_fixture(root, "git", "remote", "add", "origin", str(remote))
+            self.run_fixture(root, "git", "push", "-u", "origin", "main")
             self.run_fixture(
                 root,
                 "git",

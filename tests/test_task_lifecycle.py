@@ -107,7 +107,7 @@ class TaskLifecycleTest(unittest.TestCase):
             state.parent.mkdir()
             state.write_text("## Purpose\n\nTBD\n", encoding="utf-8")
             record = lifecycle.WorktreeRecord(root, "task/19-example", "a" * 40)
-            with self.assertRaisesRegex(lifecycle.LifecycleError, "mutation is forbidden"):
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "unresolved"):
                 lifecycle.require_resolved_contract(record, "19")
 
     def test_generated_lifecycle_files_match_sources(self) -> None:

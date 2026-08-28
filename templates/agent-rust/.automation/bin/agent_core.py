@@ -10,6 +10,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+import task_lifecycle as lifecycle
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -24,8 +29,21 @@ class AutomationError(RuntimeError):
     pass
 
 
-def run(command: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+def run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+    remove_env: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    for name in [key for key in environment if key.startswith("GIT_")]:
+        environment.pop(name, None)
+    for name in remove_env:
+        environment.pop(name, None)
+    result = subprocess.run(
+        command, cwd=cwd, text=True, capture_output=True, env=environment
+    )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise AutomationError(f"{' '.join(command)}: {detail}")
@@ -37,7 +55,7 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
 
 
 def gh(*args: str, cwd: Path | None = None) -> str:
-    return run(["gh", *args], cwd=cwd).stdout.strip()
+    return run(["gh", *args], cwd=cwd, remove_env=("GH_REPO",)).stdout.strip()
 
 
 def repo_root(cwd: Path | None = None) -> Path:
@@ -310,7 +328,7 @@ def cleanup(root: Path, task: str) -> None:
 
 
 def pr_details(root: Path, pr: str) -> dict:
-    data = json.loads(gh("pr", "view", pr, "--json", "number,baseRefName,headRefName,headRefOid,isDraft,mergeable,statusCheckRollup,state", cwd=root))
+    data = json.loads(gh("pr", "view", pr, "--json", "number,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state", cwd=root))
     return data
 
 
@@ -359,6 +377,135 @@ def integrate_merge(root: Path, pr: str) -> None:
     print(f"merged PR #{pr} at {expected}")
 
 
+def validate_pr_number(pr: str) -> int:
+    if not re.fullmatch(r"[1-9][0-9]*", pr):
+        raise AutomationError(f"invalid pull request number: {pr!r}")
+    return int(pr)
+
+
+def prs_for_branch(root: Path, branch: str) -> list[dict]:
+    try:
+        value = json.loads(
+            gh(
+                "pr",
+                "list",
+                "--state",
+                "all",
+                "--head",
+                branch,
+                "--limit",
+                "100",
+                "--json",
+                "number,headRefName,baseRefName",
+                cwd=root,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise AutomationError("invalid pull request list returned by GitHub") from exc
+    if not isinstance(value, list):
+        raise AutomationError("invalid pull request list returned by GitHub")
+    return [item for item in value if item.get("headRefName") == branch]
+
+
+def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.WorktreeRecord, dict]:
+    requested = validate_pr_number(pr)
+    try:
+        lifecycle.require_main_worktree(root)
+        record = lifecycle.worktree_for_task(root, task)
+        lifecycle.assert_task_identity(record, task)
+        status = lifecycle.state_status(lifecycle.state_path(record.path))
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
+    if status not in {"integration-pending", "merged"}:
+        raise AutomationError(
+            "post-merge finalization requires Task status integration-pending or merged; "
+            f"found {status}"
+        )
+    branch = record.branch
+    if branch is None:
+        raise AutomationError("registered Task worktree is detached")
+    data = pr_details(root, pr)
+    base = default_branch(root)
+    if data.get("number") != requested:
+        raise AutomationError("GitHub returned a different pull request")
+    if data.get("state") != "MERGED":
+        raise AutomationError("pull request is not merged")
+    if data.get("headRefName") != branch:
+        raise AutomationError("pull request head does not match the registered Task branch")
+    if data.get("baseRefName") != base:
+        raise AutomationError("pull request base is not the repository default branch")
+    if data.get("isCrossRepository"):
+        raise AutomationError("cross-repository pull requests cannot finalize a local Task")
+    merge_oid = (data.get("mergeCommit") or {}).get("oid")
+    if not isinstance(merge_oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+        raise AutomationError("merged pull request has no valid merge commit identity")
+    matches = prs_for_branch(root, branch)
+    if len(matches) != 1 or matches[0].get("number") != requested:
+        raise AutomationError("Task pull request identity is missing or ambiguous")
+    return record, data
+
+
+def merge_commit_is_ancestor(root: Path, merge_oid: str, revision: str) -> bool:
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+        return False
+    return run(
+        ["git", "merge-base", "--is-ancestor", merge_oid, revision],
+        cwd=root,
+        check=False,
+    ).returncode == 0
+
+
+def integrate_finalize(root: Path, task: str, pr: str) -> None:
+    validate_task(task)
+    record, evidence = merged_pr_evidence(root, task, pr)
+    merge_oid = evidence["mergeCommit"]["oid"]
+    try:
+        synchronized = lifecycle.synchronize_default_branch(root)
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
+    revision = synchronized["revision"]
+    if not merge_commit_is_ancestor(root, merge_oid, revision):
+        raise AutomationError(
+            "GitHub merge commit is not present in the synchronized default branch"
+        )
+
+    # Re-read GitHub evidence after the fetch/update boundary before granting
+    # terminal-state authority.
+    current_record, current = merged_pr_evidence(root, task, pr)
+    def fingerprint(value: dict) -> tuple:
+        return (
+            value.get("number"),
+            value.get("state"),
+            value.get("headRefName"),
+            value.get("baseRefName"),
+            (value.get("mergeCommit") or {}).get("oid"),
+            value.get("isCrossRepository"),
+        )
+    if current_record != record or fingerprint(current) != fingerprint(evidence):
+        raise AutomationError("pull request or Task identity changed during finalization")
+    if not merge_commit_is_ancestor(root, merge_oid, revision):
+        raise AutomationError("merge identity changed during finalization")
+    try:
+        lifecycle.require_synchronized_default_branch_revision(
+            root, synchronized["branch"], revision
+        )
+        outcome = lifecycle.mark_task_merged_from_integration(record, task)
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
+    print(
+        json.dumps(
+            {
+                "task": task,
+                "pr": evidence["number"],
+                "branch": synchronized["branch"],
+                "revision": revision,
+                "mergeCommit": merge_oid,
+                "status": outcome,
+            }
+        )
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     scope = parser.add_subparsers(dest="scope", required=True)
@@ -374,6 +521,9 @@ def build_parser() -> argparse.ArgumentParser:
     integrate_cmd = integrate.add_subparsers(dest="command", required=True)
     for name in ("check", "merge"):
         p = integrate_cmd.add_parser(name); p.add_argument("pr")
+    finalize = integrate_cmd.add_parser("finalize")
+    finalize.add_argument("task")
+    finalize.add_argument("pr")
     return parser
 
 
@@ -399,6 +549,7 @@ def main() -> int:
             actions = {
                 "check": lambda: integrate_check(root, args.pr),
                 "merge": lambda: integrate_merge(root, args.pr),
+                "finalize": lambda: integrate_finalize(root, args.task, args.pr),
             }
         actions[args.command]()
         return 0

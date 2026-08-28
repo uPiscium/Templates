@@ -18,6 +18,43 @@ integration head-SHA checkpoints, disposable Task State templates, and common
 safety policy. Repository-local OpenCode agents and permissions are added by the
 separate OpenCode configuration work.
 
+## Post-merge finalization
+
+Task Orchestrators stop at `integration-pending`. After the Main Orchestrator or
+a human merges the PR, reconcile the external merge from the unique clean
+default-branch worktree:
+
+```sh
+just integrate::finalize <task> <pr>
+```
+
+This dedicated operation requires one registered Task worktree with matching
+persisted identity and status `integration-pending` (or the idempotent `merged`
+case). It requires one unambiguous, same-repository GitHub PR for that Task
+branch, a default-branch base, state `MERGED`, and a valid GitHub
+`mergeCommit.oid`. It narrowly fetches only `origin`'s default branch with a
+non-force refspec, rejects a dirty Main worktree, non-fast-forward remote
+movement, local-only commits, divergence, detached/wrong worktrees, and ref
+movement during synchronization. It then fast-forwards the local default branch
+without reset, rebase, force, conflict resolution, or merge-commit creation.
+
+Only after the fetched local and remote-tracking refs agree, the GitHub merge
+commit is contained in that revision, and GitHub/Task evidence is revalidated
+does the dedicated internal path transition `integration-pending -> merged`.
+Re-running a valid finalized Task reports `already-finalized`. Generic Main
+`agent::state-set` and raw Git fetch/pull/merge/ref mutation remain denied.
+
+Cleanup is deliberately separate and destructive:
+
+```text
+integration-pending -> PR merge -> guarded finalize -> merged
+  -> approval-gated cleanup -> dependency re-evaluation -> next Task
+```
+
+`agent::task-start` uses the same guarded default-branch synchronization at
+execution time before creating a branch/worktree, so it does not trust a stale
+remote-tracking ref even if the default branch advanced after finalization.
+
 ## Automation Maintenance workflow
 
 An Agent Core upgrade is permitted only from a dedicated registered, non-default
