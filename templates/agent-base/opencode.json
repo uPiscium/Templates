@@ -76,6 +76,8 @@
       "just repository::policy-check": "allow",
       "just repository::policy-apply": "ask",
       "just agent::task-start *": "deny",
+      "just agent::task-start-from-issue *": "deny",
+      "just agent::contract-check *": "allow",
       "just agent::state-set *": "deny",
       "just agent::batch-plan *": "deny",
       "just agent::work-unit-register *": "deny",

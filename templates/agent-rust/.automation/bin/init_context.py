@@ -105,6 +105,22 @@ def task_state(root: Path) -> dict | None:
             raise InitError(f"Task State missing identity field: {key}")
         values[key] = match.group(1).strip()
     values["path"] = str(path)
+    unresolved = ("TBD", "Define Task-specific", "- Unverified: Task contract")
+    if any(token in text for token in unresolved):
+        raise InitError("Task Contract contains unresolved required fields")
+    # Only Issue-backed states opt into the strict canonical contract engine;
+    # low-level/offline fixture Tasks intentionally retain their old bootstrap
+    # semantics until they are hydrated.
+    if (
+        "canonical-contract sha256=" in text
+        or (root / ".task-state" / "contract.json").is_file()
+        or (root / ".task-state" / "issue.json").is_file()
+    ):
+        try:
+            from task_contract import validate_contract
+            validate_contract(root, values["taskId"])
+        except Exception as exc:
+            raise InitError(f"canonical Task Contract is unresolved: {exc}") from exc
     return values
 
 

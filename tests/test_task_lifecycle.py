@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_lifecycle.py"
@@ -79,6 +80,35 @@ class TaskLifecycleTest(unittest.TestCase):
             lifecycle.LifecycleError, "generated Work Unit ID is invalid"
         ):
             lifecycle.next_work_unit_id({"units": {}}, task)
+
+    def test_issue_start_duplicate_never_removes_existing_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            lifecycle, "require_main_worktree"
+        ), mock.patch.dict(
+            "sys.modules",
+            {
+                "task_contract": mock.Mock(
+                    ContractError=lifecycle.LifecycleError,
+                    fetch_issue=mock.Mock(return_value=("acme/widgets", {})),
+                    hydrate_task_contract=mock.Mock(),
+                )
+            },
+        ), mock.patch.object(
+            lifecycle, "task_start", side_effect=lifecycle.LifecycleError("already exists")
+        ), mock.patch.object(lifecycle, "run") as run:
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "already exists"):
+                lifecycle.task_start_from_issue(Path(directory), "19", "existing")
+            run.assert_not_called()
+
+    def test_unresolved_contract_blocks_task_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text("## Purpose\n\nTBD\n", encoding="utf-8")
+            record = lifecycle.WorktreeRecord(root, "task/19-example", "a" * 40)
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "mutation is forbidden"):
+                lifecycle.require_resolved_contract(record, "19")
 
     def test_generated_lifecycle_files_match_sources(self) -> None:
         pairs = [

@@ -175,6 +175,29 @@ class InitContractTest(unittest.TestCase):
                     for patch in reversed(patches):
                         patch.stop()
 
+    def test_unresolved_task_contract_blocks_context_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state" / "task.md"
+            state.parent.mkdir()
+            state.write_text(self.task_state_text(root).replace("## Purpose\n\n- defined", "## Purpose\n\nTBD"), encoding="utf-8")
+            before = state.read_bytes()
+            with self.assertRaisesRegex(init.InitError, "unresolved required fields"):
+                init.task_state(root)
+            self.assertEqual(before, state.read_bytes())
+
+    def test_orphaned_canonical_contract_marker_blocks_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text(
+                self.task_state_text(root) + "\n<!-- canonical-contract sha256=" + "a" * 64 + " issue=19 -->\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(init.InitError, "canonical Task Contract is unresolved"):
+                init.task_state(root)
+
     def test_default_branch_preflight_doctor_and_context_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -371,7 +394,23 @@ class InitContractTest(unittest.TestCase):
                 "runtime-preflight",
             )
             task = root / ".worktrees" / "SMOKE-PREFLIGHT-runtime-preflight"
-            for command in ("agent::preflight", "agent::doctor", "agent::context"):
+            self.run_fixture(task, "just", "agent::preflight")
+            for command in ("agent::doctor", "agent::context"):
+                blocked = self.run_fixture(task, "just", command, check=False)
+                self.assertEqual(2, blocked.returncode)
+                self.assertIn("unresolved required fields", blocked.stderr)
+
+            state = task / ".task-state/task.md"
+            resolved = state.read_text(encoding="utf-8")
+            resolved = resolved.replace("## Purpose\n\nTBD", "## Purpose\n\nOffline lifecycle fixture")
+            resolved = resolved.replace("## Scope\n\n- TBD", "## Scope\n\n- Fixture-only lifecycle validation")
+            resolved = resolved.replace(
+                "- [ ] Define Task-specific acceptance criteria",
+                "- [ ] Exercise strict identity modes",
+            )
+            resolved = resolved.replace("- Unverified: Task contract", "- Unverified: fixture checks")
+            state.write_text(resolved, encoding="utf-8")
+            for command in ("agent::doctor", "agent::context"):
                 self.run_fixture(task, "just", command)
 
     def test_init_runtime_contains_no_repository_mutation_commands(self) -> None:
@@ -447,10 +486,10 @@ class InitContractTest(unittest.TestCase):
         pairs = [
             ("components/agent-core/.automation/INIT.md", "templates/agent-base/.automation/INIT.md"),
             ("components/agent-core/.automation/VERSION", "templates/agent-base/.automation/VERSION"),
-            ("components/adapters/base/.automation/ADAPTER", "templates/agent-base/.automation/ADAPTER"),
-            ("components/adapters/base/.automation/INIT.fragment.md", "templates/agent-base/.automation/INIT.fragment.md"),
             ("components/agent-core/.automation/bin/init_context.py", "templates/agent-base/.automation/bin/init_context.py"),
             ("components/agent-core/.automation/just/agent.just", "templates/agent-base/.automation/just/agent.just"),
+            ("components/adapters/base/.automation/ADAPTER", "templates/agent-base/.automation/ADAPTER"),
+            ("components/adapters/base/.automation/INIT.fragment.md", "templates/agent-base/.automation/INIT.fragment.md"),
             ("components/agent-core/.opencode/skills/initialize/SKILL.md", "templates/agent-base/.opencode/skills/initialize/SKILL.md"),
             ("components/agent-core/.opencode/commands/init.md", "templates/agent-base/.opencode/commands/init.md"),
             ("components/agent-core/.opencode/commands/task-run.md", "templates/agent-base/.opencode/commands/task-run.md"),

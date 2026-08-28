@@ -52,7 +52,18 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
             cwd=self.repo, env=self.env,
         )
         self.assertIn('"status": "initialized"', started.stdout)
-        return self.repo / ".worktrees" / f"{task}-{slug}"
+        worktree = self.repo / ".worktrees" / f"{task}-{slug}"
+        state = worktree / ".task-state/task.md"
+        resolved = state.read_text(encoding="utf-8")
+        resolved = resolved.replace("## Purpose\n\nTBD", "## Purpose\n\nOffline lifecycle fixture")
+        resolved = resolved.replace("## Scope\n\n- TBD", "## Scope\n\n- Lifecycle smoke coverage")
+        resolved = resolved.replace(
+            "- [ ] Define Task-specific acceptance criteria",
+            "- [ ] Complete the bounded lifecycle smoke scenario",
+        )
+        resolved = resolved.replace("- Unverified: Task contract", "- Unverified: lifecycle checks")
+        state.write_text(resolved, encoding="utf-8")
+        return worktree
 
     def test_start_work_units_duplicate_and_cleanup(self) -> None:
         worktree = self.start_task()

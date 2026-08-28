@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -74,7 +75,18 @@ class WorktreeRecord:
 def run(
     command: list[str], *, cwd: Path | None = None, check: bool = True
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+    environment = None
+    if command and command[0] == "git":
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, env=environment)
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise LifecycleError(f"{' '.join(command)}: {detail}")
@@ -418,6 +430,7 @@ def work_unit_next(root: Path, task: str) -> None:
 
 def work_unit_create(root: Path, task: str, role: str, objective: str) -> None:
     record = require_local_task(root, task)
+    require_resolved_contract(record, task)
     validate_work_unit_request(role, objective)
     with work_units_lock(record):
         assert_task_identity(record, task)
@@ -437,6 +450,7 @@ def work_unit_create(root: Path, task: str, role: str, objective: str) -> None:
 
 def work_unit_register(root: Path, task: str, work_unit: str, role: str, objective: str) -> None:
     record = require_local_task(root, task)
+    require_resolved_contract(record, task)
     if not WORK_UNIT_RE.fullmatch(work_unit):
         raise LifecycleError(f"invalid Work Unit ID: {work_unit!r}")
     validate_work_unit_request(role, objective)
@@ -515,6 +529,7 @@ def work_unit_state_set(
     error: str | None,
 ) -> None:
     record = require_local_task(root, task)
+    require_resolved_contract(record, task)
     if status not in WORK_UNIT_STATES:
         raise LifecycleError(f"invalid Work Unit state: {status}")
     validate_evidence(evidence)
@@ -646,7 +661,21 @@ def assert_task_identity(record: WorktreeRecord, task: str) -> None:
         raise LifecycleError("Task State identity mismatch: " + ", ".join(missing))
 
 
-def task_start(root: Path, task: str, slug: str) -> None:
+def require_resolved_contract(record: WorktreeRecord, task: str) -> None:
+    """Block every Task mutation until strict read-only initialization can pass."""
+    path = state_path(record.path)
+    text = path.read_text(encoding="utf-8")
+    if any(token in text for token in ("TBD", "Define Task-specific", "- Unverified: Task contract")):
+        raise LifecycleError("Task Contract is unresolved; mutation is forbidden before initialization")
+    canonical = "canonical-contract sha256=" in text
+    metadata = any((record.path / relative).is_file() for relative in (".task-state/issue.json", ".task-state/contract.json"))
+    if canonical or metadata:
+        from task_contract import validate_contract
+
+        validate_contract(record.path, task)
+
+
+def task_start(root: Path, task: str, slug: str, *, quiet: bool = False) -> WorktreeRecord:
     require_main_worktree(root)
     validate_task(task)
     validate_slug(slug)
@@ -694,8 +723,9 @@ def task_start(root: Path, task: str, slug: str) -> None:
         )
         run(["git", "branch", "-D", branch], cwd=root, check=False)
         raise
-    print(
-        json.dumps(
+    if not quiet:
+        print(
+            json.dumps(
             {
                 "task": task,
                 "branch": branch,
@@ -704,8 +734,31 @@ def task_start(root: Path, task: str, slug: str) -> None:
                 "baseRevision": base_revision,
                 "status": "initialized",
             }
+            )
         )
-    )
+    return current_worktree(worktree)
+
+
+def task_start_from_issue(root: Path, issue: str, slug: str) -> None:
+    """Atomically create and hydrate an Issue-backed Task Contract."""
+    from task_contract import ContractError, fetch_issue, hydrate_task_contract
+
+    require_main_worktree(root)
+    identity, payload = fetch_issue(root, issue)
+    task = issue
+    validate_task(task)
+    worktree = root / ".worktrees" / f"{task}-{slug}"
+    created: WorktreeRecord | None = None
+    try:
+        created = task_start(root, task, slug, quiet=True)
+        hydrate_task_contract(worktree, task, issue, payload, identity)
+    except Exception:
+        if created is not None:
+            run(["git", "worktree", "remove", "--force", str(worktree)], cwd=root, check=False)
+            if created.branch:
+                run(["git", "branch", "-D", created.branch], cwd=root, check=False)
+        raise
+    print(json.dumps({"task": task, "issue": int(issue), "repository": identity, "worktree": str(worktree), "status": "initialized", "contract": "canonical"}))
 
 
 def task_status(root: Path, task: str) -> None:
@@ -735,6 +788,7 @@ def task_status(root: Path, task: str) -> None:
 
 def task_state_set(root: Path, task: str, status: str) -> None:
     record = require_local_task(root, task)
+    require_resolved_contract(record, task)
     with work_units_lock(record):
         assert_task_identity(record, task)
         set_state_status(state_path(record.path), status)
@@ -921,6 +975,11 @@ def parser() -> argparse.ArgumentParser:
     start = sub.add_parser("start")
     start.add_argument("task")
     start.add_argument("slug")
+    issue_start = sub.add_parser("start-from-issue")
+    issue_start.add_argument("issue")
+    issue_start.add_argument("slug")
+    contract = sub.add_parser("contract-check")
+    contract.add_argument("task", nargs="?")
     status = sub.add_parser("status")
     status.add_argument("task")
     state = sub.add_parser("state-set")
@@ -966,6 +1025,11 @@ def main() -> int:
         root = repo_root()
         if args.command == "start":
             task_start(root, args.task, args.slug)
+        elif args.command == "start-from-issue":
+            task_start_from_issue(root, args.issue, args.slug)
+        elif args.command == "contract-check":
+            from task_contract import check_contract
+            print(json.dumps(check_contract(root, args.task), sort_keys=True))
         elif args.command == "status":
             task_status(root, args.task)
         elif args.command == "state-set":

@@ -7,10 +7,12 @@ This repository is designed for hierarchical agent-driven development.
 - Before planning, editing, delegation, or project commands in a new primary-agent or Task-Orchestrator session, read `.automation/INIT.md` and complete the `initialize` skill. Initialization is read-only and failures block work.
 - Depth-2 leaves inherit the parent Task Orchestrator's completed Task worktree initialization and Task Contract validation. They must not start `initialize` or the full workflow, and must not run `just agent::doctor`, `just agent::context`, or mandatory `just project::doctor` as startup prerequisites; already-allowed `project::*` commands remain usable when the bounded objective/check requires them.
 - Use the repository-local Just API for Task lifecycle, publication, and integration operations.
+- Normal GitHub-Issue-backed Tasks must be authoritatively materialized from their explicit numeric Issue before launch: Main uses only `just agent::task-start-from-issue <numeric-issue> <slug>`, verifies `just agent::contract-check <task>` returns `status: READY`, and launches exactly one Task Orchestrator only after that gate. Placeholder Tasks and the low-level `task-start` path are not normal Main authority.
 - Do not bypass guarded Just recipes with raw state-changing Git or GitHub commands.
 - Ordinary implementation Tasks must not modify Automation Core files: `opencode.json`, `AGENTS.md`, `Justfile`, `.opencode/**`, `.automation/**`, or `.github/workflows/**`.
 - `flake.nix` and `flake.lock` may be modified only when the active Task explicitly includes environment or dependency changes.
 - One Task owns one branch, one worktree, one disposable Task State, and one Task Orchestrator.
+- Task State is hydrated before the Task Orchestrator starts; the Task Orchestrator has no start, hydration, pre-initialization, or generic `.task-state` write authority.
 - Leaf agents execute bounded Work Units and never update `.task-state/task.md` directly.
 - Leaf agents must not create subagents.
 - Main Orchestrator owns Task scheduling and final integration. Task Orchestrators own implementation and publication preparation for exactly one Task.

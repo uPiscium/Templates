@@ -307,6 +307,27 @@ publication changes.
 The live bootstrap is the small initial trust anchor: its self-check detects
 accidental or concurrent divergence, but does not claim to defeat hostile
 replacement. That requires an external trusted launcher or signing mechanism.
+
+Issue #95 adds source-side recovery of a pristine registered Task Contract when
+the consumer Task State is still the v3.1.1 placeholder. For AgentKnowledgeVault
+Issue #19, run from a clean Templates checkout (replace the path with the
+already-registered consumer worktree):
+
+```sh
+just agent-core::recover-task-contract-from-issue /path/to/AgentKnowledgeVault/.worktrees/19-agent-core-v3-1-1 19
+cd /path/to/AgentKnowledgeVault/.worktrees/19-agent-core-v3-1-1
+just agent::preflight
+just agent::doctor
+just agent::context
+just project::doctor
+just project::check
+```
+
+The bridge resolves the exact registered worktree and lets the canonical
+`task_contract.py` validate identity, pristine state, and the same-repository
+open Issue before writing only ignored `.task-state` metadata. It is
+idempotent for the same snapshot. Do not manually edit `.task-state`; after
+recovery, use the strict initialization and normal guarded Task workflow.
 Hard-crash consistency remains out of scope; these safeguards do not change
 Issue #85 semantics or claim stronger durability.
 
