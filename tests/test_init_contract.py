@@ -175,6 +175,74 @@ class InitContractTest(unittest.TestCase):
                     for patch in reversed(patches):
                         patch.stop()
 
+    def test_unresolved_task_contract_blocks_context_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state" / "task.md"
+            state.parent.mkdir()
+            state.write_text(self.task_state_text(root).replace("## Purpose\n\n- defined", "## Purpose\n\nTBD"), encoding="utf-8")
+            before = state.read_bytes()
+            with self.assertRaisesRegex(init.InitError, "unresolved required fields"):
+                init.task_state(root)
+            self.assertEqual(before, state.read_bytes())
+
+    def test_git_runtime_scrubs_ambient_config_and_disables_fsmonitor(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        injected = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "/tmp/attacker",
+            "GIT_SSH_COMMAND": "/tmp/attacker",
+        }
+        with mock.patch.dict(os.environ, injected), mock.patch.object(
+            init.subprocess, "run", return_value=completed
+        ) as invoked:
+            init.git(Path("/tmp"), "status", "--short")
+        command = invoked.call_args.args[0]
+        environment = invoked.call_args.kwargs["env"]
+        self.assertIn("core.fsmonitor=false", command)
+        self.assertIn("core.hooksPath=/dev/null", command)
+        self.assertFalse(any(key.startswith("GIT_") and key not in {
+            "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"
+        } for key in environment))
+        self.assertEqual(os.devnull, environment["GIT_CONFIG_GLOBAL"])
+
+    def test_github_default_branch_fallback_is_origin_bound(self) -> None:
+        def fake_git(_root: Path, *args: str, check: bool = True) -> str:
+            if args[:2] == ("symbolic-ref", "--quiet"):
+                return ""
+            if args == ("remote", "get-url", "origin"):
+                return "https://github.com/acme/widgets.git"
+            raise AssertionError(args)
+
+        response = subprocess.CompletedProcess(
+            [], 0, '{"default_branch":"main"}', ""
+        )
+        with mock.patch.object(init, "git", side_effect=fake_git), mock.patch.object(
+            init, "run", return_value=response
+        ) as invoked:
+            self.assertEqual("main", init.default_branch(Path("/tmp")))
+        self.assertEqual(
+            ["gh", "api", "--hostname", "github.com", "repos/acme/widgets"],
+            invoked.call_args.args[0],
+        )
+        self.assertEqual(
+            ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"),
+            invoked.call_args.kwargs["remove_env"],
+        )
+
+    def test_orphaned_canonical_contract_marker_blocks_initialization(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text(
+                self.task_state_text(root) + "\n<!-- canonical-contract sha256=" + "a" * 64 + " issue=19 -->\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(init.InitError, "canonical Task Contract is unresolved"):
+                init.task_state(root)
+
     def test_default_branch_preflight_doctor_and_context_pass(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -374,7 +442,23 @@ class InitContractTest(unittest.TestCase):
                 "runtime-preflight",
             )
             task = root / ".worktrees" / "SMOKE-PREFLIGHT-runtime-preflight"
-            for command in ("agent::preflight", "agent::doctor", "agent::context"):
+            self.run_fixture(task, "just", "agent::preflight")
+            for command in ("agent::doctor", "agent::context"):
+                blocked = self.run_fixture(task, "just", command, check=False)
+                self.assertEqual(2, blocked.returncode)
+                self.assertIn("unresolved required fields", blocked.stderr)
+
+            state = task / ".task-state/task.md"
+            resolved = state.read_text(encoding="utf-8")
+            resolved = resolved.replace("## Purpose\n\nTBD", "## Purpose\n\nOffline lifecycle fixture")
+            resolved = resolved.replace("## Scope\n\n- TBD", "## Scope\n\n- Fixture-only lifecycle validation")
+            resolved = resolved.replace(
+                "- [ ] Define Task-specific acceptance criteria",
+                "- [ ] Exercise strict identity modes",
+            )
+            resolved = resolved.replace("- Unverified: Task contract", "- Unverified: fixture checks")
+            state.write_text(resolved, encoding="utf-8")
+            for command in ("agent::doctor", "agent::context"):
                 self.run_fixture(task, "just", command)
 
     def test_init_runtime_contains_no_repository_mutation_commands(self) -> None:
@@ -450,10 +534,10 @@ class InitContractTest(unittest.TestCase):
         pairs = [
             ("components/agent-core/.automation/INIT.md", "templates/agent-base/.automation/INIT.md"),
             ("components/agent-core/.automation/VERSION", "templates/agent-base/.automation/VERSION"),
-            ("components/adapters/base/.automation/ADAPTER", "templates/agent-base/.automation/ADAPTER"),
-            ("components/adapters/base/.automation/INIT.fragment.md", "templates/agent-base/.automation/INIT.fragment.md"),
             ("components/agent-core/.automation/bin/init_context.py", "templates/agent-base/.automation/bin/init_context.py"),
             ("components/agent-core/.automation/just/agent.just", "templates/agent-base/.automation/just/agent.just"),
+            ("components/adapters/base/.automation/ADAPTER", "templates/agent-base/.automation/ADAPTER"),
+            ("components/adapters/base/.automation/INIT.fragment.md", "templates/agent-base/.automation/INIT.fragment.md"),
             ("components/agent-core/.opencode/skills/initialize/SKILL.md", "templates/agent-base/.opencode/skills/initialize/SKILL.md"),
             ("components/agent-core/.opencode/commands/init.md", "templates/agent-base/.opencode/commands/init.md"),
             ("components/agent-core/.opencode/commands/task-run.md", "templates/agent-base/.opencode/commands/task-run.md"),

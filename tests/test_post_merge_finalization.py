@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "components/agent-core/.automation/bin"
 sys.path.insert(0, str(BIN))
 import task_lifecycle as lifecycle
+import task_contract
 
 spec = importlib.util.spec_from_file_location("post_merge_agent_core", BIN / "agent_core.py")
 assert spec and spec.loader
@@ -42,12 +43,9 @@ class RepositoryFixture(unittest.TestCase):
         self.configure(self.repo)
         (self.repo / ".automation/templates").mkdir(parents=True)
         (self.repo / ".automation/templates/task-state.md").write_text(
-            "- Task ID: @@TASK_ID@@\n"
-            "- Branch: @@BRANCH@@\n"
-            "- Worktree: @@WORKTREE@@\n"
-            "- Base branch: @@BASE_BRANCH@@\n"
-            "- Base revision: @@BASE_REVISION@@\n"
-            "- Status: initialized\n",
+            (ROOT / "components/agent-core/.automation/templates/task-state.md").read_text(
+                encoding="utf-8"
+            ),
             encoding="utf-8",
         )
         (self.repo / "tracked.txt").write_text("initial\n", encoding="utf-8")
@@ -79,7 +77,18 @@ class RepositoryFixture(unittest.TestCase):
 
     def start_task(self, task: str = "TASK-1", slug: str = "demo") -> Path:
         lifecycle.task_start(self.repo, task, slug)
-        return self.repo / ".worktrees" / f"{task}-{slug}"
+        worktree = self.repo / ".worktrees" / f"{task}-{slug}"
+        state = worktree / ".task-state/task.md"
+        resolved = state.read_text(encoding="utf-8")
+        resolved = resolved.replace("## Purpose\n\nTBD", "## Purpose\n\nFinalization fixture")
+        resolved = resolved.replace("## Scope\n\n- TBD", "## Scope\n\n- Guarded integration coverage")
+        resolved = resolved.replace(
+            "- [ ] Define Task-specific acceptance criteria",
+            "- [ ] Finalize only verified merged evidence",
+        )
+        resolved = resolved.replace("- Unverified: Task contract", "- Unverified: finalization checks")
+        state.write_text(resolved, encoding="utf-8")
+        return worktree
 
 
 class DefaultBranchSynchronizationTest(RepositoryFixture):
@@ -192,7 +201,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
         state.write_text(state.read_text(encoding="utf-8").replace("initialized", "integration-pending"), encoding="utf-8")
         return task_worktree, task_head, self.merged_evidence(task_worktree, merge_oid)
 
-    def finalize(self, evidence: dict) -> None:
+    def finalize(self, evidence: dict, task: str = "TASK-1") -> None:
         with (
             mock.patch.object(agent_core, "pr_details", side_effect=[evidence, evidence]),
             mock.patch.object(
@@ -201,7 +210,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 return_value=[{"number": 93, "headRefName": evidence["headRefName"], "baseRefName": "main"}],
             ),
         ):
-            agent_core.integrate_finalize(self.repo, "TASK-1", "93")
+            agent_core.integrate_finalize(self.repo, task, "93")
 
     def test_standard_squash_flow_and_idempotent_retry(self) -> None:
         task_worktree, task_head, evidence = self.prepare()
@@ -210,6 +219,52 @@ class PostMergeFinalizationTest(RepositoryFixture):
         self.assertFalse(agent_core.merge_commit_is_ancestor(self.repo, task_head, evidence["mergeCommit"]["oid"]))
         self.finalize(evidence)
         self.assertEqual(lifecycle.state_status(task_worktree / ".task-state/task.md"), "merged")
+
+    def test_unresolved_contract_cannot_finalize(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        state = task_worktree / ".task-state/task.md"
+        state.write_text(
+            state.read_text(encoding="utf-8").replace(
+                "## Purpose\n\nFinalization fixture", "## Purpose\n\nTBD"
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(agent_core.AutomationError, "unresolved"):
+            self.finalize(evidence)
+        self.assertEqual(lifecycle.state_status(state), "integration-pending")
+
+    def test_canonical_issue_contract_survives_guarded_finalization(self) -> None:
+        lifecycle.task_start(self.repo, "19", "issue-contract")
+        task_worktree = self.repo / ".worktrees/19-issue-contract"
+        payload = {
+            "number": 19,
+            "repository_url": "https://api.github.com/repos/acme/widgets",
+            "html_url": "https://github.com/acme/widgets/issues/19",
+            "title": "Guarded finalization integration",
+            "body": "Preserve authoritative Task Contract validation through finalization.",
+            "state": "open",
+            "labels": [],
+            "assignees": [],
+            "milestone": None,
+        }
+        task_contract.hydrate_task_contract(
+            task_worktree, "19", "19", payload, "acme/widgets"
+        )
+        (task_worktree / "task.txt").write_text("task change\n", encoding="utf-8")
+        command("git", "add", "task.txt", cwd=task_worktree)
+        command("git", "commit", "-m", "task", cwd=task_worktree)
+        merge_oid = self.publish("canonical contract squash result")
+        state = task_worktree / ".task-state/task.md"
+        state.write_text(
+            state.read_text(encoding="utf-8").replace(
+                "Status: initialized", "Status: integration-pending"
+            ),
+            encoding="utf-8",
+        )
+        evidence = self.merged_evidence(task_worktree, merge_oid)
+        self.finalize(evidence, task="19")
+        self.assertEqual(lifecycle.state_status(state), "merged")
+        self.assertEqual("READY", task_contract.validate_contract(task_worktree, "19")["status"])
 
     def test_finalized_task_is_eligible_for_existing_cleanup(self) -> None:
         task_worktree, _, evidence = self.prepare()

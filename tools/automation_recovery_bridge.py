@@ -21,7 +21,10 @@ import subprocess
 ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP_PATH = ROOT / "tools" / "automation_recovery_bridge.py"
 ENGINE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "automation_upgrade.py"
+CONTRACT_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_contract.py"
+LIFECYCLE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_lifecycle.py"
 _TRUSTED_GIT: Path | None = None
+_TRUSTED_GH: Path | None = None
 _REVISION_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -50,6 +53,34 @@ def trusted_git() -> Path:
         raise BridgeError(f"Git executable is not root-owned and immutable: {executable}")
     _TRUSTED_GIT = executable
     return executable
+
+
+def trusted_gh() -> Path:
+    global _TRUSTED_GH
+    if _TRUSTED_GH is not None:
+        return _TRUSTED_GH
+    candidate = shutil.which("gh")
+    if not candidate:
+        raise BridgeError("trusted GitHub CLI executable is unavailable")
+    executable = Path(candidate).resolve()
+    try:
+        metadata = executable.stat()
+    except OSError as exc:
+        raise BridgeError("trusted GitHub CLI executable is unavailable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise BridgeError(f"GitHub CLI executable is not root-owned and immutable: {executable}")
+    _TRUSTED_GH = executable
+    return executable
+
+
+def trusted_gh_run(command: list[str], **kwargs):
+    if not command or command[0] != "gh":
+        raise BridgeError("Task Contract GitHub runner only accepts gh commands")
+    environment = dict(kwargs.pop("env", os.environ))
+    for key in list(environment):
+        if key in {"GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"}:
+            environment.pop(key, None)
+    return subprocess.run([str(trusted_gh()), *command[1:]], env=environment, **kwargs)
 
 
 def git_bytes(args: list[str], *, cwd: Path) -> bytes:
@@ -134,6 +165,72 @@ def _verify_bootstrap(root: Path, revision: str) -> None:
 
 
 @contextmanager
+def _verified_task_contract(root: Path, revision: str):
+    """Load the contract and its dependency exclusively from HEAD Git blobs."""
+    contract_oid, contract_mode = _tree_blob(root, revision, "components/agent-core/.automation/bin/task_contract.py")
+    lifecycle_oid, lifecycle_mode = _tree_blob(root, revision, "components/agent-core/.automation/bin/task_lifecycle.py")
+    with tempfile.TemporaryDirectory(prefix="automation-contract-") as directory:
+        directory_path = Path(directory)
+        lifecycle_path = directory_path / "task_lifecycle.py"
+        contract_path = directory_path / "task_contract.py"
+        lifecycle_path.write_bytes(_blob(root, lifecycle_oid))
+        contract_path.write_bytes(_blob(root, contract_oid))
+        # The Git modes are validated by _tree_blob; the private copies need
+        # not retain executable bits and must not be writable by other users.
+        os.chmod(lifecycle_path, 0o600)
+        os.chmod(contract_path, 0o600)
+        lifecycle_name = f"_templates_verified_lifecycle_{secrets.token_hex(16)}"
+        contract_name = f"_templates_verified_contract_{secrets.token_hex(16)}"
+        previous_lifecycle = sys.modules.get("task_lifecycle")
+        previous_bytecode = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            lifecycle_spec = importlib.util.spec_from_file_location(lifecycle_name, lifecycle_path)
+            if lifecycle_spec is None or lifecycle_spec.loader is None:
+                raise BridgeError("cannot create specification for verified Task Contract dependency")
+            lifecycle = importlib.util.module_from_spec(lifecycle_spec)
+            sys.modules[lifecycle_name] = lifecycle
+            sys.modules["task_lifecycle"] = lifecycle
+            lifecycle_spec.loader.exec_module(lifecycle)
+
+            def trusted_lifecycle_run(command, *, cwd=None, check=True):
+                if not command or command[0] != "git":
+                    raise BridgeError("verified Task Contract attempted a non-Git lifecycle command")
+                environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+                environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                                    "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+                result = subprocess.run(
+                    [str(trusted_git()), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                     "-c", "core.pager=", *command[1:]], cwd=cwd, text=True,
+                    capture_output=True, env=environment)
+                if check and result.returncode:
+                    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+                    raise lifecycle.LifecycleError(f"{' '.join(command)}: {detail}")
+                return result
+
+            lifecycle.run = trusted_lifecycle_run
+            contract_spec = importlib.util.spec_from_file_location(contract_name, contract_path)
+            if contract_spec is None or contract_spec.loader is None:
+                raise BridgeError("cannot create specification for verified Task Contract")
+            contract = importlib.util.module_from_spec(contract_spec)
+            sys.modules[contract_name] = contract
+            contract_spec.loader.exec_module(contract)
+            yield contract
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise BridgeError(f"cannot load verified Task Contract: {exc}") from exc
+        finally:
+            sys.modules.pop(contract_name, None)
+            sys.modules.pop(lifecycle_name, None)
+            if previous_lifecycle is None:
+                sys.modules.pop("task_lifecycle", None)
+            else:
+                sys.modules["task_lifecycle"] = previous_lifecycle
+            sys.dont_write_bytecode = previous_bytecode
+
+
+@contextmanager
 def _verified_engine(root: Path, revision: str):
     oid, mode = _tree_blob(root, revision, "components/agent-core/.automation/bin/automation_upgrade.py")
     engine_bytes = _blob(root, oid)
@@ -177,15 +274,16 @@ def _verified_engine(root: Path, revision: str):
 
 @contextmanager
 def maintenance_environment():
-    previous = os.environ.get("AUTOMATION_MAINTENANCE")
+    previous = dict(os.environ)
     os.environ["AUTOMATION_MAINTENANCE"] = "1"
+    for key in list(os.environ):
+        if key.startswith("GIT_") or key in {"GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"}:
+            os.environ.pop(key, None)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop("AUTOMATION_MAINTENANCE", None)
-        else:
-            os.environ["AUTOMATION_MAINTENANCE"] = previous
+        os.environ.clear()
+        os.environ.update(previous)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -197,6 +295,9 @@ def parser() -> argparse.ArgumentParser:
     commit.add_argument("target", type=Path)
     commit.add_argument("task")
     commit.add_argument("message", nargs="?", default="")
+    issue = sub.add_parser("recover-task-contract-from-issue")
+    issue.add_argument("target", type=Path)
+    issue.add_argument("issue", type=_issue_argument)
     return result
 
 
@@ -206,6 +307,12 @@ def _error_text(exc: BaseException) -> str:
     return detail[:1600] or exc.__class__.__name__
 
 
+def _issue_argument(value: str) -> str:
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise BridgeError("Issue number must be an exact positive decimal integer")
+    return value
+
+
 def main() -> int:
     try:
         args = parser().parse_args()
@@ -213,20 +320,28 @@ def main() -> int:
             raise BridgeError("bootstrap path is not exactly the expected Templates path")
         revision = _clean_root(ROOT)
         _verify_bootstrap(ROOT, revision)
-        with _verified_engine(ROOT, revision) as engine:
-            if engine.git_executable().resolve() != trusted_git():
-                raise BridgeError("recovery engine selected a different Git executable")
-            _clean_root(ROOT, revision)
-            target = args.target.resolve()
-            with maintenance_environment():
-                if args.command == "recover-maintenance-authority":
-                    result = engine.recover_maintenance_authority_from_source(
-                        target, ROOT, expected_implementation_revision=revision)
-                elif args.command == "commit-recovered-maintenance":
-                    result = engine.commit_recovered_maintenance(
-                        target, ROOT, args.task, args.message, expected_implementation_revision=revision)
-                else:  # pragma: no cover
-                    raise BridgeError(f"unsupported bridge command: {args.command}")
+        _clean_root(ROOT, revision)
+        target = args.target.resolve()
+        with maintenance_environment():
+            if args.command == "recover-task-contract-from-issue":
+                trusted_git()
+                with _verified_task_contract(ROOT, revision) as contract:
+                    _clean_root(ROOT, revision)
+                    value = contract.recover_task_from_issue(target, args.issue, runner=trusted_gh_run)
+                result = {"status": "TASK_CONTRACT_RECOVERED", **value}
+            else:
+                with _verified_engine(ROOT, revision) as engine:
+                    if engine.git_executable().resolve() != trusted_git():
+                        raise BridgeError("recovery engine selected a different Git executable")
+                    _clean_root(ROOT, revision)
+                    if args.command == "recover-maintenance-authority":
+                        result = engine.recover_maintenance_authority_from_source(
+                            target, ROOT, expected_implementation_revision=revision)
+                    elif args.command == "commit-recovered-maintenance":
+                        result = engine.commit_recovered_maintenance(
+                            target, ROOT, args.task, args.message, expected_implementation_revision=revision)
+                    else:  # pragma: no cover
+                        raise BridgeError(f"unsupported bridge command: {args.command}")
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except Exception as exc:

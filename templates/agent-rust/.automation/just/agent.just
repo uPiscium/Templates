@@ -20,6 +20,14 @@ task-start task slug:
     python3 {{quote(lifecycle)}} start {{quote(task)}} {{quote(slug)}}
 
 [working-directory: root]
+task-start-from-issue issue slug:
+    python3 {{quote(lifecycle)}} start-from-issue {{quote(issue)}} {{quote(slug)}}
+
+[working-directory: root]
+contract-check task='':
+    python3 {{quote(lifecycle)}} contract-check {{if task != '' { quote(task) } else { '' }}}
+
+[working-directory: root]
 status task:
     python3 {{quote(lifecycle)}} status {{quote(task)}}
 

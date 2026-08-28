@@ -60,7 +60,7 @@ Stop initialization and report `BLOCKED` when any of the following is true:
 - `just project::doctor` fails;
 - a required Task Contract field is absent or still unresolved.
 
-Do not weaken a permission, select another Task, substitute an unconfigured model, or repair the repository in order to pass initialization.
+The initialization guard is strict and fail-closed. For a Task worktree, `agent::doctor` and `agent::context` validate the already-materialized Task Contract without mutation; unresolved placeholders remain a blocking error. Do not weaken a permission, select another Task, substitute an unconfigured model, or repair the repository in order to pass initialization.
 
 ## Project Adapter fragment
 

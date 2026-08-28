@@ -69,6 +69,15 @@ class OpenCodeDiscoverySmokeTest(unittest.TestCase):
         edges = set(TASK_EDGE_RE.findall(text))
         self.assertNotIn("task-orchestrator", edges)
 
+    def test_issue_backed_task_start_command_is_authoritative(self) -> None:
+        text = (CORE / "commands" / "task-start.md").read_text(encoding="utf-8").lower()
+        self.assertIn("just agent::task-start-from-issue <numeric-issue> <slug>", text)
+        self.assertIn("just agent::contract-check <numeric-issue>", text)
+        self.assertIn("status: ready", text)
+        self.assertIn("arbitrary url", text)
+        self.assertIn("placeholder task", text)
+        self.assertNotIn("just agent::task-start <task-id>", text)
+
 
 if __name__ == "__main__":
     unittest.main()

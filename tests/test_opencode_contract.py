@@ -338,6 +338,50 @@ class OpenCodeContractTest(unittest.TestCase):
                 agent,
             )
 
+    def test_issue_backed_main_authority_is_explicit_and_gated(self) -> None:
+        global_bash = self.config["permission"]["bash"]
+        build = permission_for("build")
+        build_bash = build["bash"]
+        self.assertEqual(global_bash["just agent::task-start-from-issue *"], "deny")
+        self.assertEqual(global_bash["just agent::task-start *"], "deny")
+        self.assertEqual(global_bash["just agent::contract-check *"], "allow")
+        self.assertEqual(build_bash["just agent::task-start-from-issue *"], "allow")
+        self.assertEqual(build_bash["just agent::task-start *"], "deny")
+        self.assertEqual(build_bash["just agent::contract-check *"], "allow")
+        self.assertEqual(build_bash["just agent::state-set *"], "deny")
+
+        main = body_text("build").lower()
+        for phrase in (
+            "numeric-issue",
+            "sole authoritative source",
+            "just agent::task-start-from-issue <numeric-issue> <slug>",
+            "never call the low-level `just agent::task-start`",
+            "just agent::contract-check <numeric-issue>",
+            "status: ready",
+            "exactly one `task-orchestrator`",
+            "never create or launch a placeholder task",
+            "arbitrary url or repository",
+            "do not add an llm interpretation step",
+        ):
+            self.assertIn(phrase, main, phrase)
+
+    def test_task_state_and_lifecycle_mutation_are_not_main_or_orchestrator_authority(self) -> None:
+        edit = self.config["permission"]["edit"]
+        self.assertEqual(edit[".task-state/**"], "deny")
+        for agent in ("build", "task-orchestrator"):
+            bash = permission_for(agent)["bash"]
+            self.assertEqual(bash.get("just agent::task-start *"), "deny", agent)
+            self.assertEqual(bash.get("just agent::task-start-from-issue *"), "deny" if agent == "task-orchestrator" else "allow", agent)
+            self.assertEqual(
+                bash.get("just agent::state-set *"),
+                "deny" if agent == "build" else "allow",
+                agent,
+            )
+
+        orchestrator = body_text("task-orchestrator").lower()
+        for phrase in ("do not start", "hydrate", "pre-initialize", "status: ready", "never use generic `.task-state` edits"):
+            self.assertIn(phrase, orchestrator, phrase)
+
     def test_automation_core_is_not_editable(self) -> None:
         edit = self.config["permission"]["edit"]
         for path in (

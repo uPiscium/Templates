@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 SUPPORTED_AGENT_CORE_VERSION = "3"
 REQUIRED_TOOLS = ("git", "gh", "just", "python3")
@@ -40,8 +42,30 @@ class InitError(RuntimeError):
     pass
 
 
-def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+def run(
+    command: list[str],
+    *,
+    cwd: Path,
+    check: bool = True,
+    remove_env: tuple[str, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    if command and command[0] == "git":
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+        )
+    for name in remove_env:
+        environment.pop(name, None)
+    result = subprocess.run(
+        command, cwd=cwd, text=True, capture_output=True, env=environment
+    )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         raise InitError(f"{' '.join(command)}: {detail}")
@@ -49,7 +73,19 @@ def run(command: list[str], *, cwd: Path, check: bool = True) -> subprocess.Comp
 
 
 def git(root: Path, *args: str, check: bool = True) -> str:
-    return run(["git", *args], cwd=root, check=check).stdout.strip()
+    return run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "--no-pager",
+            *args,
+        ],
+        cwd=root,
+        check=check,
+    ).stdout.strip()
 
 
 def repo_root(cwd: Path | None = None) -> Path:
@@ -57,14 +93,37 @@ def repo_root(cwd: Path | None = None) -> Path:
     return Path(git(start, "rev-parse", "--show-toplevel")).resolve()
 
 
+def github_repository_identity(root: Path) -> str:
+    remote = git(root, "remote", "get-url", "origin", check=False).removesuffix(".git")
+    if remote.startswith("git@github.com:"):
+        identity = remote.removeprefix("git@github.com:")
+    else:
+        parsed = urlparse(remote)
+        if parsed.scheme != "https" or parsed.hostname != "github.com" or parsed.username:
+            raise InitError("cannot resolve GitHub repository identity from origin")
+        identity = parsed.path.lstrip("/")
+    if identity.count("/") != 1 or any(
+        not re.fullmatch(r"[A-Za-z0-9_.-]+", part or "")
+        for part in identity.split("/")
+    ):
+        raise InitError("cannot resolve GitHub owner/name from origin")
+    return identity
+
+
 def default_branch(root: Path) -> str:
     symbolic = git(root, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD", check=False)
     if symbolic.startswith("origin/"):
         return symbolic.removeprefix("origin/")
-    result = run(["gh", "repo", "view", "--json", "defaultBranchRef"], cwd=root, check=False)
+    identity = github_repository_identity(root)
+    result = run(
+        ["gh", "api", "--hostname", "github.com", f"repos/{identity}"],
+        cwd=root,
+        check=False,
+        remove_env=("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"),
+    )
     if result.returncode == 0:
         try:
-            value = json.loads(result.stdout).get("defaultBranchRef", {}).get("name")
+            value = json.loads(result.stdout).get("default_branch")
         except json.JSONDecodeError:
             value = None
         if value:
@@ -105,6 +164,22 @@ def task_state(root: Path) -> dict | None:
             raise InitError(f"Task State missing identity field: {key}")
         values[key] = match.group(1).strip()
     values["path"] = str(path)
+    unresolved = ("TBD", "Define Task-specific", "- Unverified: Task contract")
+    if any(token in text for token in unresolved):
+        raise InitError("Task Contract contains unresolved required fields")
+    # Only Issue-backed states opt into the strict canonical contract engine;
+    # low-level/offline fixture Tasks intentionally retain their old bootstrap
+    # semantics until they are hydrated.
+    if (
+        "canonical-contract sha256=" in text
+        or (root / ".task-state" / "contract.json").is_file()
+        or (root / ".task-state" / "issue.json").is_file()
+    ):
+        try:
+            from task_contract import validate_contract
+            validate_contract(root, values["taskId"])
+        except Exception as exc:
+            raise InitError(f"canonical Task Contract is unresolved: {exc}") from exc
     return values
 
 

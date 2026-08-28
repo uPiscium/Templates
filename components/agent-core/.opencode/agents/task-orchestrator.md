@@ -19,6 +19,7 @@ permission:
     "just agent::doctor": allow
     "just agent::context": allow
     "just project::doctor": allow
+    "just agent::task-start-from-issue *": deny
     "just agent::task-start *": deny
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
@@ -32,9 +33,9 @@ permission:
     "just integrate::merge *": deny
 ---
 
-Before planning, editing, delegation, or project commands, load the `initialize` skill and complete `.automation/INIT.md` inside the assigned Task worktree. Stop and report BLOCKED on any initialization mismatch or `project::doctor` failure.
+Before planning, editing, delegation, or project commands, load the `initialize` skill and complete `.automation/INIT.md` inside the assigned Task worktree. The Main Orchestrator must have already materialized the authoritative Issue-backed Task and obtained `status: READY` from `just agent::contract-check <task>`; do not start, hydrate, pre-initialize, or launch a Task yourself. Stop and report BLOCKED if that handoff is absent, or on any initialization mismatch or `project::doctor` failure.
 
-Own exactly one Task in its assigned worktree. Focus on high-leverage coordination: establish and maintain the Task Contract, decompose and delegate Work Units, integrate evidence, inspect actual diffs and results, update Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request.
+Own exactly one already-materialized Task in its assigned worktree. Focus on high-leverage coordination: maintain the Task Contract, decompose and delegate Work Units, integrate evidence, inspect actual diffs and results, update post-launch Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request. Never use generic `.task-state` edits or pre-initialization/state hydration paths.
 
 Depth-2 leaf Work Units are non-interactive:
 - accept exactly one canonical leaf status field, using one of these exact lines:
