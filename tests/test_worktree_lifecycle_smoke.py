@@ -27,6 +27,8 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         temporary_root = Path(self.temporary.name)
+        remote = temporary_root / "origin.git"
+        run("git", "init", "--bare", "--initial-branch=main", str(remote), cwd=temporary_root)
         self.repo = temporary_root / "repo"
         shutil.copytree(TEMPLATE, self.repo)
         run("git", "init", "-b", "main", cwd=self.repo)
@@ -34,7 +36,8 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         run("git", "config", "user.name", "Smoke", cwd=self.repo)
         run("git", "add", ".", cwd=self.repo)
         run("git", "commit", "-m", "initial", cwd=self.repo)
-        run("git", "update-ref", "refs/remotes/origin/main", "HEAD", cwd=self.repo)
+        run("git", "remote", "add", "origin", str(remote), cwd=self.repo)
+        run("git", "push", "-u", "origin", "main", cwd=self.repo)
         run("git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main", cwd=self.repo)
         self.script = self.repo / ".automation" / "bin" / "task_lifecycle.py"
 

@@ -328,6 +328,8 @@ class InitContractTest(unittest.TestCase):
     def test_real_repository_identity_modes_preserve_strictness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "repository"
+            remote = Path(directory) / "origin.git"
+            self.run_fixture(Path(directory), "git", "init", "--bare", "--initial-branch=main", str(remote))
             shutil.copytree(ROOT / "templates" / "agent-base", root)
             self.run_fixture(root, "git", "init", "-b", "main")
             self.run_fixture(root, "git", "config", "user.name", "Preflight Test")
@@ -336,7 +338,8 @@ class InitContractTest(unittest.TestCase):
             )
             self.run_fixture(root, "git", "add", ".")
             self.run_fixture(root, "git", "commit", "-m", "fixture")
-            self.run_fixture(root, "git", "update-ref", "refs/remotes/origin/main", "HEAD")
+            self.run_fixture(root, "git", "remote", "add", "origin", str(remote))
+            self.run_fixture(root, "git", "push", "-u", "origin", "main")
             self.run_fixture(
                 root,
                 "git",
