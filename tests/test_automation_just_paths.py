@@ -14,8 +14,9 @@ TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agen
 RECIPES = (
     ("automation::version",),
     ("automation::check-update", "."),
-    ("automation::upgrade", "."),
-    ("automation::bootstrap-receipt", "."),
+    ("automation::upgrade", ".", "a" * 40),
+    ("automation::bootstrap-receipt", ".", "a" * 40),
+    ("automation::rebind-maintenance-provenance", ".", "a" * 40),
     ("automation::commit", "TASK-81", "message"),
 )
 
@@ -64,6 +65,16 @@ class AutomationJustPathTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertEqual(text.splitlines()[0], "root := justfile_directory()", path)
             self.assertNotIn("../..", text, path)
+
+    def test_source_rebind_recipe_uses_python_isolated_bridge(self) -> None:
+        justfile = ROOT / "just" / "agent-core.just"
+        text = justfile.read_text(encoding="utf-8")
+        self.assertIn("rebind-maintenance-provenance target expected_revision:", text)
+        self.assertIn(
+            "python3 -I {{quote(tool)}} rebind-maintenance-provenance "
+            "{{quote(target)}} {{quote(expected_revision)}}",
+            text,
+        )
 
     def test_dry_runs_select_main_repository_script(self) -> None:
         self._assert_dry_run_selects_local_script(linked=False)

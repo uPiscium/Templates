@@ -25,7 +25,7 @@ CONTRACT_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "ta
 LIFECYCLE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_lifecycle.py"
 _TRUSTED_GIT: Path | None = None
 _TRUSTED_GH: Path | None = None
-_REVISION_RE = re.compile(r"[0-9a-f]{40,64}")
+_REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 
 class BridgeError(RuntimeError):
@@ -137,7 +137,7 @@ def _tree_blob(root: Path, revision: str, relative: str) -> tuple[str, int]:
         if not separator or len(fields) != 3 or path.decode("utf-8", "surrogateescape") != relative:
             continue
         mode, kind, oid = fields
-        if kind != b"blob" or not re.fullmatch(rb"[0-9a-f]{40,64}", oid) or mode not in (b"100644", b"100755"):
+        if kind != b"blob" or not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", oid) or mode not in (b"100644", b"100755"):
             raise BridgeError(f"Git tree entry for {relative} is not a safe regular blob")
         matches.append((oid.decode("ascii"), int(mode, 8)))
     if len(matches) != 1:
@@ -298,6 +298,9 @@ def parser() -> argparse.ArgumentParser:
     issue = sub.add_parser("recover-task-contract-from-issue")
     issue.add_argument("target", type=Path)
     issue.add_argument("issue", type=_issue_argument)
+    rebind = sub.add_parser("rebind-maintenance-provenance")
+    rebind.add_argument("target", type=Path)
+    rebind.add_argument("expected_source_revision", type=_revision_argument)
     return result
 
 
@@ -310,6 +313,12 @@ def _error_text(exc: BaseException) -> str:
 def _issue_argument(value: str) -> str:
     if not re.fullmatch(r"[1-9][0-9]*", value):
         raise BridgeError("Issue number must be an exact positive decimal integer")
+    return value
+
+
+def _revision_argument(value: str) -> str:
+    if not _REVISION_RE.fullmatch(value):
+        raise BridgeError("source revision must be a full lowercase immutable Git object ID")
     return value
 
 
@@ -340,6 +349,10 @@ def main() -> int:
                     elif args.command == "commit-recovered-maintenance":
                         result = engine.commit_recovered_maintenance(
                             target, ROOT, args.task, args.message, expected_implementation_revision=revision)
+                    elif args.command == "rebind-maintenance-provenance":
+                        result = engine.rebind_maintenance_provenance_from_source(
+                            target, ROOT, args.expected_source_revision,
+                            expected_implementation_revision=revision)
                     else:  # pragma: no cover
                         raise BridgeError(f"unsupported bridge command: {args.command}")
         print(json.dumps(result, indent=2, sort_keys=True))
