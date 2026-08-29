@@ -613,11 +613,14 @@ Push is restricted to the Task branch with an explicit refspec. Force push is ne
 Agent Core upgrades are a separate, dedicated publication workflow, not ordinary Task work. The Task must be registered, non-default, and have ignored disposable Task State. From that Task worktree, use:
 
 ```sh
-AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout>
+AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout> <expected-revision>
 ```
 
-The source must be a trusted clean local Templates Git worktree root. The
-command pins its full, non-null `HEAD`, materializes only tracked
+The source must be a trusted clean local Templates Git worktree root. Upgrade
+requires the exact expected full immutable source revision; an actual-HEAD
+mismatch fails before tracked consumer mutation or receipt/authority
+publication, even for byte-identical trees, because commit identity is
+provenance. The command pins its full, non-null `HEAD`, materializes only tracked
 `components/agent-core` objects into a temporary snapshot, and plans/copies
 only from that snapshot. Tracked modifications or non-ignored untracked paths
 under Agent Core, an invalid source root, or a source race fail closed; ignored
@@ -629,14 +632,19 @@ continues to reject Automation Core paths. Upgrade preserves Adapter,
 repository, product, and CI-owned paths, and performs no commit, push, or
 merge.
 
-The read-only `automation::check-update` operation applies the same source
+The read-only `automation::check-update <source> [expected-revision]` operation applies the same source
 contract: its Templates argument must be a trusted clean Git worktree root
 with a full `HEAD`, and tracked or non-ignored untracked changes under
 `components/agent-core` are rejected. Ignored generated artifacts are
-structurally absent; compatible `VERSION` drift remains detectable. It pins
+structurally absent; compatible `VERSION` drift remains detectable and actual
+`HEAD` is always reported. It pins
 the source `HEAD`, materializes only tracked Agent Core objects into a
 temporary snapshot, and plans only from that snapshot. A source race fails
 closed.
+
+`automation::bootstrap-receipt <source> <expected-revision>` likewise requires
+the exact full immutable revision; it is not permitted to infer provenance from
+the current diff or a no-change result.
 
 The canonical publication flows are:
 
@@ -693,6 +701,47 @@ The canonical publication flows are:
   Successful upgrade writes or replaces the ignored `.task-state/automation-maintenance.json` receipt. Its schema-1 content records Task identity (`task_id`, `branch`, `worktree`), source and source revision, current/upstream versions, sorted unique `changed_paths`, the authority `HEAD`, and per-path content/state fingerprints. Receipt and authority publication is a logical pair. Authority records live under the Git-resolved per-worktree administrative directory returned by `--absolute-git-dir`, not an assumed visible `.git` or shared Git directory; linked and special administrative topologies are supported, and worktrees do not share authority. Existing safe legacy shared-common-dir hashed records remain validation/commit compatible. `automation::commit <task> [message]` fails closed unless both records match the current Task/worktree identity and `HEAD`, fingerprints, and complete pending path set. Receipt paths must be Agent Core-managed; any mixed Adapter, repository, product, configured-secret, or `.task-state` scope is rejected. Ambient Git repository/index overrides are scrubbed; exact blobs and modes are staged and rechecked in a private index, committed as that verified tree without hooks, and published only by an expected-HEAD Task branch update. A handled authority-write failure removes the newly written receipt if it is unchanged; an interruption half-state is recoverable only through the strict source-side bridge above. No cross-filesystem atomicity is claimed. The receipt is moved to `.task-state/automation-maintenance.consumed.json` after successful commit; the next successful upgrade with changes replaces the active receipt and removes the prior consumed receipt. A no-change invocation returns `NO_CHANGES` and preserves existing lifecycle evidence.
 
 The required sequence is `git diff --check`, `just agent::doctor`, `just project::check`, and the repository CI/smoke suite, followed by `just automation::commit <task> [message]`, existing `just agent::push <task>`, and `just agent::pr-create <task>` (Draft PR). Raw Git/GitHub bypass is not permitted. Merge is excluded from this workflow and remains a separately gated Main Orchestrator operation.
+
+#### Issue #97 provenance correction
+
+The active-consumer correction is deliberately narrow, not generic receipt
+editing or deletion:
+
+```sh
+AUTOMATION_MAINTENANCE=1 just automation::rebind-maintenance-provenance <trusted-source-at-expected-HEAD> <expected-revision>
+```
+
+For older consumers, the Templates source bridge is:
+
+```sh
+just agent-core::rebind-maintenance-provenance <consumer-worktree> <expected-revision>
+```
+
+It verifies bootstrap/engine trust, reconstructs old and expected immutable
+objects from the same Templates object database, requires the exact registered
+maintenance Task/worktree/branch/HEAD, one standard active receipt matching
+exactly one authority, safe pending Agent Core paths/fingerprints, no consumed,
+source-recovery, or ambiguous state, and an identical expected canonical diff.
+Tracked files remain unchanged; success reports `PROVENANCE_REBOUND`, while an
+already-correct pair reports `PROVENANCE_ALREADY_BOUND`. Missing authority
+remains the #85 route; committed or consumed state, including a crossed guarded
+publication boundary, rejects.
+Handled failures roll back safely and concurrency fails closed. No
+cross-filesystem atomicity or hard-crash durability is claimed; that remains
+#89 scope.
+
+For AgentKnowledgeVault #19, run exactly:
+
+```sh
+just agent-core::rebind-maintenance-provenance /path/to/AgentKnowledgeVault/.worktrees/19-agent-core-v3-1-1 835203b6f1ae342d31ed74372728e9862b9b36f0
+```
+
+`076653b054f5d8cbce4a28bcb6b381e9f30ee669` is the old receipt source revision,
+not the expected `835203...`; `1e3a795d5e2717f9c670a812777c4a38c9592db0` is
+baseline metadata. This is hermetic recovery: no commit, push, or PR, and no
+tracked-byte change. Verify, then use normal `automation::commit 19`. Issue
+#97 is a compatible maintenance fix: VERSION remains 3, and #83/#85 semantics
+are unchanged.
 
 ## 18. Integration boundary
 

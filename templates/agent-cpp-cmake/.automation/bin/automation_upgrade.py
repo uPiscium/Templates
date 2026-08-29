@@ -40,6 +40,7 @@ RECEIPT_FIELDS = {
     "authority_nonce",
     "path_fingerprints",
 }
+FULL_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _GIT_EXECUTABLE: Path | None = None
 
 
@@ -63,6 +64,26 @@ def task_state_dir(repo: Path) -> Path:
 def git_head(repo: Path) -> str:
     result = run(["git", "rev-parse", "HEAD"], cwd=repo, check=False)
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def git_object_format(repo: Path) -> str:
+    value = run(["git", "rev-parse", "--show-object-format"], cwd=repo).stdout.strip()
+    if value not in {"sha1", "sha256"}:
+        raise UpgradeError("cannot determine the Git object format")
+    return value
+
+
+def _oid_pattern(repo: Path) -> re.Pattern[str]:
+    return re.compile(rf"[0-9a-f]{{{40 if git_object_format(repo) == 'sha1' else 64}}}")
+
+
+def validate_commit_oid(repo: Path, value: object, *, field: str = "Git revision") -> str:
+    if not isinstance(value, str) or _oid_pattern(repo).fullmatch(value) is None:
+        raise UpgradeError(f"{field} must be a full lowercase commit ID for this repository")
+    resolved = run(["git", "rev-parse", "--verify", f"{value}^{{commit}}"], cwd=repo, check=False)
+    if resolved.returncode != 0 or resolved.stdout.strip() != value:
+        raise UpgradeError(f"{field} is not an exact commit in this repository object database")
+    return value
 
 
 def source_revision(source: Path) -> str | None:
@@ -662,8 +683,9 @@ def resolve_pinned_source(path: Path) -> tuple[Path, str]:
     source = resolve_source(path)
     top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=source).stdout.strip()).resolve()
     head = git_head(source)
-    if top != source or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+    if top != source:
         raise UpgradeError("source must be a Git worktree root with a full non-null HEAD")
+    validate_commit_oid(source, head, field="source HEAD")
     status = git_bytes(
         ["git", "status", "--porcelain=v1", "-z", "--", "components/agent-core"], cwd=source
     )
@@ -677,8 +699,9 @@ def resolve_clean_source_worktree(path: Path) -> tuple[Path, str]:
     source = resolve_source(path)
     top = Path(run(["git", "rev-parse", "--show-toplevel"], cwd=source).stdout.strip()).resolve()
     head = git_head(source)
-    if top != source or not re.fullmatch(r"[0-9a-f]{40,64}", head):
+    if top != source:
         raise UpgradeError("source must be a Git worktree root with a full non-null HEAD")
+    validate_commit_oid(source, head, field="source HEAD")
     if git_bytes(["git", "status", "--porcelain=v1", "-z"], cwd=source):
         raise UpgradeError("Templates source worktree must be clean")
     return source, head
@@ -699,16 +722,11 @@ def _source_is_compatible(receipt_source: str, source: Path) -> bool:
 
 
 def _validate_source_revision(source: Path, revision: object) -> str:
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision):
-        raise UpgradeError("receipt source_revision must be a full lowercase hexadecimal Git revision")
-    result = run(["git", "rev-parse", "--verify", f"{revision}^{{commit}}"], cwd=source, check=False)
-    if result.returncode != 0 or result.stdout.strip() != revision:
-        raise UpgradeError("receipt source_revision is not a commit in the current source object database")
-    return revision
+    return validate_commit_oid(source, revision, field="receipt source_revision")
 
 
 def _validate_expected_implementation_revision(revision: object) -> str:
-    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+    if not isinstance(revision, str) or FULL_OID_RE.fullmatch(revision) is None:
         raise UpgradeError(
             "expected implementation revision must be a full lowercase hexadecimal Git revision"
         )
@@ -1252,8 +1270,12 @@ def require_maintenance(repo: Path) -> tuple[str, str, Path]:
     return identity
 
 
-def check_update(repo: Path, source_path: Path) -> dict:
+def check_update(repo: Path, source_path: Path, expected_source_revision: str | None = None) -> dict:
     source, revision = resolve_pinned_source(source_path)
+    if expected_source_revision is not None:
+        validate_commit_oid(source, expected_source_revision, field="expected source revision")
+        if revision != expected_source_revision:
+            raise UpgradeError("source HEAD does not match the expected source revision")
     with tempfile.TemporaryDirectory(prefix="automation-update-") as temporary:
         snapshot, _ = materialize_source_snapshot(source, revision, Path(temporary))
         plan = build_plan(repo, snapshot)
@@ -1263,11 +1285,14 @@ def check_update(repo: Path, source_path: Path) -> dict:
     return plan
 
 
-def apply(repo: Path, source_path: Path) -> dict:
+def apply(repo: Path, source_path: Path, expected_source_revision: str) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
     if os.path.lexists(receipt_path(repo)) or authority_exists(repo):
         raise UpgradeError("cannot apply with an existing receipt or authority record")
     source, revision = resolve_pinned_source(source_path)
+    validate_commit_oid(source, expected_source_revision, field="expected source revision")
+    if revision != expected_source_revision:
+        raise UpgradeError("source HEAD does not match the expected source revision")
     with tempfile.TemporaryDirectory(prefix="automation-upgrade-") as temporary:
         snapshot, source_core = materialize_source_snapshot(source, revision, Path(temporary))
         plan = build_plan(repo, snapshot)
@@ -1387,7 +1412,7 @@ def reject_bootstrap_path(repo: Path, raw_path: str) -> None:
         raise UpgradeError(f"pending path is outside Agent Core: {path}")
 
 
-def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
+def bootstrap_receipt(repo: Path, source_path: Path, expected_source_revision: str) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
     authority_head = git_head(repo)
     authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip()
@@ -1411,6 +1436,10 @@ def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
     for path in pending:
         reject_bootstrap_path(repo, path)
     source, source_head = resolve_pinned_source(source_path)
+    validate_commit_oid(source, expected_source_revision, field="expected source revision")
+    if source_head != expected_source_revision:
+        raise UpgradeError("source HEAD does not match the expected source revision")
+    source_head = expected_source_revision
     if existing is not None:
         if str(source) != existing["source"] or source_head != existing["source_revision"]:
             raise UpgradeError("receipt source or revision is stale")
@@ -1515,6 +1544,331 @@ def bootstrap_receipt(repo: Path, source_path: Path) -> dict:
     return {"status": "RECEIPT_BOOTSTRAPPED", "changedPaths": expected, "authorityIssued": True}
 
 
+def _standard_authority_only(repo: Path, receipt: dict) -> Path:
+    new_path, legacy_path = _authority_locations(repo)
+    locations = [path for path in (new_path, legacy_path) if path is not None and os.path.lexists(path)]
+    if len(locations) != 1:
+        raise UpgradeError("missing or ambiguous successful-upgrade authority record")
+    if os.path.lexists(source_recovery_proof_path(repo)):
+        raise UpgradeError("cannot rebind source-recovery provenance")
+    authority = validate_authority(repo, receipt)
+    if authority != locations[0]:
+        raise UpgradeError("missing or invalid successful-upgrade authority record")
+    return authority
+
+
+def _reconstruct_pending(repo: Path, source: Path, revision: str, authority_head: str) -> tuple[list[str], dict[str, object], tuple[str, str]]:
+    """Reconstruct an upgrade solely from immutable trees, never from a live source tree."""
+    with tempfile.TemporaryDirectory(prefix="automation-rebind-") as temporary:
+        baseline = Path(temporary) / "baseline"
+        snapshot, source_core = materialize_source_snapshot(source, revision, Path(temporary))
+        materialize_tree(repo, authority_head, baseline, surface_only=True)
+        before = {
+            path.relative_to(baseline).as_posix(): bootstrap_fingerprint(baseline, path.relative_to(baseline).as_posix())
+            for path in baseline.rglob("*") if path.is_file()
+        }
+        plan = build_plan(baseline, snapshot)
+        if plan["blockers"]:
+            raise UpgradeError("reconstruction blocked:\n- " + "\n- ".join(plan["blockers"]))
+        selected = [migration for migration in load_migrations(source_core)
+                    if migration.to_version <= version_number(source_core)]
+        _, migration_blockers, _ = migration_actions(repo, selected)
+        if migration_blockers:
+            raise UpgradeError("reconstruction blocked:\n- " + "\n- ".join(migration_blockers))
+        returned = {item["path"] for item in plan["actions"] if item["action"] != "noop"}
+        apply_plan_to_tree(baseline, source_core, plan)
+        paths = sorted(path for path in returned if before.get(path, {"state": "absent", "mode": None, "content_sha256": None})
+                       != bootstrap_fingerprint(baseline, path))
+        return paths, {path: bootstrap_fingerprint(baseline, path) for path in paths}, (plan["currentVersion"], plan["upstreamVersion"])
+
+
+def _rename_record_at(source: str, destination: str, *, source_dir_fd: int, destination_dir_fd: int) -> None:
+    """Narrow test seam for the dirfd-relative atomic publication boundary."""
+    os.rename(
+        source,
+        destination,
+        src_dir_fd=source_dir_fd,
+        dst_dir_fd=destination_dir_fd,
+    )
+
+
+def _replace_standard_pair(repo: Path, old_receipt_raw: bytes, old_authority_raw: bytes,
+                           receipt: dict, authority_path_value: Path,
+                           receipt_identity: tuple[int, int], authority_identity: tuple[int, int]) -> None:
+    active = receipt_path(repo)
+    admin = _rollback_authority_guard(repo, authority_path_value)
+    _validate_admin_record_parent(authority_path_value, admin)
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW") \
+             or any(operation not in getattr(os, "supports_dir_fd", set())
+                    for operation in (os.open, os.rename, os.unlink)):
+        raise UpgradeError("secure dirfd-relative record replacement is unavailable")
+    originals = {active: (old_receipt_raw, receipt_identity),
+                 authority_path_value: (old_authority_raw, authority_identity)}
+    new_instances: dict[Path, tuple[bytes, tuple[int, int]]] = {}
+    handles: dict[Path, tuple[int, str]] = {}
+
+    def open_parent(path: Path) -> tuple[int, str]:
+        parent = path.parent
+        expected = os.stat(parent, follow_symlinks=False)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise UpgradeError("record parent is not a directory")
+        if not parent.is_absolute():
+            raise UpgradeError("record parent is not absolute")
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open(os.sep, flags)
+        try:
+            for component in parent.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
+        except BaseException:
+            os.close(fd)
+            raise
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            os.close(fd)
+            raise UpgradeError("record parent changed during secure open")
+        return fd, path.name
+
+    def read_at(handle: tuple[int, str]) -> tuple[bytes, tuple[int, int]]:
+        fd, name = handle
+        record_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            metadata = os.fstat(record_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise UpgradeError("record is not a regular file")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(record_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks), (metadata.st_dev, metadata.st_ino)
+        finally:
+            os.close(record_fd)
+
+    def write_all(fd: int, content: bytes) -> None:
+        offset = 0
+        while offset < len(content):
+            written = os.write(fd, content[offset:])
+            if written <= 0:
+                raise OSError("short secure record write")
+            offset += written
+
+    def parent_unchanged(handle: tuple[int, str], path: Path) -> bool:
+        opened = os.fstat(handle[0])
+        try:
+            current = os.stat(path.parent, follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISDIR(current.st_mode) and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+
+    def replace(path: Path, content: bytes) -> None:
+        expected_bytes, expected_identity = originals[path]
+        handle = handles[path]
+        if read_at(handle) != (expected_bytes, expected_identity):
+            raise UpgradeError("receipt or authority changed before provenance replacement")
+        fd, name = handle
+        temporary = f".{name}.replace-{secrets.token_hex(16)}"
+        temporary_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        published = False
+        try:
+            try:
+                write_all(temporary_fd, content)
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            _rename_record_at(temporary, name, source_dir_fd=fd, destination_dir_fd=fd)
+            published = True
+        finally:
+            if not published:
+                try:
+                    os.unlink(temporary, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+        created = read_at(handle)
+        if created[0] != content:
+            raise UpgradeError("new record failed postvalidation")
+        new_instances[path] = created
+
+    try:
+        for path, (old_bytes, old_identity) in originals.items():
+            handles[path] = open_parent(path)
+            if read_at(handles[path]) != (old_bytes, old_identity):
+                raise UpgradeError("receipt or authority changed before provenance replacement")
+        receipt_bytes = (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        replace(active, receipt_bytes)
+        authority_bytes = (json.dumps({
+            "schema_version": 1, "task_id": receipt["task_id"], "branch": receipt["branch"],
+            "worktree": receipt["worktree"], "authority_nonce": receipt["authority_nonce"],
+            "receipt_sha256": receipt_digest(receipt),
+        }, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        replace(authority_path_value, authority_bytes)
+        try:
+            receipt_record = validate_receipt_schema(json.loads(receipt_bytes.decode("utf-8")))
+            authority_record = json.loads(authority_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:  # pragma: no cover - generated above
+            raise UpgradeError("rebound receipt or authority is not valid JSON") from exc
+        expected_authority = {
+            "schema_version": 1,
+            "task_id": receipt["task_id"],
+            "branch": receipt["branch"],
+            "worktree": receipt["worktree"],
+            "authority_nonce": receipt["authority_nonce"],
+            "receipt_sha256": receipt_digest(receipt),
+        }
+        if (
+            read_at(handles[active]) != new_instances[active]
+            or read_at(handles[authority_path_value]) != new_instances[authority_path_value]
+            or receipt_record != receipt
+            or authority_record != expected_authority
+            # These are deliberately the last checks before success. Semantic
+            # validation above reads only through retained directory FDs.
+            or not parent_unchanged(handles[active], active)
+            or not parent_unchanged(handles[authority_path_value], authority_path_value)
+        ):
+            raise UpgradeError("rebound receipt or authority failed post-publication validation")
+    except (OSError, UpgradeError) as failure:
+        rollback_errors: list[str] = []
+        for path, (old_bytes, old_identity) in originals.items():
+            try:
+                if path in new_instances:
+                    new_bytes, new_identity = new_instances[path]
+                    if read_at(handles[path]) != (new_bytes, new_identity):
+                        raise UpgradeError("unknown concurrent record preserved")
+                    replace_old = f".{path.name}.rollback-{secrets.token_hex(16)}"
+                    replace_old_fd = os.open(replace_old, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=handles[path][0])
+                    rollback_published = False
+                    try:
+                        try:
+                            write_all(replace_old_fd, old_bytes)
+                            os.fsync(replace_old_fd)
+                        finally:
+                            os.close(replace_old_fd)
+                        _rename_record_at(
+                            replace_old,
+                            handles[path][1],
+                            source_dir_fd=handles[path][0],
+                            destination_dir_fd=handles[path][0],
+                        )
+                        rollback_published = True
+                    finally:
+                        if not rollback_published:
+                            try:
+                                os.unlink(replace_old, dir_fd=handles[path][0])
+                            except FileNotFoundError:
+                                pass
+                elif read_at(handles[path]) != (old_bytes, old_identity):
+                    raise UpgradeError("unknown concurrent record preserved")
+            except (OSError, UpgradeError) as rollback:
+                rollback_errors.append(f"{path}: {rollback}")
+        if rollback_errors:
+            raise UpgradeError("provenance replacement failed and rollback failed: " + "; ".join(rollback_errors)) from failure
+        raise
+    finally:
+        for fd, _ in handles.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _rebind_maintenance_provenance(repo: Path, source_path: Path, expected_source_revision: str,
+                                   *, require_source_head: bool,
+                                   expected_implementation_revision: str | None = None) -> dict:
+    """Replace only a valid standard receipt/authority pair with new provenance."""
+    task_id, branch, worktree = require_maintenance(repo)
+    source, current_source_revision = resolve_pinned_source(source_path)
+    validate_commit_oid(source, expected_source_revision, field="expected source revision")
+    if require_source_head and current_source_revision != expected_source_revision:
+        raise UpgradeError("source HEAD does not match the expected source revision")
+    active = receipt_path(repo)
+    raw_receipt, old = _read_json_record_bytes(active, "invalid automation upgrade receipt")
+    old = validate_receipt_schema(old)
+    old_paths_from_receipt = receipt_paths(repo, old)
+    fingerprints = old.get("path_fingerprints")
+    if not isinstance(fingerprints, dict) or set(fingerprints) != set(old_paths_from_receipt):
+        raise UpgradeError("automation receipt fingerprints do not match its paths")
+    if any(file_fingerprint(repo, path) != fingerprints[path] for path in old_paths_from_receipt):
+        raise UpgradeError("automation receipt path content/state fingerprint changed")
+    if old["source_revision"] is None or not _source_is_compatible(old["source"], source):
+        raise UpgradeError("receipt source is not compatible with the current Templates source")
+    old_revision = _validate_source_revision(source, old["source_revision"])
+    authority = _standard_authority_only(repo, old)
+    old_authority_raw = authority.read_bytes()
+    receipt_identity = (active.lstat().st_dev, active.lstat().st_ino)
+    authority_identity = (authority.lstat().st_dev, authority.lstat().st_ino)
+    authority_head = validate_commit_oid(repo, old["authority_head"], field="receipt authority HEAD")
+    if os.path.lexists(consumed_receipt_path(repo)):
+        raise UpgradeError("cannot rebind a consumed automation receipt")
+    if (old["task_id"], old["branch"], old["worktree"]) != (task_id, branch, str(worktree)):
+        raise UpgradeError("automation receipt identity does not match the current Task worktree")
+    if git_head(repo) != authority_head or pending_paths(repo) != old["changed_paths"]:
+        raise UpgradeError("maintenance worktree changed since provenance was issued")
+    authority_branch_oid = run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip()
+    authority_registration = registered_worktrees(repo).get(worktree)
+    if authority_branch_oid != authority_head or authority_registration != (branch, authority_head):
+        raise UpgradeError("Task branch registration does not match the receipt authority")
+    old_paths, old_fingerprints, old_versions = _reconstruct_pending(repo, source, old_revision, authority_head)
+    if old_paths != old["changed_paths"] or old_fingerprints != old["path_fingerprints"]:
+        raise UpgradeError("receipt does not validate against its immutable source reconstruction")
+    if old_versions != (old["current_version"], old["upstream_version"]):
+        raise UpgradeError("receipt versions do not validate against its immutable source reconstruction")
+    expected_paths, expected_fingerprints, expected_versions = _reconstruct_pending(repo, source, expected_source_revision, authority_head)
+    if expected_paths != old_paths or any(file_fingerprint(repo, path) != expected_fingerprints[path] for path in expected_paths):
+        raise UpgradeError("expected provenance does not produce the existing pending content")
+    candidate = dict(old)
+    candidate.update({"source": str(source), "source_revision": expected_source_revision,
+                      "current_version": expected_versions[0], "upstream_version": expected_versions[1],
+                      "authority_nonce": secrets.token_hex(32), "path_fingerprints": expected_fingerprints})
+    # Revalidate all protected state immediately before publication.
+    if require_source_head:
+        current_source, current_revision = resolve_pinned_source(source)
+    else:
+        current_source, current_revision = resolve_clean_source_worktree(source)
+        if expected_implementation_revision is None or current_revision != expected_implementation_revision:
+            raise UpgradeError("source implementation changed before provenance replacement")
+    if active.read_bytes() != raw_receipt or authority.read_bytes() != old_authority_raw or pending_paths(repo) != expected_paths \
+            or git_head(repo) != authority_head or current_source != source \
+            or (require_source_head and current_revision != expected_source_revision) \
+            or (active.lstat().st_dev, active.lstat().st_ino) != receipt_identity \
+            or (authority.lstat().st_dev, authority.lstat().st_ino) != authority_identity \
+            or run(["git", "rev-parse", f"refs/heads/{branch}"], cwd=repo).stdout.strip() != authority_branch_oid \
+            or registered_worktrees(repo).get(worktree) != authority_registration \
+            or validate_commit_oid(source, expected_source_revision, field="expected source revision") != expected_source_revision:
+        raise UpgradeError("receipt, authority, source, or pending content changed before provenance replacement")
+    if any(file_fingerprint(repo, path) != expected_fingerprints[path] for path in expected_paths):
+        raise UpgradeError("pending Agent Core content changed before provenance replacement")
+    if old["source_revision"] == expected_source_revision and old_versions == expected_versions:
+        return {"status": "PROVENANCE_ALREADY_BOUND", "changedPaths": expected_paths, "sourceRevision": expected_source_revision}
+    _replace_standard_pair(repo, raw_receipt, old_authority_raw, candidate, authority,
+                           receipt_identity, authority_identity)
+    return {"status": "PROVENANCE_REBOUND", "changedPaths": expected_paths, "sourceRevision": expected_source_revision}
+
+
+def rebind_maintenance_provenance(repo: Path, source_path: Path, expected_source_revision: str) -> dict:
+    return _rebind_maintenance_provenance(repo, source_path, expected_source_revision, require_source_head=True)
+
+
+def rebind_maintenance_provenance_from_source(
+    target_repo: Path,
+    templates_source_root: Path,
+    expected_source_revision: str,
+    *,
+    expected_implementation_revision: str,
+) -> dict:
+    """Source-side bridge: validate the live implementation and retain historical source objects."""
+    source, implementation_revision = resolve_clean_source_worktree(templates_source_root)
+    validate_commit_oid(source, expected_implementation_revision, field="expected implementation revision")
+    if implementation_revision != expected_implementation_revision:
+        raise UpgradeError("source HEAD does not match the expected implementation revision")
+    validate_commit_oid(source, expected_source_revision, field="expected source revision")
+    return _rebind_maintenance_provenance(
+        target_repo, source, expected_source_revision, require_source_head=False,
+        expected_implementation_revision=expected_implementation_revision,
+    )
+
+
 PROOF_FIELDS = {
     "schema_version", "kind", "task_id", "branch", "worktree", "authority_head",
     "authority_nonce", "receipt_sha256", "receipt_bytes_sha256", "changed_paths_sha256",
@@ -1554,7 +1908,7 @@ def _validate_recovery_proof(proof: object) -> dict:
                 "receipt_source", "receipt_source_revision"):
         if not isinstance(proof[key], str) or not proof[key]:
             raise UpgradeError("missing or invalid source-recovery proof")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", proof["implementation_revision"]):
+    if FULL_OID_RE.fullmatch(proof["implementation_revision"]) is None:
         raise UpgradeError("invalid source-recovery implementation revision")
     for key in ("receipt_sha256", "receipt_bytes_sha256", "changed_paths_sha256", "path_fingerprints_sha256"):
         if not re.fullmatch(r"[0-9a-f]{64}", proof[key]):
@@ -1749,7 +2103,7 @@ def validate_receipt_schema(receipt: object) -> dict:
         raise UpgradeError("automation upgrade receipt has an invalid source revision")
     if not Path(receipt["source"]).is_absolute():
         raise UpgradeError("automation upgrade receipt source must be absolute")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", receipt["authority_head"]):
+    if FULL_OID_RE.fullmatch(receipt["authority_head"]) is None:
         raise UpgradeError("automation upgrade receipt has an invalid authority HEAD")
     if not re.fullmatch(r"[0-9a-f]{64}", receipt["authority_nonce"]):
         raise UpgradeError("automation upgrade receipt has an invalid authority nonce")
@@ -2054,10 +2408,16 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("version")
     check = sub.add_parser("check-update")
     check.add_argument("--source", type=Path, required=True)
+    check.add_argument("--expected-source-revision")
     upgrade = sub.add_parser("upgrade")
     upgrade.add_argument("--source", type=Path, required=True)
+    upgrade.add_argument("--expected-source-revision", required=True)
     bootstrap = sub.add_parser("bootstrap-receipt")
     bootstrap.add_argument("--source", type=Path, required=True)
+    bootstrap.add_argument("--expected-source-revision", required=True)
+    rebind = sub.add_parser("rebind-maintenance-provenance")
+    rebind.add_argument("--source", type=Path, required=True)
+    rebind.add_argument("--expected-source-revision", required=True)
     commit_parser = sub.add_parser("commit")
     commit_parser.add_argument("task")
     commit_parser.add_argument("message", nargs="?", default="")
@@ -2071,11 +2431,13 @@ def main() -> int:
         if args.command == "version":
             result = context(repo)
         elif args.command == "check-update":
-            result = check_update(repo, args.source)
+            result = check_update(repo, args.source, args.expected_source_revision)
         elif args.command == "upgrade":
-            result = apply(repo, args.source)
+            result = apply(repo, args.source, args.expected_source_revision)
         elif args.command == "bootstrap-receipt":
-            result = bootstrap_receipt(repo, args.source)
+            result = bootstrap_receipt(repo, args.source, args.expected_source_revision)
+        elif args.command == "rebind-maintenance-provenance":
+            result = rebind_maintenance_provenance(repo, args.source, args.expected_source_revision)
         elif args.command == "commit":
             result = commit(repo, args.task, args.message)
         else:  # pragma: no cover

@@ -217,10 +217,13 @@ just automation::version
 The repository never fetches or executes upstream code automatically. Check against a trusted local Templates checkout:
 
 ```sh
-just automation::check-update /path/to/Templates
+just automation::check-update /path/to/Templates [expected-revision]
 ```
 
-This reports current/upstream versions and the ownership boundaries without mutating the repository. Agent Core upgrades must never be silently mixed into an ordinary Task.
+This reports the actual source `HEAD` and optionally asserts an exact full
+immutable expected revision, alongside current/upstream versions and ownership
+boundaries, without mutation. Agent Core upgrades must never be silently mixed
+into an ordinary Task.
 
 Both `automation::check-update` and `automation::upgrade` accept only a trusted
 Git worktree root for the Templates source. The source worktree must have a
@@ -237,11 +240,14 @@ is still reported; a source race after pinning fails closed.
 Use a dedicated, registered, non-default **Automation Maintenance Task** worktree. The complete canonical publication workflow is:
 
 ```sh
-AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout>
+AUTOMATION_MAINTENANCE=1 just automation::upgrade <trusted local Templates checkout> <expected-revision>
 ```
 
-The source must be a trusted clean local Templates Git worktree root. The
-command pins its full `HEAD`, materializes only tracked
+The source must be a trusted clean local Templates Git worktree root. Upgrade
+requires the exact expected full immutable source revision; an actual-HEAD
+mismatch fails before tracked consumer mutation or receipt/authority
+publication, even for byte-identical trees, because commit identity is
+provenance. The command pins its full `HEAD`, materializes only tracked
 `components/agent-core` objects into a temporary snapshot, and plans/copies
 only from that snapshot. Tracked modifications or non-ignored untracked paths
 under Agent Core, a source race, or an invalid source root fail closed; ignored
@@ -250,6 +256,15 @@ default branch, an unregistered Task, missing Task State, or a
 non-ignored/tracked Task State path. The ambient `AUTOMATION_MAINTENANCE=1`
 variable grants upgrade opt-in only; it does not grant commit authority, and
 ordinary `just agent::commit <task>` still rejects Automation Core changes.
+
+The receipt-reconstruction form also requires the exact revision:
+
+```sh
+AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted local Templates checkout> <expected-revision>
+```
+
+Issue #97 is a compatible maintenance fix: `.automation/VERSION` remains 3,
+and #83/#85 semantics remain unchanged.
 
 It materializes only Agent Core-owned paths and preserves Adapter-owned `.automation/ADAPTER`, `.automation/INIT.fragment.md`, `.automation/adoption.toml`, `just/project/**`, local modules, and repository CI. On success it creates or replaces the ignored `.task-state/automation-maintenance.json` receipt; it does not commit, push, or merge. Inspect the diff and run:
 
@@ -262,6 +277,47 @@ just automation::commit <task> [message]
 just agent::push <task>
 just agent::pr-create <task>
 ```
+
+Issue #97 provides a narrow provenance correction. The canonical active-consumer
+command is:
+
+```sh
+AUTOMATION_MAINTENANCE=1 just automation::rebind-maintenance-provenance <trusted-source-at-expected-HEAD> <expected-revision>
+```
+
+This is a standard receipt+authority correction, not generic editing or
+deletion. For older consumers, the Templates source bridge is:
+
+```sh
+just agent-core::rebind-maintenance-provenance <consumer-worktree> <expected-revision>
+```
+
+It verifies bootstrap/engine trust, reconstructs old and expected immutable
+objects from the same Templates object database, requires an unchanged expected
+canonical diff and exact safe pending Agent Core paths/fingerprints, leaves
+tracked files unchanged, and reports `PROVENANCE_REBOUND` or idempotent
+`PROVENANCE_ALREADY_BOUND`. Then run ordinary consumer verification and the
+existing `automation::commit`.
+
+Eligibility requires the exact registered maintenance Task/worktree/branch/HEAD,
+one standard active receipt matching exactly one authority, no consumed,
+source-recovery, or ambiguous state, and old/expected revisions in the same
+Templates object database. Missing authority remains the Issue #85 route;
+committed or consumed state, including a crossed guarded publication boundary,
+is rejected. Handled failures
+rollback safely and concurrency fails closed. No cross-filesystem atomicity or
+hard-crash durability claim is made; that remains Issue #89 scope.
+
+For AgentKnowledgeVault Issue #19, the exact command is:
+
+```sh
+just agent-core::rebind-maintenance-provenance /path/to/AgentKnowledgeVault/.worktrees/19-agent-core-v3-1-1 835203b6f1ae342d31ed74372728e9862b9b36f0
+```
+
+The receipt's `076653b054f5d8cbce4a28bcb6b381e9f30ee669` is the old source
+revision, not the expected revision; `1e3a795d5e2717f9c670a812777c4a38c9592db0`
+is baseline metadata. This hermetic recovery makes no commit, push, or PR;
+tracked bytes remain unchanged. Verify, then use normal `automation::commit 19`.
 
 Issue #85 provides a narrower Templates source-side bridge for a consumer
 worktree with the exact active receipt but missing authority. From the Templates

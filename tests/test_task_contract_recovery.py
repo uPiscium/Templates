@@ -27,6 +27,31 @@ class TaskContractRecoveryTest(unittest.TestCase):
         self.assertEqual((args.command, args.task, args.message), ("commit-recovered-maintenance", "T-1", ""))
         args = bridge.parser().parse_args(["recover-task-contract-from-issue", "/tmp/task", "19"])
         self.assertEqual((args.command, args.issue), ("recover-task-contract-from-issue", "19"))
+        args = bridge.parser().parse_args(["rebind-maintenance-provenance", "/tmp/task", "a" * 40])
+        self.assertEqual((args.command, args.expected_source_revision), ("rebind-maintenance-provenance", "a" * 40))
+        args = bridge.parser().parse_args(["rebind-maintenance-provenance", "/tmp/task", "a" * 64])
+        self.assertEqual(args.expected_source_revision, "a" * 64)
+        for value in ("a" * 39, "a" * 41, "a" * 63, "A" * 40, "main", "v1.2.3"):
+            with self.subTest(value=value):
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.parser().parse_args(["rebind-maintenance-provenance", "/tmp/task", value])
+
+    def test_rebind_passes_raw_source_revision_to_verified_engine(self) -> None:
+        engine = mock.Mock()
+        engine.git_executable.return_value = bridge.trusted_git()
+        engine.rebind_maintenance_provenance_from_source.return_value = {"status": "REBIND_COMPLETE"}
+        with mock.patch.object(bridge, "_clean_root", return_value="b" * 40), \
+             mock.patch.object(bridge, "_verify_bootstrap"), \
+             mock.patch.object(bridge, "_verified_engine") as verified, \
+             mock.patch.object(bridge, "maintenance_environment"), \
+             mock.patch.object(sys, "argv", ["bridge", "rebind-maintenance-provenance", "/tmp/task", "a" * 40]), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            verified.return_value.__enter__.return_value = engine
+            self.assertEqual(bridge.main(), 0)
+        engine.rebind_maintenance_provenance_from_source.assert_called_once_with(
+            Path("/tmp/task").resolve(), bridge.ROOT, "a" * 40,
+            expected_implementation_revision="b" * 40,
+        )
 
     def test_dirty_source_is_rejected_before_target_engine_call(self) -> None:
         with mock.patch.object(bridge, "_clean_root", side_effect=bridge.BridgeError("dirty")), \
