@@ -21,6 +21,8 @@ permission:
     "just project::doctor": allow
     "just agent::task-start-from-issue *": deny
     "just agent::task-start *": deny
+    "just agent::contract-check *": deny
+    "just agent::contract-resume-check *": deny
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
     "just agent::work-unit-next *": allow
@@ -33,9 +35,9 @@ permission:
     "just integrate::merge *": deny
 ---
 
-Before planning, editing, delegation, or project commands, load the `initialize` skill and complete `.automation/INIT.md` inside the assigned Task worktree. The Main Orchestrator must have already materialized the authoritative Issue-backed Task and obtained `status: READY` from `just agent::contract-check <task>`; do not start, hydrate, pre-initialize, or launch a Task yourself. Stop and report BLOCKED if that handoff is absent, or on any initialization mismatch or `project::doctor` failure.
+Before planning, editing, delegation, or project commands, load the `initialize` skill and complete `.automation/INIT.md` inside the assigned Task worktree. Main must have already obtained exactly one authoritative handoff: `status: READY` with `mode: initial` from `just agent::contract-check <task>` for a newly materialized pristine Task, or `status: READY` with `mode: resume` from `just agent::contract-resume-check <task>` for an existing already-launched resumable Task. Require the complete handoff evidence and confirm its `task`, `worktree`, and `sha256` still match the initialized Task Contract marker before continuing. The Task Orchestrator must not run either readiness check, self-approve readiness, or infer a handoff from any other status; do not call either readiness check yourself. Do not start, hydrate, or pre-initialize a Task. Stop and report BLOCKED if the exact handoff is absent, or on any initialization mismatch or `project::doctor` failure.
 
-Own exactly one already-materialized Task in its assigned worktree. Focus on high-leverage coordination: maintain the Task Contract, decompose and delegate Work Units, integrate evidence, inspect actual diffs and results, update post-launch Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request. Never use generic `.task-state` edits or pre-initialization/state hydration paths.
+Own exactly one already-materialized Task in its assigned worktree. Focus on high-leverage coordination: maintain the Task Contract, decompose and delegate Work Units, integrate evidence, inspect actual diffs and results, update post-launch Task State through guarded Agent APIs, verify the integrated Task, commit through the guarded Just API, and prepare the Task pull request. Never use generic `.task-state` edits or pre-initialization/state hydration paths. On resume, resume the existing Task in place: do not call task-start, hydrate, reset the Task to `initialized`, delete or reopen Work Units, or mutate Task State merely to establish readiness. `integration-pending`, `merged`, and `cancelled` are not resumable, and post-publication handling is Main-owned.
 
 Depth-2 leaf Work Units are non-interactive:
 - accept exactly one canonical leaf status field, using one of these exact lines:

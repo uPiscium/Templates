@@ -76,6 +76,16 @@ class AutomationJustPathTest(unittest.TestCase):
             text,
         )
 
+    def test_source_resume_contract_recipe_uses_python_isolated_bridge(self) -> None:
+        justfile = ROOT / "just" / "agent-core.just"
+        text = justfile.read_text(encoding="utf-8")
+        self.assertIn("resume-contract-check target task:", text)
+        self.assertIn(
+            "python3 -I {{quote(tool)}} resume-contract-check "
+            "{{quote(target)}} {{quote(task)}}",
+            text,
+        )
+
     def test_dry_runs_select_main_repository_script(self) -> None:
         self._assert_dry_run_selects_local_script(linked=False)
 
