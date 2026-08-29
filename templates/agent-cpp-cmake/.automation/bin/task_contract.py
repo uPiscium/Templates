@@ -29,6 +29,17 @@ except ModuleNotFoundError:  # direct import by an offline test harness
 ISSUE_RE = re.compile(r"^[1-9][0-9]*$")
 SNAPSHOT = ".task-state/issue.json"
 CONTRACT = ".task-state/contract.json"
+RESUMABLE_STATES = {
+    "researching",
+    "planning",
+    "implementing",
+    "verification-pending",
+    "local-verified",
+    "review-pending",
+    "publication-ready",
+    "draft-pr-created",
+    "blocked",
+}
 
 
 class ContractError(lifecycle.LifecycleError):
@@ -397,6 +408,7 @@ def validate_contract(root: Path, task: str, *, require_pristine: bool = False) 
     else:
         record = lifecycle.require_local_task(root, task)
     state = lifecycle.state_path(root).read_text(encoding="utf-8")
+    _validate_task_identity_exact(record, task, state)
     if "canonical-contract sha256=" not in state:
         raise ContractError("Task State has no canonical contract marker")
     path = root / SNAPSHOT
@@ -454,11 +466,13 @@ def validate_contract(root: Path, task: str, *, require_pristine: bool = False) 
         raise ContractError("canonical contract metadata is malformed") from exc
     if metadata != {"schema_version": 1, "issue": data["issue"], "repository": data["repository"], "snapshot": SNAPSHOT, "sha256": data["sha256"]}:
         raise ContractError("canonical contract metadata mismatch")
-    marker = re.search(r"canonical-contract sha256=([0-9a-f]{64}) issue=([0-9]+)", state)
-    if not marker or marker.group(1) != data["sha256"] or int(marker.group(2)) != data["issue"]:
+    markers = re.findall(r"canonical-contract sha256=([0-9a-f]{64}) issue=([0-9]+)", state)
+    if len(markers) != 1 or markers[0][0] != data["sha256"] or int(markers[0][1]) != data["issue"]:
         raise ContractError("Task State canonical contract marker mismatch")
     expected = _canonical_state(_placeholder_state(root), data["issue"], data["sha256"])
     for heading in ("Purpose", "Scope", "Prohibited changes", "Dependencies", "Acceptance criteria", "Test plan", "Stop conditions", "Coordination surfaces", "External resources"):
+        if len(re.findall(rf"(?m)^## {re.escape(heading)}$", state)) != 1:
+            raise ContractError(f"canonical Task State section is missing or duplicated: {heading}")
         pattern = rf"(?ms)^## {re.escape(heading)}\n\n(.*?)(?=^## |\Z)"
         actual = re.search(pattern, state)
         wanted = re.search(pattern, expected)
@@ -467,16 +481,70 @@ def validate_contract(root: Path, task: str, *, require_pristine: bool = False) 
     return {"status": "READY", "task": task, "worktree": str(record.path), "issue": data["issue"], "repository": data["repository"], "sha256": data["sha256"]}
 
 
-def check_contract(root: Path, task: str | None = None) -> dict:
-    if task is not None:
-        current = lifecycle.current_worktree(root)
-        main = lifecycle.main_worktree(root)
-        record = lifecycle.worktree_for_task(root, task)
-        if current.path not in {main.path, record.path}:
-            raise ContractError("contract check cannot inspect a sibling Task worktree")
-        root = record.path
-    else:
+def _validate_task_identity_exact(record: lifecycle.WorktreeRecord, task: str, state: str) -> None:
+    expected = {
+        "Task ID": task,
+        "Branch": record.branch,
+        "Worktree": str(record.path),
+    }
+    for label, value in expected.items():
+        if value is None or len(re.findall(rf"(?m)^- {re.escape(label)}: .+$", state)) != 1:
+            raise ContractError(f"Task State identity is missing or duplicated: {label}")
+        if not re.search(rf"(?m)^- {re.escape(label)}: {re.escape(value)}$", state):
+            raise ContractError(f"Task State identity mismatch: {label}")
+
+
+def _resolve_contract_target(root: Path, task: str | None) -> tuple[Path, str]:
+    current = lifecycle.current_worktree(root)
+    main = lifecycle.main_worktree(root)
+    if task is None:
         task = lifecycle.extract_identity_value(lifecycle.state_path(root), "Task ID")
     if not task:
         raise ContractError("canonical Task Contract is missing")
-    return validate_contract(root, task, require_pristine=True)
+    record = lifecycle.worktree_for_task(root, task)
+    if current.path not in {main.path, record.path}:
+        raise ContractError("contract check cannot inspect a sibling Task worktree")
+    return record.path, task
+
+
+def _validate_authoritative_issue(
+    root: Path, task: str, repository: str, digest: str, runner=None
+) -> None:
+    identity, payload = fetch_issue(root, task, runner)
+    if identity != repository:
+        raise ContractError("live Issue repository identity mismatch")
+    current = authoritative_payload(payload, int(task), identity)
+    if _digest(current) != digest:
+        raise ContractError("canonical Issue snapshot no longer matches its authoritative Issue")
+
+
+def check_contract(root: Path, task: str | None = None, *, runner=None) -> dict:
+    target, task = _resolve_contract_target(root, task)
+    result = validate_contract(target, task, require_pristine=True)
+    if repository_identity(target) != result["repository"]:
+        raise ContractError("live repository identity mismatch")
+    _validate_authoritative_issue(
+        target, task, result["repository"], result["sha256"], runner
+    )
+    result["mode"] = "initial"
+    return result
+
+
+def check_resume_contract(root: Path, task: str | None = None, *, runner=None) -> dict:
+    target, task = _resolve_contract_target(root, task)
+    result = validate_contract(target, task)
+    try:
+        status = lifecycle.state_status(lifecycle.state_path(target))
+    except lifecycle.LifecycleError as exc:
+        raise ContractError(str(exc)) from exc
+    if status not in RESUMABLE_STATES:
+        raise ContractError(f"Task State status is not resumable: {status}")
+    live_repository = repository_identity(target)
+    if live_repository != result["repository"]:
+        raise ContractError("live repository identity mismatch")
+    _validate_authoritative_issue(
+        target, task, result["repository"], result["sha256"], runner
+    )
+    result["mode"] = "resume"
+    result["taskStatus"] = status
+    return result

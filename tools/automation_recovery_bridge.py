@@ -301,6 +301,9 @@ def parser() -> argparse.ArgumentParser:
     rebind = sub.add_parser("rebind-maintenance-provenance")
     rebind.add_argument("target", type=Path)
     rebind.add_argument("expected_source_revision", type=_revision_argument)
+    resume = sub.add_parser("resume-contract-check")
+    resume.add_argument("target", type=Path)
+    resume.add_argument("task", type=_issue_argument)
     return result
 
 
@@ -322,6 +325,24 @@ def _revision_argument(value: str) -> str:
     return value
 
 
+def _check_resume_contract(contract, target: Path, task: str) -> dict:
+    """Check the explicitly named registered Task, without changing it."""
+    target_root = contract.lifecycle.repo_root(target)
+    if target_root != target:
+        raise BridgeError("resume contract check target must be an exact Git worktree root")
+    current = contract.lifecycle.current_worktree(target)
+    main = contract.lifecycle.main_worktree(target)
+    if current.path != target or current.path == main.path:
+        raise BridgeError("resume contract check target must be the exact registered Task worktree")
+    record = contract.lifecycle.worktree_for_task(target, task)
+    if record.path != target:
+        raise BridgeError("resume contract check target is not the exact registered Task worktree")
+    result = contract.check_resume_contract(target, task, runner=trusted_gh_run)
+    if result.get("worktree") != str(target):
+        raise BridgeError("canonical resume contract resolved a different Task worktree")
+    return result
+
+
 def main() -> int:
     try:
         args = parser().parse_args()
@@ -332,12 +353,16 @@ def main() -> int:
         _clean_root(ROOT, revision)
         target = args.target.resolve()
         with maintenance_environment():
-            if args.command == "recover-task-contract-from-issue":
+            if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
                 trusted_git()
                 with _verified_task_contract(ROOT, revision) as contract:
                     _clean_root(ROOT, revision)
-                    value = contract.recover_task_from_issue(target, args.issue, runner=trusted_gh_run)
-                result = {"status": "TASK_CONTRACT_RECOVERED", **value}
+                    if args.command == "recover-task-contract-from-issue":
+                        value = contract.recover_task_from_issue(target, args.issue, runner=trusted_gh_run)
+                        result = {"status": "TASK_CONTRACT_RECOVERED", **value}
+                    else:
+                        result = _check_resume_contract(contract, target, args.task)
+                        result["implementationRevision"] = revision
             else:
                 with _verified_engine(ROOT, revision) as engine:
                     if engine.git_executable().resolve() != trusted_git():

@@ -376,6 +376,19 @@ mod project 'just/project/mod.just'
             self.assertEqual(0, result.returncode, result.stderr)
         return result
 
+    def _lifecycle_cli(self, repo: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(
+            ["python3", ".automation/bin/task_lifecycle.py", *args],
+            cwd=repo,
+            env={**os.environ, "AUTOMATION_MAINTENANCE": "1"},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if check:
+            self.assertEqual(0, result.returncode, result.stderr)
+        return result
+
     def _old_process_fixture(self, root: Path) -> tuple[Path, Path, dict]:
         task, source, metadata = self._real_cli_fixture(root)
         metadata["release_version"] = (task / ".automation/VERSION").read_text(encoding="utf-8").strip()
@@ -2067,6 +2080,8 @@ mod project 'just/project/mod.just'
             )
             implementation = (
                 "components/agent-core/.automation/bin/automation_upgrade.py",
+                "components/agent-core/.automation/bin/task_contract.py",
+                "components/agent-core/.automation/bin/task_lifecycle.py",
                 "tools/automation_recovery_bridge.py",
                 "just/agent-core.just",
             )
@@ -2091,6 +2106,7 @@ mod project 'just/project/mod.just'
             self._git(["init", "-b", "main"], main)
             self._git(["config", "user.name", "Test User"], main)
             self._git(["config", "user.email", "test@example.invalid"], main)
+            self._git(["remote", "add", "origin", "https://github.com/upiscium/AgentKnowledgeVault"], main)
             baseline_pack = ROOT / "tests/fixtures/agent-knowledge-vault-19-baseline.pack"
             self.assertEqual(
                 fixture["baseline_pack_sha256"],
@@ -2122,6 +2138,38 @@ mod project 'just/project/mod.just'
             exclude.parent.mkdir(parents=True, exist_ok=True)
             exclude.write_text("/.task-state/\n", encoding="utf-8")
 
+            # Hydrate the canonical contract while the target is still pristine.
+            # This deliberately loads the current source-side implementation,
+            # rather than the old consumer copy that the upgrade will install.
+            contract_spec = importlib.util.spec_from_file_location(
+                "agent_knowledge_vault_19_source_contract",
+                ROOT / "components/agent-core/.automation/bin/task_contract.py",
+            )
+            self.assertIsNotNone(contract_spec)
+            assert contract_spec and contract_spec.loader
+            contract = importlib.util.module_from_spec(contract_spec)
+            contract_spec.loader.exec_module(contract)
+            contract.lifecycle.initialize_state(
+                task, fixture["task"], fixture["branch"], "main", local_baseline
+            )
+            issue_payload = {
+                "number": 19,
+                "url": "https://github.com/upiscium/AgentKnowledgeVault/issues/19",
+                "title": "Resume the Agent Core upgrade",
+                "body": "Resume this existing Task without resetting its Task State.",
+                "state": "open",
+                "repository": "upiscium/AgentKnowledgeVault",
+                "labels": [],
+                "assignees": [],
+                "milestone": None,
+            }
+            hydrated = contract.hydrate_task_contract(
+                task, fixture["task"], "19", issue_payload, "upiscium/AgentKnowledgeVault"
+            )
+            self.assertEqual(19, hydrated["issue"])
+            self.assertTrue((task / ".task-state/issue.json").is_file())
+            self.assertTrue((task / ".task-state/contract.json").is_file())
+
             # The installed v3.1.0 consumer intentionally lacks Issue #97's
             # expected-revision/rebind implementation and issues the stranded pair.
             applied = json.loads(
@@ -2135,11 +2183,33 @@ mod project 'just/project/mod.just'
             self.assertFalse(upgrade.consumed_receipt_path(task).exists())
             self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
 
+            # Use the upgraded consumer's canonical lifecycle only after the
+            # pending upgrade.
+            self._lifecycle_cli(
+                task,
+                ["work-unit-register", fixture["task"], "WU-19-existing", "general", "Record existing terminal evidence"],
+            )
+            self._lifecycle_cli(
+                task,
+                ["work-unit-state-set", fixture["task"], "WU-19-existing", "completed", "Existing terminal Work Unit evidence"],
+            )
+            self._lifecycle_cli(task, ["state-set", fixture["task"], "blocked"])
+            units_before_resume = json.loads(
+                self._lifecycle_cli(task, ["work-unit-status", fixture["task"], "WU-19-existing"]).stdout
+            )
+            self.assertEqual("completed", units_before_resume["state"])
+            self.assertEqual(
+                "blocked",
+                json.loads(self._lifecycle_cli(task, ["status", fixture["task"]]).stdout)["status"],
+            )
+
             tracked_before = {
                 path: ((task / Path(*path.split("/"))).read_bytes(),
                        (task / Path(*path.split("/"))).stat().st_mode & 0o777)
                 for path in receipt_before["changed_paths"]
             }
+            self.assertTrue(receipt_before["changed_paths"])
+            self.assertTrue(self._git(["diff", "--name-only"], task).splitlines())
             status_before = self._git(["status", "--porcelain=v1"], task)
             rebound = json.loads(
                 self._bridge_cli(
@@ -2153,6 +2223,7 @@ mod project 'just/project/mod.just'
             self.assertEqual(expected_revision, rebound["sourceRevision"])
             receipt_after = self._receipt(task)
             self.assertEqual(expected_revision, receipt_after["source_revision"])
+            self.assertEqual(fixture["expected_source_revision"], receipt_after["source_revision"])
             self.assertEqual(receipt_before["changed_paths"], receipt_after["changed_paths"])
             self.assertEqual(tracked_before, {
                 path: ((task / Path(*path.split("/"))).read_bytes(),
@@ -2162,6 +2233,75 @@ mod project 'just/project/mod.just'
             self.assertEqual(status_before, self._git(["status", "--porcelain=v1"], task))
             subprocess.run(["git", "diff", "--check"], cwd=task, check=True)
             self.assertEqual("3", json.loads(self._cli(task, ["version"]).stdout)["version"])
+
+            tracked_before_resume = {
+                path: ((task / Path(*path.split("/"))).read_bytes(),
+                       (task / Path(*path.split("/"))).stat().st_mode & 0o777)
+                for path in receipt_after["changed_paths"]
+            }
+            status_before_resume = self._git(["status", "--porcelain=v1"], task)
+            state_before_resume = {
+                path.relative_to(task): (path.read_bytes(), path.stat().st_mode & 0o777)
+                for path in (task / ".task-state").rglob("*")
+                if path.is_file()
+            }
+            issue_api_payload = {
+                "number": 19,
+                "repository_url": "https://api.github.com/repos/upiscium/AgentKnowledgeVault",
+                "html_url": "https://github.com/upiscium/AgentKnowledgeVault/issues/19",
+                "title": issue_payload["title"],
+                "body": issue_payload["body"],
+                "state": "open",
+                "labels": [],
+                "assignees": [],
+                "milestone": None,
+            }
+
+            def issue_runner(command, **_kwargs):
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=json.dumps(issue_api_payload), stderr=""
+                )
+
+            with mock.patch.object(bridge_bootstrap, "ROOT", bridge), \
+                mock.patch.object(bridge_bootstrap, "trusted_gh_run", side_effect=issue_runner), \
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["automation_recovery_bridge.py", "resume-contract-check", str(task), fixture["task"]],
+                ), mock.patch("sys.stdout", new_callable=io.StringIO) as resume_output:
+                self.assertEqual(0, bridge_bootstrap.main())
+            resumed = json.loads(resume_output.getvalue())
+            self.assertEqual("READY", resumed["status"])
+            self.assertEqual("resume", resumed["mode"])
+            self.assertEqual("blocked", resumed["taskStatus"])
+            self.assertEqual(fixture["task"], resumed["task"])
+            self.assertEqual(19, resumed["issue"])
+            self.assertEqual("upiscium/AgentKnowledgeVault", resumed["repository"])
+            self.assertRegex(resumed["sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(implementation_revision, resumed["implementationRevision"])
+            self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
+            self.assertEqual(tracked_before_resume, {
+                path: ((task / Path(*path.split("/"))).read_bytes(),
+                       (task / Path(*path.split("/"))).stat().st_mode & 0o777)
+                for path in receipt_after["changed_paths"]
+            })
+            self.assertEqual(status_before_resume, self._git(["status", "--porcelain=v1"], task))
+            self.assertEqual(state_before_resume, {
+                path.relative_to(task): (path.read_bytes(), path.stat().st_mode & 0o777)
+                for path in (task / ".task-state").rglob("*")
+                if path.is_file()
+            })
+            self.assertEqual(units_before_resume, json.loads(
+                self._lifecycle_cli(task, ["work-unit-status", fixture["task"], "WU-19-existing"]).stdout
+            ))
+            transitioned = json.loads(
+                self._lifecycle_cli(task, ["state-set", fixture["task"], "verification-pending"]).stdout
+            )
+            self.assertEqual("verification-pending", transitioned["status"])
+            self.assertEqual("completed", json.loads(
+                self._lifecycle_cli(task, ["work-unit-status", fixture["task"], "WU-19-existing"]).stdout
+            )["state"])
+            self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
 
             committed = json.loads(
                 self._cli(task, ["commit", fixture["task"], "fix: upgrade Agent Core v3.1.2"]).stdout
@@ -2176,6 +2316,10 @@ mod project 'just/project/mod.just'
             self.assertFalse(upgrade.receipt_path(task).exists())
             self.assertFalse(upgrade.authority_path(task).exists())
             self.assertEqual("", self._git(["for-each-ref", "--format=%(refname)", "refs/remotes/origin/task"], task))
+            self.assertEqual(
+                "",
+                self._git(["for-each-ref", "--format=%(refname)", "refs/remotes/origin/task/19"], task),
+            )
 
     def test_same_version_committed_compatible_drift_is_detected_and_applied(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

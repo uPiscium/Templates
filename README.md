@@ -389,6 +389,71 @@ recovery, use the strict initialization and normal guarded Task workflow.
 Hard-crash consistency remains out of scope; these safeguards do not change
 Issue #85 semantics or claim stronger durability.
 
+Issue #99 separates pristine initial-launch readiness from read-only resume
+readiness. A new Task still requires:
+
+```sh
+just agent::contract-check <task>
+```
+
+and receives `status: READY`, `mode: initial` only while it is `initialized`,
+has no Work Units or pending tracked changes, and remains at its Base revision.
+An already-launched Task instead uses:
+
+```sh
+just agent::contract-resume-check <task>
+```
+
+This validates the same canonical Issue snapshot, digest, metadata, required
+sections, repository, Task, branch, and uniquely registered worktree without
+requiring a clean tree, zero Work Units, or `HEAD == Base revision`. It accepts
+the existing `researching`, `planning`, `implementing`,
+`verification-pending`, `local-verified`, `review-pending`,
+`publication-ready`, `draft-pr-created`, and `blocked` states. It rejects
+`initialized` (which uses the initial gate), `integration-pending`, `merged`,
+and `cancelled`. Neither check changes Task State or Work Units.
+Both readiness modes re-read the open authoritative GitHub Issue and require
+its filtered content digest to remain identical to the stored snapshot. A
+coherently rewritten set of ignored Task State files therefore cannot
+self-authenticate. An unavailable or changed Issue fails closed.
+
+For a pre-fix consumer such as AgentKnowledgeVault Task #19, run the verified
+source-side bridge from a clean Templates checkout containing Issue #99's fix:
+
+```sh
+just agent-core::resume-contract-check /path/to/AgentKnowledgeVault/.worktrees/19-agent-core-v3-1-1 19
+```
+
+For the blocked Task with the rebound receipt source revision
+`835203b6f1ae342d31ed74372728e9862b9b36f0`, success includes bounded evidence
+like:
+
+```json
+{
+  "status": "READY",
+  "mode": "resume",
+  "task": "19",
+  "taskStatus": "blocked",
+  "repository": "upiscium/AgentKnowledgeVault",
+  "implementationRevision": "<verified Templates HEAD>"
+}
+```
+
+That source-side `READY` result is the formal launch handoff equivalent for an
+older installed Task Orchestrator contract that cannot produce consumer-side
+resume readiness. The bridge loads its contract implementation from verified
+Templates `HEAD` blobs, uses the trusted GitHub CLI to bind the snapshot to the
+current authoritative Issue, and leaves all tracked consumer files and all
+Task State bytes unchanged. It performs no transition, commit, push, PR,
+merge, or cleanup. Main passes the complete READY evidence, including its
+`sha256`, when relaunching exactly one Task Orchestrator; the orchestrator
+requires the initialized contract marker to retain that same digest. It then
+continues from `blocked` through an existing canonical transition such as
+`blocked -> verification-pending`, preserves all Work Units, and uses the
+existing `automation::commit 19` path. Resetting to `initialized`, deleting or
+reopening Work Units, and manual `.task-state` edits remain forbidden. This is
+a compatible Agent Core change; VERSION remains 3.
+
 After a successful commit, the active receipt is consumed as `.task-state/automation-maintenance.consumed.json`. A later successful upgrade with changes replaces the active receipt and removes the prior consumed receipt; a no-change invocation returns `NO_CHANGES` and preserves existing receipt lifecycle evidence. There is no raw Git/GitHub bypass, and merge is excluded: the Main Orchestrator performs the separately gated integration/merge workflow.
 
 The upgrade system supports versioned removal migrations. Removals name explicit, exact Agent Core-managed paths; repository-owned and protected paths cannot be removed. Migration preconditions are checked before any mutation, and `.automation/VERSION` advances only after all deletion, creation, replacement, and merge actions succeed.

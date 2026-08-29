@@ -78,6 +78,17 @@ class OpenCodeDiscoverySmokeTest(unittest.TestCase):
         self.assertIn("placeholder task", text)
         self.assertNotIn("just agent::task-start <task-id>", text)
 
+    def test_startup_handoffs_are_exact_and_resume_is_dedicated(self) -> None:
+        text = (CORE / "commands" / "task-start.md").read_text(encoding="utf-8").lower()
+        self.assertIn("just agent::contract-check <task>", text)
+        self.assertIn("status: ready", text)
+        self.assertIn("mode: initial", text)
+        self.assertIn("just agent::contract-resume-check <task>", text)
+        self.assertIn("mode: resume", text)
+        self.assertIn("do not run task-start or hydrate it", text)
+        for state in ("integration-pending", "merged", "cancelled"):
+            self.assertIn(state, text)
+
 
 if __name__ == "__main__":
     unittest.main()

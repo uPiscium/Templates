@@ -163,6 +163,8 @@ just agent::preflight
 just agent::doctor
 just agent::context
 just agent::task-start <TASK-ID> <slug>
+just agent::contract-check <TASK-ID>
+just agent::contract-resume-check <TASK-ID>
 just agent::status <TASK-ID>
 just agent::verify <TASK-ID>
 just agent::commit <TASK-ID>
@@ -179,6 +181,13 @@ Semantics:
 - `doctor`: validate full repository/session readiness, including strict context and branch/Task identity, without repairing it.
 - `context`: resolve repository/worktree/branch/Task/adapter context in machine-readable form with strict identity validation.
 - `task-start`: create a dedicated branch/worktree and initialize Task State.
+- `contract-check`: validate canonical contract integrity plus pristine initial
+  launch state and return `mode: initial`; it requires `initialized`, zero Work
+  Units, a clean worktree, and `HEAD` equal to the recorded Base revision.
+- `contract-resume-check`: validate the same canonical contract and exact
+  repository/Task/branch/worktree identity for an already-launched resumable
+  Task and return `mode: resume`; it is read-only and does not require pristine
+  state.
 - `status`: report current Task state and Git relationship.
 - `verify`: execute the stable project verification contract and record evidence.
 - `commit`: validate scope and create Task-local commits.
@@ -742,6 +751,48 @@ baseline metadata. This is hermetic recovery: no commit, push, or PR, and no
 tracked-byte change. Verify, then use normal `automation::commit 19`. Issue
 #97 is a compatible maintenance fix: VERSION remains 3, and #83/#85 semantics
 are unchanged.
+
+#### Issue #99 resume-contract handoff
+
+Initial launch and resume are disjoint gates. Initial `READY` is restricted to
+the pristine `initialized` state. Resume `READY` accepts only `researching`,
+`planning`, `implementing`, `verification-pending`, `local-verified`,
+`review-pending`, `publication-ready`, `draft-pr-created`, or `blocked` after
+strict canonical Issue snapshot, digest, metadata, required-section,
+repository, Task, branch, and unique-worktree validation. Resume rejects
+`initialized`, `integration-pending`, `merged`, and `cancelled`. Both gates are
+read-only. Resume never resets status, deletes/reopens Work Units, or grants
+generic Task State mutation.
+Both readiness modes fetch the current open authoritative Issue and require its
+canonical filtered payload to match the stored digest. The ignored snapshot,
+metadata, and marker therefore cannot be coherently rewritten into a
+self-authenticating replacement.
+
+Pre-fix consumers use the clean, verified Templates source bridge:
+
+```sh
+just agent-core::resume-contract-check <consumer-task-worktree> <numeric-task>
+```
+
+The isolated bootstrap verifies its tracked `HEAD`, loads `task_contract.py`
+and `task_lifecycle.py` only from that verified Git tree, uses the trusted
+GitHub CLI for the authoritative Issue binding, and requires the explicit
+target itself to be the uniquely registered non-main Task worktree.
+It returns bounded `status: READY`, `mode: resume` evidence including the
+verified Templates `implementationRevision`; target tracked files and the
+entire ignored Task State remain byte-for-byte unchanged. It performs no
+lifecycle or Git/GitHub mutation.
+
+For AgentKnowledgeVault #19 after `PROVENANCE_REBOUND` bound the active receipt
+to `835203b6f1ae342d31ed74372728e9862b9b36f0`, this source-side resume `READY`
+is the formal launch handoff equivalent for the older installed startup
+contract. Main passes the complete evidence, including `sha256`, and may
+relaunch one Task Orchestrator only while that digest still matches the
+initialized Task Contract marker. The orchestrator preserves the existing
+terminal Work Units, follows the canonical `blocked -> verification-pending`
+transition, and then uses the existing `automation::commit 19` publication
+path. No reset to `initialized`, raw Git authority, push, PR, merge, or cleanup
+is part of the bridge. This compatible fix keeps Agent Core VERSION 3.
 
 ## 18. Integration boundary
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -31,10 +32,63 @@ class TaskContractRecoveryTest(unittest.TestCase):
         self.assertEqual((args.command, args.expected_source_revision), ("rebind-maintenance-provenance", "a" * 40))
         args = bridge.parser().parse_args(["rebind-maintenance-provenance", "/tmp/task", "a" * 64])
         self.assertEqual(args.expected_source_revision, "a" * 64)
+        args = bridge.parser().parse_args(["resume-contract-check", "/tmp/task", "99"])
+        self.assertEqual((args.command, args.task), ("resume-contract-check", "99"))
         for value in ("a" * 39, "a" * 41, "a" * 63, "A" * 40, "main", "v1.2.3"):
             with self.subTest(value=value):
                 with self.assertRaises(bridge.BridgeError):
                     bridge.parser().parse_args(["rebind-maintenance-provenance", "/tmp/task", value])
+        for value in ("", "TASK-99", "019", "bad/task", "-bad", "bad task"):
+            with self.subTest(value=value):
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.parser().parse_args(["resume-contract-check", "/tmp/task", value])
+
+    def test_resume_check_requires_exact_registered_non_main_target(self) -> None:
+        contract = mock.Mock()
+        contract.lifecycle.repo_root.return_value = Path("/tmp/task").resolve()
+        contract.lifecycle.current_worktree.return_value = mock.Mock(path=Path("/tmp/task").resolve())
+        contract.lifecycle.main_worktree.return_value = mock.Mock(path=Path("/tmp/main").resolve())
+        contract.lifecycle.worktree_for_task.return_value = mock.Mock(
+            path=Path("/tmp/task").resolve()
+        )
+        contract.check_resume_contract.return_value = {
+            "status": "READY", "mode": "resume", "worktree": str(Path("/tmp/task").resolve())
+        }
+        self.assertEqual(
+            bridge._check_resume_contract(contract, Path("/tmp/task").resolve(), "99")["mode"],
+            "resume",
+        )
+        contract.lifecycle.repo_root.return_value = Path("/tmp/other").resolve()
+        with self.assertRaises(bridge.BridgeError):
+            bridge._check_resume_contract(contract, Path("/tmp/other").resolve(), "99")
+
+    def test_resume_dispatch_uses_verified_contract_and_reports_revision(self) -> None:
+        contract = mock.Mock()
+        target = Path("/tmp/task").resolve()
+        contract.lifecycle.repo_root.return_value = target
+        contract.lifecycle.current_worktree.return_value = mock.Mock(path=target)
+        contract.lifecycle.main_worktree.return_value = mock.Mock(path=Path("/tmp/main").resolve())
+        contract.lifecycle.worktree_for_task.return_value = mock.Mock(path=target)
+        contract.check_resume_contract.return_value = {
+            "status": "READY", "mode": "resume", "task": "99",
+            "worktree": str(target), "issue": 99, "repository": "o/r",
+            "sha256": "d" * 64, "taskStatus": "implementing",
+        }
+        with mock.patch.object(bridge, "_clean_root", return_value="b" * 40), \
+             mock.patch.object(bridge, "_verify_bootstrap"), \
+             mock.patch.object(bridge, "trusted_git", return_value=Path("/usr/bin/git")), \
+             mock.patch.object(bridge, "_verified_task_contract") as verified, \
+             mock.patch.object(bridge, "maintenance_environment"), \
+             mock.patch.object(bridge, "_verified_engine") as engine, \
+             mock.patch.object(sys, "argv", ["bridge", "resume-contract-check", str(target), "99"]), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            verified.return_value.__enter__.return_value = contract
+            self.assertEqual(bridge.main(), 0)
+        engine.assert_not_called()
+        self.assertEqual(json.loads(output.getvalue())["implementationRevision"], "b" * 40)
+        contract.check_resume_contract.assert_called_once_with(
+            target, "99", runner=bridge.trusted_gh_run
+        )
 
     def test_rebind_passes_raw_source_revision_to_verified_engine(self) -> None:
         engine = mock.Mock()

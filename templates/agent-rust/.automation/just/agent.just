@@ -28,6 +28,10 @@ contract-check task='':
     python3 {{quote(lifecycle)}} contract-check {{if task != '' { quote(task) } else { '' }}}
 
 [working-directory: root]
+contract-resume-check task='':
+    python3 {{quote(lifecycle)}} contract-resume-check {{if task != '' { quote(task) } else { '' }}}
+
+[working-directory: root]
 status task:
     python3 {{quote(lifecycle)}} status {{quote(task)}}
 

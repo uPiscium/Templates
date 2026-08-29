@@ -138,6 +138,235 @@ class TaskContractTest(unittest.TestCase):
             self.assertEqual(payload["body"], snapshot["payload"]["body"])
             self.assertNotIn("TBD", (root / ".task-state/task.md").read_text(encoding="utf-8"))
 
+    def test_initial_check_reports_initial_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            patches = self.hydration_patches(root, record)
+            with patches[0], patches[1], patches[2], mock.patch.object(
+                contract.lifecycle, "current_worktree", return_value=record
+            ), mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), mock.patch.object(
+                contract.lifecycle, "worktree_for_task", return_value=record
+            ), mock.patch.object(
+                contract, "repository_identity", return_value="acme/widgets"
+            ), mock.patch.object(
+                contract, "_validate_authoritative_issue"
+            ):
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+                result = contract.check_contract(root, "19")
+            self.assertEqual("initial", result["mode"])
+
+    def test_initial_check_preserves_every_pristine_requirement(self) -> None:
+        cases = ("status", "work-unit", "dirty", "head")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                record = self.write_pristine(root)
+                hydration = self.hydration_patches(root, record)
+                with hydration[0], hydration[1], hydration[2]:
+                    contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+                if case == "status":
+                    state = root / ".task-state/task.md"
+                    state.write_text(
+                        state.read_text(encoding="utf-8").replace("Status: initialized", "Status: planning"),
+                        encoding="utf-8",
+                    )
+
+                def git(*args, **_kwargs):
+                    if args[0] == "status":
+                        return " M product.txt" if case == "dirty" else ""
+                    if args[0] == "rev-parse":
+                        return "b" * 40 if case == "head" else "a" * 40
+                    raise AssertionError(args)
+
+                with mock.patch.object(contract.lifecycle, "current_worktree", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "require_local_task", return_value=record), \
+                    mock.patch.object(
+                        contract.lifecycle,
+                        "read_work_units",
+                        return_value={"units": {"WU-19-01": {}} if case == "work-unit" else {}},
+                    ), mock.patch.object(contract.lifecycle, "git", side_effect=git), \
+                    self.assertRaises(contract.ContractError):
+                    contract.check_contract(root, "19")
+
+    def test_initial_check_rejects_authoritative_issue_change_after_hydration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            hydration = self.hydration_patches(root, record)
+            with hydration[0], hydration[1], hydration[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+            readiness = self.hydration_patches(root, record)
+            with readiness[0], readiness[1], readiness[2], \
+                mock.patch.object(contract.lifecycle, "current_worktree", return_value=record), \
+                mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), \
+                mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record), \
+                mock.patch.object(contract, "repository_identity", return_value="acme/widgets"), \
+                self.assertRaisesRegex(contract.ContractError, "authoritative Issue"):
+                contract.check_contract(
+                    root,
+                    "19",
+                    runner=lambda *_args, **_kwargs: response(
+                        self.payload(body="Issue changed after hydration")
+                    ),
+                )
+
+    def test_resume_check_accepts_every_defined_resumable_state_without_pristine_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            hydration = self.hydration_patches(root, record)
+            with hydration[0], hydration[1], hydration[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+            state = root / ".task-state/task.md"
+            initialized = state.read_text(encoding="utf-8")
+            with mock.patch.object(contract.lifecycle, "current_worktree", return_value=record), \
+                mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), \
+                mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record), \
+                mock.patch.object(contract.lifecycle, "require_local_task", return_value=record), \
+                mock.patch.object(contract.lifecycle, "read_work_units") as read_units, \
+                mock.patch.object(contract, "repository_identity", return_value="acme/widgets"), \
+                mock.patch.object(contract, "_validate_authoritative_issue"), \
+                mock.patch.object(contract, "_pristine", side_effect=AssertionError("resume used pristine gate")):
+                for status in sorted(contract.RESUMABLE_STATES):
+                    with self.subTest(status=status):
+                        state.write_text(
+                            initialized.replace("Status: initialized", f"Status: {status}"),
+                            encoding="utf-8",
+                        )
+                        result = contract.check_resume_contract(root, "19")
+                        self.assertEqual(("READY", "resume", status), (
+                            result["status"], result["mode"], result["taskStatus"]
+                        ))
+                read_units.assert_not_called()
+
+    def test_readiness_rejects_live_repository_and_exact_state_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            hydration = self.hydration_patches(root, record)
+            with hydration[0], hydration[1], hydration[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+            state = root / ".task-state/task.md"
+            state.write_text(
+                state.read_text(encoding="utf-8").replace("Status: initialized", "Status: blocked"),
+                encoding="utf-8",
+            )
+            common = (
+                mock.patch.object(contract.lifecycle, "current_worktree", return_value=record),
+                mock.patch.object(contract.lifecycle, "main_worktree", return_value=record),
+                mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record),
+                mock.patch.object(contract.lifecycle, "require_local_task", return_value=record),
+            )
+            with common[0], common[1], common[2], common[3], \
+                mock.patch.object(contract, "repository_identity", return_value="other/widgets"), \
+                self.assertRaisesRegex(contract.ContractError, "repository identity"):
+                contract.check_resume_contract(root, "19")
+            state.write_text(
+                state.read_text(encoding="utf-8").replace(
+                    f"- Branch: {record.branch}", f"- Branch: {record.branch}\n- Branch: {record.branch}"
+                ),
+                encoding="utf-8",
+            )
+            with common[0], common[1], common[2], common[3], \
+                mock.patch.object(contract, "repository_identity", return_value="acme/widgets"), \
+                self.assertRaisesRegex(contract.ContractError, "missing or duplicated"):
+                contract.check_resume_contract(root, "19")
+
+    def test_resume_check_allows_progress_with_work_units_dirty_tree_and_head_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            patches = self.hydration_patches(root, record)
+            with patches[0], patches[1], patches[2], mock.patch.object(
+                contract.lifecycle, "current_worktree", return_value=record
+            ), mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), mock.patch.object(
+                contract.lifecycle, "worktree_for_task", return_value=record
+            ):
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+                state = root / ".task-state/task.md"
+                state.write_text(state.read_text().replace("Status: initialized", "Status: implementing"), encoding="utf-8")
+                (root / "product.txt").write_text("changed", encoding="utf-8")
+                with mock.patch.object(contract, "repository_identity", return_value="acme/widgets"), \
+                    mock.patch.object(contract, "_validate_authoritative_issue"):
+                    result = contract.check_resume_contract(root, "19")
+            self.assertEqual({"status", "mode", "taskStatus", "task", "worktree", "issue", "repository", "sha256"}, set(result))
+            self.assertEqual("READY", result["status"])
+            self.assertEqual("resume", result["mode"])
+            self.assertEqual("implementing", result["taskStatus"])
+
+    def test_resume_check_rejects_initialized_terminal_and_identity_mismatch(self) -> None:
+        for status in ("initialized", "integration-pending", "merged", "cancelled", "not-a-status"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                record = self.write_pristine(root)
+                patches = self.hydration_patches(root, record)
+                with patches[0], patches[1], patches[2]:
+                    contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+                state = root / ".task-state/task.md"
+                state.write_text(re.sub(r"Status: [^\n]+", f"Status: {status}", state.read_text()), encoding="utf-8")
+                with mock.patch.object(contract.lifecycle, "current_worktree", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record), \
+                    mock.patch.object(contract, "repository_identity", return_value="acme/widgets"):
+                    with self.assertRaises(contract.ContractError):
+                        contract.check_resume_contract(root, "19")
+
+    def test_resume_check_rejects_duplicate_or_relocated_status(self) -> None:
+        for case in ("duplicate", "relocated"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                record = self.write_pristine(root)
+                hydration = self.hydration_patches(root, record)
+                with hydration[0], hydration[1], hydration[2]:
+                    contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+                state = root / ".task-state/task.md"
+                text = state.read_text(encoding="utf-8").replace("Status: initialized", "Status: blocked")
+                if case == "duplicate":
+                    text += "\n- Status: blocked\n"
+                else:
+                    text = text.replace("- Status: blocked\n", "") + "\n- Status: blocked\n"
+                state.write_text(text, encoding="utf-8")
+                with mock.patch.object(contract.lifecycle, "current_worktree", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record), \
+                    mock.patch.object(contract.lifecycle, "require_local_task", return_value=record), \
+                    mock.patch.object(contract, "repository_identity", return_value="acme/widgets"), \
+                    self.assertRaises(contract.ContractError):
+                    contract.check_resume_contract(root, "19")
+
+    def test_resume_check_is_byte_for_byte_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            patches = self.hydration_patches(root, record)
+            with patches[0], patches[1], patches[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+            state = root / ".task-state/task.md"
+            state.write_text(state.read_text().replace("Status: initialized", "Status: implementing"), encoding="utf-8")
+            before = {path.name: path.read_bytes() for path in (root / ".task-state").iterdir()}
+            with mock.patch.object(contract.lifecycle, "current_worktree", return_value=record), \
+                mock.patch.object(contract.lifecycle, "main_worktree", return_value=record), \
+                mock.patch.object(contract.lifecycle, "worktree_for_task", return_value=record), \
+                mock.patch.object(contract, "repository_identity", return_value="acme/widgets"), \
+                mock.patch.object(contract, "_validate_authoritative_issue"):
+                contract.check_resume_contract(root, "19")
+            after = {path.name: path.read_bytes() for path in (root / ".task-state").iterdir()}
+            self.assertEqual(before, after)
+
+    def test_authoritative_issue_binding_rejects_same_identity_contract_rewrite(self) -> None:
+        original = contract.authoritative_payload(self.payload(), 19, "acme/widgets")
+        forged = self.payload(body="attacker-rewritten scope")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            contract, "fetch_issue", return_value=("acme/widgets", forged)
+        ):
+            with self.assertRaisesRegex(contract.ContractError, "authoritative Issue"):
+                contract._validate_authoritative_issue(
+                    Path(directory), "19", "acme/widgets", contract._digest(original)
+                )
+
     def test_hydration_rejects_modified_progressed_dirty_work_unit_and_identity_mismatch(self) -> None:
         cases = ("modified", "progressed", "dirty", "unit", "identity")
         for case in cases:

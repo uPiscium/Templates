@@ -16,3 +16,7 @@ recover-task-contract-from-issue target issue:
 [working-directory: root]
 rebind-maintenance-provenance target expected_revision:
     python3 -I {{quote(tool)}} rebind-maintenance-provenance {{quote(target)}} {{quote(expected_revision)}}
+
+[working-directory: root]
+resume-contract-check target task:
+    python3 -I {{quote(tool)}} resume-contract-check {{quote(target)}} {{quote(task)}}

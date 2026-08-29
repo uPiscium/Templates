@@ -704,12 +704,23 @@ def work_unit_state_set(
 def state_status(path: Path) -> str:
     if not path.is_file():
         raise LifecycleError(f"missing Task State: {path}")
-    match = re.search(
-        r"(?m)^- Status: ([A-Za-z0-9._-]+)$", path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    sections = re.findall(r"(?ms)^## Current state\n\n(.*?)(?=^## |\Z)", text)
+    statuses = re.findall(r"(?m)^- Status: ([A-Za-z0-9._-]+)$", text)
+    section_statuses = (
+        re.findall(r"(?m)^- Status: ([A-Za-z0-9._-]+)$", sections[0])
+        if len(sections) == 1
+        else []
     )
-    if not match or match.group(1) not in VALID_STATES:
+    if (
+        len(sections) != 1
+        or len(statuses) != 1
+        or len(section_statuses) != 1
+        or statuses != section_statuses
+        or statuses[0] not in VALID_STATES
+    ):
         raise LifecycleError(f"invalid or missing Task State status in {path}")
-    return match.group(1)
+    return statuses[0]
 
 
 def set_state_status(path: Path, status: str) -> None:
@@ -1118,6 +1129,8 @@ def parser() -> argparse.ArgumentParser:
     issue_start.add_argument("slug")
     contract = sub.add_parser("contract-check")
     contract.add_argument("task", nargs="?")
+    resume_contract = sub.add_parser("contract-resume-check")
+    resume_contract.add_argument("task", nargs="?")
     status = sub.add_parser("status")
     status.add_argument("task")
     state = sub.add_parser("state-set")
@@ -1168,6 +1181,9 @@ def main() -> int:
         elif args.command == "contract-check":
             from task_contract import check_contract
             print(json.dumps(check_contract(root, args.task), sort_keys=True))
+        elif args.command == "contract-resume-check":
+            from task_contract import check_resume_contract
+            print(json.dumps(check_resume_contract(root, args.task), sort_keys=True))
         elif args.command == "status":
             task_status(root, args.task)
         elif args.command == "state-set":

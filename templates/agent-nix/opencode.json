@@ -79,6 +79,7 @@
       "just agent::task-start *": "deny",
       "just agent::task-start-from-issue *": "deny",
       "just agent::contract-check *": "allow",
+      "just agent::contract-resume-check *": "deny",
       "just agent::state-set *": "deny",
       "just agent::batch-plan *": "deny",
       "just agent::work-unit-register *": "deny",

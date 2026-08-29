@@ -345,9 +345,11 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(global_bash["just agent::task-start-from-issue *"], "deny")
         self.assertEqual(global_bash["just agent::task-start *"], "deny")
         self.assertEqual(global_bash["just agent::contract-check *"], "allow")
+        self.assertEqual(global_bash["just agent::contract-resume-check *"], "deny")
         self.assertEqual(build_bash["just agent::task-start-from-issue *"], "allow")
         self.assertEqual(build_bash["just agent::task-start *"], "deny")
         self.assertEqual(build_bash["just agent::contract-check *"], "allow")
+        self.assertEqual(build_bash["just agent::contract-resume-check *"], "allow")
         self.assertEqual(build_bash["just agent::state-set *"], "deny")
 
         main = body_text("build").lower()
@@ -357,6 +359,13 @@ class OpenCodeContractTest(unittest.TestCase):
             "just agent::task-start-from-issue <numeric-issue> <slug>",
             "never call the low-level `just agent::task-start`",
             "just agent::contract-check <numeric-issue>",
+            "just agent::contract-resume-check <task>",
+            "mode: initial",
+            "mode: resume",
+            "existing already-launched resumable task",
+            "integration-pending",
+            "merged",
+            "cancelled",
             "status: ready",
             "exactly one `task-orchestrator`",
             "never create or launch a placeholder task",
@@ -381,6 +390,36 @@ class OpenCodeContractTest(unittest.TestCase):
         orchestrator = body_text("task-orchestrator").lower()
         for phrase in ("do not start", "hydrate", "pre-initialize", "status: ready", "never use generic `.task-state` edits"):
             self.assertIn(phrase, orchestrator, phrase)
+
+    def test_resume_handoff_is_main_only_and_does_not_reinitialize(self) -> None:
+        main = body_text("build").lower()
+        orchestrator = body_text("task-orchestrator").lower()
+        orchestrator_bash = permission_for("task-orchestrator")["bash"]
+
+        for command in ("just agent::contract-check *", "just agent::contract-resume-check *"):
+            self.assertEqual(orchestrator_bash.get(command), "deny", command)
+        for phrase in (
+            "exactly one authoritative handoff",
+            "status: ready",
+            "mode: initial",
+            "mode: resume",
+            "self-approve readiness",
+            "do not call either readiness check",
+            "reset the task to `initialized`",
+            "delete or reopen work units",
+            "integration-pending",
+            "merged",
+            "cancelled",
+        ):
+            self.assertIn(phrase, orchestrator, phrase)
+        for phrase in (
+            "contract-resume-check <task>",
+            "only when its result is exactly `status: ready` with `mode: resume`",
+            "do not call any task-start or hydration path",
+            "complete ready evidence",
+            "including `task`, `worktree`, and `sha256`",
+        ):
+            self.assertIn(phrase, main, phrase)
 
     def test_automation_core_is_not_editable(self) -> None:
         edit = self.config["permission"]["edit"]
