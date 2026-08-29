@@ -47,6 +47,7 @@ class AutomationUpgradeContractTest(unittest.TestCase):
         "branch": "task/19-agent-core-v3-1-1",
         "authoritative_external_baseline": "1e3a795d5e2717f9c670a812777c4a38c9592db0",
         "baseline_pack_sha256": "e4bb9e9240d40543404bdb094446104ec7984f8cb72a6bcce7d042dc3e670bab",
+        "templates_source_pack_sha256": "54e7d83478d67499c5afd522a3fc27766048ce669c7169c9e8bc8cb2a04fe5cd",
         "receipt_source_revision": "076653b054f5d8cbce4a28bcb6b381e9f30ee669",
         "expected_source_revision": "835203b6f1ae342d31ed74372728e9862b9b36f0",
         "maintenance_commit": None,
@@ -2031,23 +2032,39 @@ mod project 'just/project/mod.just'
         old_revision = fixture["receipt_source_revision"]
         expected_revision = fixture["expected_source_revision"]
         baseline_revision = fixture["authoritative_external_baseline"]
-        self.assertEqual(old_revision, self._git(["rev-parse", f"{old_revision}^{{commit}}"], ROOT))
-        self.assertEqual(expected_revision, self._git(["rev-parse", f"{expected_revision}^{{commit}}"], ROOT))
-        self.assertEqual(
-            0,
-            subprocess.run(
-                ["git", "diff", "--quiet", old_revision, expected_revision, "--", "components/agent-core"],
-                cwd=ROOT,
-                check=False,
-            ).returncode,
-            "the two authoritative source commits must remain byte/tree-identical for Agent Core",
-        )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             bridge = root / "templates-bridge"
-            self._git(["clone", "--shared", "--no-checkout", str(ROOT), str(bridge)], ROOT)
-            self._git(["switch", "--detach", expected_revision], bridge)
+            bridge.mkdir()
+            self._git(["init", "-b", "main"], bridge)
+            self._git(["config", "user.name", "Test User"], bridge)
+            self._git(["config", "user.email", "test@example.invalid"], bridge)
+            source_pack = ROOT / "tests/fixtures/agent-knowledge-vault-19-templates-source.pack"
+            self.assertEqual(
+                fixture["templates_source_pack_sha256"],
+                hashlib.sha256(source_pack.read_bytes()).hexdigest(),
+            )
+            subprocess.run(
+                ["git", "index-pack", "--stdin"],
+                cwd=bridge,
+                input=source_pack.read_bytes(),
+                capture_output=True,
+                check=True,
+            )
+            self._git(["update-ref", "refs/heads/main", expected_revision], bridge)
+            self._git(["reset", "--hard", expected_revision], bridge)
+            self.assertEqual(old_revision, self._git(["rev-parse", f"{old_revision}^{{commit}}"], bridge))
+            self.assertEqual(expected_revision, self._git(["rev-parse", f"{expected_revision}^{{commit}}"], bridge))
+            self.assertEqual(
+                0,
+                subprocess.run(
+                    ["git", "diff", "--quiet", old_revision, expected_revision, "--", "components/agent-core"],
+                    cwd=bridge,
+                    check=False,
+                ).returncode,
+                "the fixture-owned source commits must remain byte/tree-identical for Agent Core",
+            )
             implementation = (
                 "components/agent-core/.automation/bin/automation_upgrade.py",
                 "tools/automation_recovery_bridge.py",
@@ -2057,8 +2074,6 @@ mod project 'just/project/mod.just'
                 destination = bridge / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(ROOT / relative, destination)
-            self._git(["config", "user.name", "Test User"], bridge)
-            self._git(["config", "user.email", "test@example.invalid"], bridge)
             self._git(["add", *implementation], bridge)
             self._git(["commit", "-m", "Issue 97 verified recovery implementation"], bridge)
             implementation_revision = self._git(["rev-parse", "HEAD"], bridge)
@@ -2066,6 +2081,10 @@ mod project 'just/project/mod.just'
 
             old_source = root / "templates-receipt-source"
             self._git(["worktree", "add", "--detach", str(old_source), old_revision], bridge)
+            self.assertNotIn(
+                "def rebind_maintenance_provenance(",
+                (old_source / "components/agent-core/.automation/bin/automation_upgrade.py").read_text(encoding="utf-8"),
+            )
 
             main = root / "agent-knowledge-vault-main"
             main.mkdir()
