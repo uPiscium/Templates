@@ -443,6 +443,7 @@ class OpenCodeContractTest(unittest.TestCase):
             "build.md": "openai/gpt-5.6-sol",
             "plan.md": "openai/gpt-5.6-sol",
             "task-orchestrator.md": "openai/gpt-5.6-sol",
+            "maintenance-orchestrator.md": "openai/gpt-5.6-sol",
             "general.md": "openai/gpt-5.6-luna",
             "explore.md": "openai/gpt-5.6-luna",
             "verifier.md": "openai/gpt-5.6-luna",
@@ -469,10 +470,97 @@ class OpenCodeContractTest(unittest.TestCase):
             path.name for path in AGENTS.glob("*.md")
             if "model: openai/gpt-5.6-terra" in frontmatter(path)
         }
-        self.assertEqual(sol_agents, {"build.md", "plan.md", "task-orchestrator.md", "architect.md"})
+        self.assertEqual(
+            sol_agents,
+            {
+                "build.md",
+                "plan.md",
+                "task-orchestrator.md",
+                "maintenance-orchestrator.md",
+                "architect.md",
+            },
+        )
         self.assertEqual(luna_agents, {"general.md", "explore.md", "verifier.md", "scout.md"})
         self.assertEqual(terra_agents, {"reviewer.md", "investigator.md", "security-reviewer.md"})
         self.assertFalse(list(AGENTS.glob("*-fallback.md")))
+
+    def test_maintenance_authority_matrix_is_explicit(self) -> None:
+        global_bash = json.loads(
+            (ROOT / "components" / "agent-core" / "opencode.json").read_text(
+                encoding="utf-8"
+            )
+        )["permission"]["bash"]
+        build_bash = permission_for("build")["bash"]
+        maintenance_bash = permission_for("maintenance-orchestrator")["bash"]
+        expected = {
+            "just automation::maintenance-check *": ("allow", "allow", "allow"),
+            "just automation::maintenance-review-record *": ("deny", "allow", "deny"),
+            "just automation::maintenance-pr-create *": ("deny", "deny", "allow"),
+            "just automation::maintenance-finalize *": ("deny", "allow", "deny"),
+        }
+        for command, actions in expected.items():
+            with self.subTest(command=command):
+                self.assertEqual(
+                    (global_bash.get(command), build_bash.get(command), maintenance_bash.get(command)),
+                    actions,
+                )
+        self.assertEqual(global_bash["just automation::upgrade *"], "ask")
+        self.assertEqual(maintenance_bash["just automation::upgrade *"], "ask")
+        self.assertEqual(global_bash["just agent::push *"], "ask")
+        self.assertEqual(maintenance_bash["just agent::push *"], "ask")
+        for command in ("git push *", "gh pr create *", "gh pr merge *"):
+            self.assertEqual(global_bash[command], "deny")
+
+    def test_maintenance_effective_policy_when_cli_available(self) -> None:
+        opencode = shutil.which("opencode")
+        if opencode is None:
+            self.skipTest("opencode CLI is not available")
+
+        source_project = ROOT / "templates" / "agent-base"
+        with tempfile.TemporaryDirectory(prefix="templates-108-opencode-") as directory:
+            project = Path(directory) / "agent-base"
+            shutil.copytree(source_project, project)
+            config = Path(directory) / "opencode"
+            config.mkdir()
+            (config / "opencode.json").write_text("{}\n", encoding="utf-8")
+            env = os.environ.copy()
+            env["XDG_CONFIG_HOME"] = directory
+            env["OPENCODE_CONFIG_HOME"] = str(config)
+
+            effective = {}
+            for agent in ("build", "maintenance-orchestrator"):
+                result = subprocess.run(
+                    [opencode, "debug", "agent", agent, "--pure"],
+                    cwd=project,
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                effective[agent] = json.loads(result.stdout)["permission"]
+
+        def last_action(permissions: list[dict], pattern: str) -> str:
+            matches = [
+                item["action"]
+                for item in permissions
+                if item["permission"] == "bash" and item.get("pattern") == pattern
+            ]
+            self.assertTrue(matches, f"missing effective bash permission: {pattern}")
+            return matches[-1]
+
+        expected = {
+            "just automation::maintenance-check *": ("allow", "allow"),
+            "just automation::maintenance-review-record *": ("allow", "deny"),
+            "just automation::maintenance-pr-create *": ("deny", "allow"),
+            "just automation::maintenance-finalize *": ("allow", "deny"),
+        }
+        for command, (build_action, maintenance_action) in expected.items():
+            with self.subTest(command=command):
+                self.assertEqual(last_action(effective["build"], command), build_action)
+                self.assertEqual(
+                    last_action(effective["maintenance-orchestrator"], command),
+                    maintenance_action,
+                )
 
 
     def test_plan_agent_repository_local_read_only_contract(self) -> None:

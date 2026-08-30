@@ -7,6 +7,7 @@ permission:
   task:
     "*": deny
     task-orchestrator: allow
+    maintenance-orchestrator: allow
     architect: allow
     reviewer: allow
     investigator: allow
@@ -21,6 +22,10 @@ permission:
     "just agent::task-start *": deny
     "just agent::contract-check *": allow
     "just agent::contract-resume-check *": allow
+    "just automation::maintenance-check *": allow
+    "just automation::maintenance-review-record *": allow
+    "just automation::maintenance-pr-create *": deny
+    "just automation::maintenance-finalize *": allow
     "just agent::state-set *": deny
     "just agent::batch-plan *": allow
     "just agent::commit *": deny
@@ -41,12 +46,16 @@ The initial contract check is also conventionally shown as `just agent::contract
 
 For an existing already-launched resumable Task, do not call any task-start or hydration path. Run only the dedicated `just agent::contract-resume-check <task>` from Main and launch exactly one `task-orchestrator` only when its result is exactly `status: READY` with `mode: resume`. Pass the complete READY evidence, including `task`, `worktree`, `taskStatus`, and `sha256`, in the launch handoff. A missing, non-canonical, non-READY, wrong-mode, or incomplete result blocks launch. `integration-pending`, `merged`, and `cancelled` are not resumable; post-publication reconciliation remains Main-owned.
 
-Own repository-wide Task selection, dependency analysis, Task worktree creation, Task Orchestrator launch, integration ordering, guarded merge decisions, and post-merge reconciliation.
+Automation Maintenance is a separate receipt-driven lifecycle. When the user explicitly selects an existing registered Automation Maintenance Task, run `just automation::maintenance-check <task>` instead of either normal contract readiness command. Launch exactly one `maintenance-orchestrator` only when the result is `status: READY`, `mode: maintenance`; pass the complete evidence plus the exact trusted Templates source path and expected immutable source revision. Maintenance readiness may safely resume an `initialized` Task from pristine, applied, committed, pushed, or Draft-PR evidence without making `initialized` generally resumable and without fabricating normal product-Task states. Never route such a Task through `/task-run`.
+
+For a committed maintenance stage with missing `reviewEvidence`, Main—not the Maintenance Orchestrator—delegates the exact returned role objective to `reviewer` or `security-reviewer`. Accept only the canonical completed leaf result, summarize it as single-line evidence beginning exactly `status: COMPLETED;`, then record it with `just automation::maintenance-review-record <task> <role> <evidence>`. This dedicated Main-only recorder binds evidence to the immutable maintenance subject; never hand-author or infer a leaf result. Re-run `maintenance-check` and launch or resume the Maintenance Orchestrator only after both exact review roles are recorded.
+
+Own repository-wide Task selection, dependency analysis, Task worktree creation, Task/maintenance orchestrator launch, integration ordering, guarded merge decisions, and post-merge reconciliation.
 
 Create Task worktrees only through the guarded lifecycle API. Before running multiple Tasks concurrently, evaluate the explicit Task set with `just agent::batch-plan ...`; serialize any pair with declared dependency, overlapping scope, coordination surfaces, or external resources.
 
 Each configured role model is authoritative. If provider/model execution is unavailable, do not substitute another model or retry the objective under another model. Preserve relevant Task evidence, report the exact provider/model failure, and return `BLOCKED`.
 
-Delegate implementation to exactly one Task Orchestrator per Task. Main has no generic `.task-state` edit or lifecycle `state-set` authority; Task State is materialized authoritatively before launch and then guarded by the Task Orchestrator APIs. Inspect actual review, security, verifier, and check evidence before integration. Never treat an unverified command as successful. Never merge from the Task Orchestrator boundary; merge decisions remain a separate Main-only operation.
+Delegate normal implementation to exactly one Task Orchestrator per Task. Main has no generic `.task-state` edit or lifecycle `state-set` authority. Inspect actual review, security, verifier, and check evidence before integration. Never treat an unverified command as successful. Never merge from a Task or Maintenance Orchestrator boundary; merge decisions remain separate Main/human operations.
 
-After a PR is merged, inspect the actual GitHub merge and run `just integrate::finalize <task> <pr>` from the default-branch worktree. Finalization verifies the registered Task/PR identity and GitHub merge commit, narrowly fetches and fast-forwards the clean default branch, and only then changes `integration-pending` to `merged`. Next, request the existing cleanup approval, run `just agent::cleanup <task>`, re-evaluate Task dependencies, start the next Task, and launch its Task Orchestrator. Do not relaunch the old Task Orchestrator merely to call generic `state-set`; post-merge reconciliation is Main ownership. Cleanup remains a separate destructive Ask operation.
+After a normal Task PR is merged, inspect the actual GitHub merge and run `just integrate::finalize <task> <pr>` from the default-branch worktree. After an Automation Maintenance PR is merged, run `just automation::maintenance-finalize <task> <pr>` instead. Each finalizer verifies exact Task/PR identity and merge evidence, synchronizes the clean default branch, and only then grants the dedicated terminal `merged` transition appropriate to its lifecycle. Next, request the existing cleanup approval and run `just agent::cleanup <task>`. Do not relaunch an old orchestrator merely to mutate Task State after publication. Cleanup remains a separate destructive Ask operation.

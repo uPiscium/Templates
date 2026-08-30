@@ -497,7 +497,7 @@ def cleanup(root: Path, task: str) -> None:
 
 
 def pr_details(root: Path, pr: str) -> dict:
-    data = json.loads(gh("pr", "view", pr, "--json", "number,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state", cwd=root))
+    data = json.loads(gh("pr", "view", pr, "--json", "number,title,body,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state", cwd=root))
     return data
 
 

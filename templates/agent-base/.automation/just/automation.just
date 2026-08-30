@@ -1,5 +1,6 @@
 root := justfile_directory()
 script := root / ".automation" / "bin" / "automation_upgrade.py"
+maintenance := root / ".automation" / "bin" / "maintenance_lifecycle.py"
 
 [working-directory: root]
 version:
@@ -24,3 +25,19 @@ rebind-maintenance-provenance source expected_revision:
 [working-directory: root]
 commit task message="":
     python3 {{quote(script)}} commit {{quote(task)}} {{quote(message)}}
+
+[working-directory: root]
+maintenance-check task:
+    python3 {{quote(maintenance)}} check {{quote(task)}}
+
+[working-directory: root]
+maintenance-pr-create task:
+    python3 {{quote(maintenance)}} pr-create {{quote(task)}}
+
+[working-directory: root]
+maintenance-review-record task role evidence:
+    python3 {{quote(maintenance)}} review-record {{quote(task)}} {{quote(role)}} {{quote(evidence)}}
+
+[working-directory: root]
+maintenance-finalize task pr:
+    python3 {{quote(maintenance)}} finalize {{quote(task)}} {{quote(pr)}}
