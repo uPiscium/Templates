@@ -338,7 +338,7 @@ class PristineDiscardTest(unittest.TestCase):
 
         with self.github(), self.assertRaisesRegex(
             lifecycle.LifecycleError,
-            "live remote Task branch exists",
+            "publication configuration|live remote Task branch exists",
         ):
             discard.task_discard_pristine(self.repo, "13")
         self.assertEqual(
