@@ -406,6 +406,7 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
 
 
 def pr_create(root: Path, task: str) -> None:
+    verify(root, task)
     branch, context, head = _publication_context(root, task)
     if context["status"] != "publication-ready":
         raise AutomationError(f"pr-create requires publication-ready; found {context['status']}")
@@ -429,6 +430,7 @@ def pr_create(root: Path, task: str) -> None:
 
 
 def pr_edit(root: Path, task: str) -> None:
+    verify(root, task)
     branch, context, head = _publication_context(root, task)
     if context["status"] not in {"publication-ready", "draft-pr-created"}:
         raise AutomationError(f"pr-edit requires publication-ready or draft-pr-created; found {context['status']}")

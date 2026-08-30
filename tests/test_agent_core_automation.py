@@ -76,7 +76,7 @@ class AgentCoreSafetyTest(unittest.TestCase):
 class PublicationMetadataTest(unittest.TestCase):
     HEAD = "a" * 40
 
-    def fixture(self, root: Path, *, reviews: bool = False) -> None:
+    def fixture(self, root: Path, *, reviews: bool = True) -> None:
         state = root / ".task-state"
         state.mkdir()
         (state / "task.md").write_text(
@@ -97,6 +97,12 @@ Repair AgentKnowledgeVault publication metadata without replacing PR #20.
 ## Acceptance criteria
 
 - [x] Guard publication metadata.
+
+## Current state
+
+- Status: publication-ready
+- Blockers: none
+- Unverified: none
 
 ## Follow-up Task candidates
 
@@ -189,10 +195,53 @@ None yet.
             agent_core.publication.write_metadata(root, title, body)
             self.assertEqual(product.read_text(encoding="utf-8"), "unchanged\n")
             self.assertIn("`just project::check`: PASS", body)
+            self.assertIn("authoritative Task requirements", body)
+            self.assertIn("- Requirement: Guard publication metadata.", body)
+            self.assertNotIn("- [x]", body)
             self.assertIn("`WU-19-04` — `reviewer`", body)
             self.assertNotIn("security-reviewer", body)
             self.assertNotIn("NOT RUN", body)
             self.assertNotIn("Describe the implemented", body)
+
+    def test_known_blockers_and_unverified_state_are_rendered_truthfully(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            task = root / ".task-state" / "task.md"
+            text = task.read_text(encoding="utf-8")
+            text = text.replace("- Blockers: none", "- Blockers: release approval pending")
+            text = text.replace("- Unverified: none", "- Unverified: generated C++ smoke")
+            task.write_text(text, encoding="utf-8")
+            _, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=["one"]
+            )
+            risks = body.split("## Risks and unverified areas", 1)[1].split("## Follow-up Tasks", 1)[0]
+            self.assertIn("- Blockers: release approval pending", risks)
+            self.assertIn("- Unverified: generated C++ smoke", risks)
+            self.assertNotIn("None recorded", risks)
+
+    def test_missing_current_state_evidence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            task = root / ".task-state" / "task.md"
+            task.write_text(
+                task.read_text(encoding="utf-8").replace("- Unverified: none\n", ""),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "Current state Unverified"):
+                agent_core.publication.canonical_metadata(
+                    root, "19", head=self.HEAD, changed_paths=["one"]
+                )
+
+    def test_missing_reviewer_evidence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root, reviews=False)
+            with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "completed reviewer"):
+                agent_core.publication.canonical_metadata(
+                    root, "19", head=self.HEAD, changed_paths=["one"]
+                )
 
     def test_complete_metadata_allows_draft_creation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +252,7 @@ None yet.
             context = {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}
             live = {"number": 20, "title": title, "body": body_text.rstrip(), "headRefName": "task/19-agent-core-v3-1-1", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
             with (
+                mock.patch.object(agent_core, "verify") as verify_mock,
                 mock.patch.object(agent_core, "_publication_context", return_value=(live["headRefName"], context, self.HEAD)),
                 mock.patch.object(agent_core, "_validated_local_metadata", return_value=(title, root / ".task-state/pr-body.md", body_text.rstrip())),
                 mock.patch.object(agent_core, "default_branch", return_value="main"),
@@ -213,6 +263,7 @@ None yet.
             ):
                 agent_core.pr_create(root, "19")
             self.assertIn("--draft", gh.call_args.args)
+            verify_mock.assert_called_once_with(root, "19")
             transition.assert_called_once()
 
     def test_existing_stale_draft_is_repaired_in_place(self) -> None:
@@ -224,6 +275,7 @@ None yet.
             stale = {"number": 20, "headRefName": "task/19-fix", "baseRefName": "main", "headRefOid": self.HEAD, "isDraft": True, "isCrossRepository": False, "state": "OPEN"}
             updated = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
             with (
+                mock.patch.object(agent_core, "verify") as verify_mock,
                 mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
                 mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", body_file, "canonical")),
                 mock.patch.object(agent_core, "default_branch", return_value="main"),
@@ -233,10 +285,26 @@ None yet.
             ):
                 agent_core.pr_edit(root, "19")
             self.assertEqual(gh.call_args.args[:3], ("pr", "edit", "20"))
+            verify_mock.assert_called_once_with(root, "19")
+
+    def test_create_and_edit_do_not_write_when_verification_fails(self) -> None:
+        for action in (agent_core.pr_create, agent_core.pr_edit):
+            with (
+                mock.patch.object(
+                    agent_core,
+                    "verify",
+                    side_effect=agent_core.AutomationError("verification failed"),
+                ),
+                mock.patch.object(agent_core, "gh") as gh,
+                self.assertRaisesRegex(agent_core.AutomationError, "verification failed"),
+            ):
+                action(Path("."), "19")
+            gh.assert_not_called()
 
     def test_pr_edit_rejects_wrong_identity_before_write(self) -> None:
         wrong = {"number": 20, "headRefName": "task/19-fix", "baseRefName": "other", "headRefOid": self.HEAD, "isDraft": True, "isCrossRepository": False, "state": "OPEN"}
         with (
+            mock.patch.object(agent_core, "verify"),
             mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
             mock.patch.object(agent_core, "default_branch", return_value="main"),
             mock.patch.object(agent_core, "pr_for_branch", return_value=wrong),

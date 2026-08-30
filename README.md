@@ -431,6 +431,13 @@ and `.task-state/pr-body.md` from the resolved Task Contract, changed paths,
 the persisted successful project check, and completed reviewer/security
 reviewer Work Units. Publication rejects untouched placeholders, stale
 metadata, and a `NOT RUN` claim that contradicts persisted PASS evidence.
+The PR renders non-empty Task `Blockers` and `Unverified` values instead of
+claiming that no risks are recorded; missing Current-state evidence fails
+closed. Issue-backed acceptance criteria are labeled as authoritative
+requirements, while completion evidence remains in Validation and Reviews.
+Creation and repair rerun project verification, and publication requires a
+completed reviewer Work Unit; any present security-reviewer unit must also be
+completed before its evidence can be rendered.
 `pr-edit` repairs the same existing open Draft PR after preparation;
 `pr-ready` reruns verification and requires exact canonical/live metadata
 before marking Ready and entering `integration-pending`. Generic `state-set`

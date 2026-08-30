@@ -44,6 +44,27 @@ def _identity(text: str, name: str) -> str:
     return match.group(1).strip()
 
 
+def _current_state_value(text: str, name: str) -> str:
+    match = re.search(rf"(?m)^- {re.escape(name)}: (.+)$", text)
+    if match is None or not match.group(1).strip():
+        raise PublicationMetadataError(f"Task State is missing Current state {name}")
+    return match.group(1).strip()
+
+
+def _is_none_value(value: str) -> bool:
+    return value.casefold().rstrip(".") in {"none", "none recorded"}
+
+
+def _requirements(lines: list[str]) -> list[str]:
+    requirements = []
+    for line in lines:
+        value = re.sub(r"^-\s*\[[ xX]\]\s*", "", line.strip())
+        value = value.removeprefix("- ").strip()
+        if value:
+            requirements.append(f"- Requirement: {value}")
+    return requirements
+
+
 def _read_json(path: Path) -> dict | None:
     if not path.exists():
         return None
@@ -110,21 +131,39 @@ def canonical_metadata(root: Path, task: str, *, head: str, changed_paths: list[
     criteria = _content_lines(sections.get("Acceptance criteria", ""))
     if not purpose or not criteria:
         raise PublicationMetadataError("Task purpose and acceptance criteria must be resolved")
+    requirements = _requirements(criteria)
+    if not requirements:
+        raise PublicationMetadataError("Task acceptance criteria contain no authoritative requirements")
+    blockers = _current_state_value(sections.get("Current state", ""), "Blockers")
+    unverified = _current_state_value(sections.get("Current state", ""), "Unverified")
+    risks = []
+    if not _is_none_value(blockers):
+        risks.append(f"- Blockers: {blockers}")
+    if not _is_none_value(unverified):
+        risks.append(f"- Unverified: {unverified}")
+    if not risks:
+        risks = ["- None recorded."]
     summary = purpose[0].lstrip("- ").strip()
     verification = verification_evidence(root, task, head)
     title = f"{task}: {summary}"
     changes = [f"- `{path.replace('`', '')}`" for path in changed_paths] or ["- No tracked changes recorded."]
     reviews = completed_reviews(root, task)
+    if not any("— `reviewer` — completed" in review for review in reviews):
+        raise PublicationMetadataError(
+            "publication requires a completed reviewer Work Unit"
+        )
     followups = _content_lines(sections.get("Follow-up Task candidates", "")) or ["- None recorded."]
     body = "\n".join(
         [
             "## Summary", "", f"Task: {task}", "", *purpose,
             "", "## Changed paths", "", *changes,
-            "", "## Acceptance criteria", "", *criteria,
+            "", "## Acceptance criteria", "",
+            "The following are authoritative Task requirements; completion evidence is reported separately under Validation and Reviews.",
+            "", *requirements,
             "", "## Validation", "",
             f"- `just project::check`: PASS at `{head}` (persisted executed evidence)",
             "", "## Reviews", "", *(reviews or ["- None recorded."]),
-            "", "## Risks and unverified areas", "", "- None recorded.",
+            "", "## Risks and unverified areas", "", *risks,
             "", "## Follow-up Tasks", "", *followups, "",
         ]
     )
