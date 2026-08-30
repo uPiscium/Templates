@@ -136,17 +136,18 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 ),
             )
             for remote, pr, expected in cases:
-                with self.subTest(stage=expected), (
-                    mock.patch.object(maintenance.lifecycle, "state_status", return_value="initialized"),
-                    mock.patch.object(maintenance.upgrade, "receipt_path", return_value=active),
-                    mock.patch.object(maintenance.upgrade, "consumed_receipt_path", return_value=consumed),
-                    mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
-                    mock.patch.object(maintenance, "_remote_head", return_value=remote),
-                    mock.patch.object(maintenance, "_pr_evidence", return_value=pr),
-                ):
-                    result = maintenance._maintenance_stage(record, "21", self._contract(root))
-                self.assertEqual(result["stage"], expected)
-                self.assertEqual(result["taskStatus"], "initialized")
+                with self.subTest(stage=expected):
+                    with (
+                        mock.patch.object(maintenance.lifecycle, "state_status", return_value="initialized"),
+                        mock.patch.object(maintenance.upgrade, "receipt_path", return_value=active),
+                        mock.patch.object(maintenance.upgrade, "consumed_receipt_path", return_value=consumed),
+                        mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
+                        mock.patch.object(maintenance, "_remote_head", return_value=remote),
+                        mock.patch.object(maintenance, "_pr_evidence", return_value=pr),
+                    ):
+                        result = maintenance._maintenance_stage(record, "21", self._contract(root))
+                    self.assertEqual(result["stage"], expected)
+                    self.assertEqual(result["taskStatus"], "initialized")
 
     def test_review_evidence_requires_reviewer_and_security_reviewer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -306,6 +307,15 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("maintenance-orchestration", command)
         self.assertIn("maintenance-check", command)
+        agent = (
+            ROOT
+            / "components"
+            / "agent-core"
+            / ".opencode"
+            / "agents"
+            / "maintenance-orchestrator.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn('model: "openai/gpt-5.6-sol"', agent)
 
     def test_generated_maintenance_surface_matches_canonical(self) -> None:
         canonical = ROOT / "components" / "agent-core"
