@@ -443,6 +443,7 @@ class OpenCodeContractTest(unittest.TestCase):
             "build.md": "openai/gpt-5.6-sol",
             "plan.md": "openai/gpt-5.6-sol",
             "task-orchestrator.md": "openai/gpt-5.6-sol",
+            "maintenance-orchestrator.md": "openai/gpt-5.6-sol",
             "general.md": "openai/gpt-5.6-luna",
             "explore.md": "openai/gpt-5.6-luna",
             "verifier.md": "openai/gpt-5.6-luna",
@@ -469,7 +470,16 @@ class OpenCodeContractTest(unittest.TestCase):
             path.name for path in AGENTS.glob("*.md")
             if "model: openai/gpt-5.6-terra" in frontmatter(path)
         }
-        self.assertEqual(sol_agents, {"build.md", "plan.md", "task-orchestrator.md", "architect.md"})
+        self.assertEqual(
+            sol_agents,
+            {
+                "build.md",
+                "plan.md",
+                "task-orchestrator.md",
+                "maintenance-orchestrator.md",
+                "architect.md",
+            },
+        )
         self.assertEqual(luna_agents, {"general.md", "explore.md", "verifier.md", "scout.md"})
         self.assertEqual(terra_agents, {"reviewer.md", "investigator.md", "security-reviewer.md"})
         self.assertFalse(list(AGENTS.glob("*-fallback.md")))

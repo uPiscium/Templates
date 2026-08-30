@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,27 @@ class MaintenanceLifecycleTest(unittest.TestCase):
     OLD_REMOTE = "9" * 40
     MERGE = "c" * 40
 
+    def _git(self, root: Path, *args: str) -> str:
+        result = subprocess.run(
+            ["git", *args], cwd=root, check=True, capture_output=True, text=True
+        )
+        return result.stdout.strip()
+
+    def _init_repo(self, root: Path) -> None:
+        self._git(root, "init", "-b", "main")
+        self._git(root, "config", "user.name", "Maintenance Test")
+        self._git(root, "config", "user.email", "maintenance@example.invalid")
+
+    def _commit(self, root: Path, message: str) -> str:
+        self._git(root, "add", ".")
+        self._git(root, "commit", "-m", message)
+        return self._git(root, "rev-parse", "HEAD")
+
+    def _write(self, root: Path, relative: str, content: str) -> None:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
     def _record(self, root: Path):
         return maintenance.lifecycle.WorktreeRecord(
             root,
@@ -41,6 +63,22 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             "issue": 21,
             "repository": "example/repo",
             "sha256": "d" * 64,
+        }
+
+    def _receipt(self, **values) -> dict:
+        return {
+            "authority_head": self.BASE,
+            "source": "/trusted/Templates",
+            "source_revision": self.HEAD,
+            "changed_paths": [".automation/bin/maintenance.py"],
+            "path_fingerprints": {
+                ".automation/bin/maintenance.py": {
+                    "state": "file",
+                    "mode": 0o644,
+                    "content_sha256": "e" * 64,
+                }
+            },
+            **values,
         }
 
     def _state(self, root: Path, status: str = "initialized") -> None:
@@ -78,7 +116,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(
                     maintenance,
                     "_validate_active_receipt",
-                    return_value={"source_revision": self.HEAD},
+                    return_value=self._receipt(),
                 ),
             ):
                 result = maintenance._maintenance_stage(record, "21", self._contract(root))
@@ -94,7 +132,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             active = root / "active.json"
             consumed = root / "consumed.json"
             consumed.write_text("{}\n", encoding="utf-8")
-            receipt = {"commit_sha": self.HEAD, "source_revision": self.BASE}
+            receipt = self._receipt(commit_sha=self.HEAD)
 
             class Result:
                 returncode = 0
@@ -113,6 +151,55 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             self.assertEqual(result["remoteHead"], self.OLD_REMOTE)
             self.assertEqual(result["remoteRelation"], "ancestor")
 
+    def test_consumed_receipt_uses_real_ancestry_and_rejects_divergence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init_repo(root)
+            self._write(root, "tracked.txt", "base\n")
+            base = self._commit(root, "base")
+            self._write(root, "tracked.txt", "older maintenance\n")
+            older = self._commit(root, "older maintenance")
+            self._write(root, "latest.txt", "latest maintenance\n")
+            head = self._commit(root, "latest maintenance")
+            self._git(root, "checkout", "-b", "diverged", base)
+            self._write(root, "diverged.txt", "diverged\n")
+            diverged = self._commit(root, "diverged")
+            self._git(root, "checkout", "main")
+
+            record = maintenance.lifecycle.WorktreeRecord(
+                root, "task/21-agent-core-v3-1-5", head
+            )
+            active = root / "active.json"
+            consumed = root / "consumed.json"
+            consumed.write_text("{}\n", encoding="utf-8")
+            receipt = self._receipt(
+                commit_sha=head, authority_head=base, source_revision=head
+            )
+            with (
+                mock.patch.object(maintenance.lifecycle, "state_status", return_value="initialized"),
+                mock.patch.object(maintenance.upgrade, "receipt_path", return_value=active),
+                mock.patch.object(maintenance.upgrade, "consumed_receipt_path", return_value=consumed),
+                mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
+                mock.patch.object(maintenance, "_remote_head", return_value=older),
+                mock.patch.object(maintenance, "_pr_evidence", return_value=None),
+            ):
+                result = maintenance._maintenance_stage(record, "21", self._contract(root))
+            self.assertEqual(result["stage"], "committed")
+            self.assertEqual(result["remoteRelation"], "ancestor")
+
+            with (
+                mock.patch.object(maintenance.lifecycle, "state_status", return_value="initialized"),
+                mock.patch.object(maintenance.upgrade, "receipt_path", return_value=active),
+                mock.patch.object(maintenance.upgrade, "consumed_receipt_path", return_value=consumed),
+                mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
+                mock.patch.object(maintenance, "_remote_head", return_value=diverged),
+                mock.patch.object(maintenance, "_pr_evidence", return_value=None),
+            ):
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "not the maintenance commit or its ancestor"
+                ):
+                    maintenance._maintenance_stage(record, "21", self._contract(root))
+
     def test_consumed_receipt_stages_resume_from_commit_push_and_draft_pr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -120,7 +207,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             active = root / "active.json"
             consumed = root / "consumed.json"
             consumed.write_text("{}\n", encoding="utf-8")
-            receipt = {"commit_sha": self.HEAD, "source_revision": self.BASE}
+            receipt = self._receipt(commit_sha=self.HEAD)
             cases = (
                 (None, None, "committed"),
                 (self.HEAD, None, "pushed"),
@@ -153,6 +240,9 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             record = self._record(root)
+            receipt = self._receipt(commit_sha=self.HEAD)
+            subject = maintenance._review_subject(receipt)
+            objective = maintenance._review_objective("21", "reviewer", subject)
             with mock.patch.object(
                 maintenance.lifecycle,
                 "read_work_units",
@@ -160,13 +250,107 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                     "units": {
                         "WU-21-01": {
                             "requested_role": "reviewer",
+                            "objective": objective,
+                            "semantic_sha256": maintenance.lifecycle.semantic_digest(objective),
                             "state": "completed",
+                            "transitions": [
+                                {"to": "completed", "evidence_sha256": "f" * 64}
+                            ],
                         }
                     }
                 },
             ):
                 with self.assertRaisesRegex(maintenance.MaintenanceError, "security-reviewer"):
-                    maintenance._require_review_evidence(record, "21")
+                    maintenance._require_review_evidence(record, "21", receipt)
+
+    def test_review_evidence_is_bound_to_exact_maintenance_subject(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            old_receipt = self._receipt(commit_sha=self.HEAD)
+            new_receipt = self._receipt(
+                commit_sha=self.HEAD,
+                source_revision=self.MERGE,
+                changed_paths=[".automation/bin/newer.py"],
+                path_fingerprints={
+                    ".automation/bin/newer.py": {
+                        "state": "file",
+                        "mode": 0o644,
+                        "content_sha256": "1" * 64,
+                    }
+                },
+            )
+            old_subject = maintenance._review_subject(old_receipt)
+            units = {}
+            for index, role in enumerate(("reviewer", "security-reviewer"), start=1):
+                objective = maintenance._review_objective("21", role, old_subject)
+                units[f"WU-21-0{index}"] = {
+                    "requested_role": role,
+                    "objective": objective,
+                    "semantic_sha256": maintenance.lifecycle.semantic_digest(objective),
+                    "state": "completed",
+                    "transitions": [
+                        {"to": "completed", "evidence_sha256": str(index) * 64}
+                    ],
+                }
+            with mock.patch.object(
+                maintenance.lifecycle,
+                "read_work_units",
+                return_value={"units": units},
+            ):
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "reviewer, security-reviewer"
+                ):
+                    maintenance._require_review_evidence(record, "21", new_receipt)
+
+    def test_main_only_review_recorder_persists_exact_subject_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root / "task")
+            receipt = self._receipt(commit_sha=self.HEAD)
+            units = {"schema_version": 1, "task_id": "21", "units": {}}
+            evidence = "status: COMPLETED; no findings for the exact maintenance subject"
+            with (
+                mock.patch.object(maintenance.lifecycle, "require_main_worktree") as main_only,
+                mock.patch.object(
+                    maintenance, "_validated_contract", return_value=(record, self._contract(record.path))
+                ),
+                mock.patch.object(
+                    maintenance, "_validate_consumed_receipt", return_value=receipt
+                ),
+                mock.patch.object(
+                    maintenance.lifecycle, "work_units_lock", return_value=nullcontext()
+                ),
+                mock.patch.object(maintenance.lifecycle, "assert_task_identity"),
+                mock.patch.object(
+                    maintenance.lifecycle, "read_work_units", return_value=units
+                ),
+                mock.patch.object(maintenance.lifecycle, "persist_work_units") as persist,
+            ):
+                result = maintenance.maintenance_review_record(
+                    root, "21", "security-reviewer", evidence
+                )
+            main_only.assert_called_once_with(root)
+            persisted = persist.call_args.args[1]
+            unit = persisted["units"][result["workUnit"]]
+            self.assertEqual(unit["state"], "completed")
+            self.assertEqual(
+                unit["objective"],
+                maintenance._review_objective(
+                    "21", "security-reviewer", maintenance._review_subject(receipt)
+                ),
+            )
+            self.assertEqual(unit["transitions"][-1]["evidence"], evidence)
+
+            with (
+                mock.patch.object(maintenance.lifecycle, "require_main_worktree"),
+                self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "must start with status: COMPLETED;"
+                ),
+            ):
+                maintenance.maintenance_review_record(
+                    root, "21", "security-reviewer", "status: BLOCKED; no result"
+                )
 
     def test_pr_create_uses_full_direct_upgrade_diff_not_latest_receipt_delta(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -175,10 +359,10 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             body_path = root / ".task-state" / "pr-body.md"
             body_path.parent.mkdir(parents=True)
             body_path.write_text("body\n", encoding="utf-8")
-            receipt = {
-                "commit_sha": self.HEAD,
-                "changed_paths": [".automation/bin/second-upgrade-only.py"],
-            }
+            receipt = self._receipt(
+                commit_sha=self.HEAD,
+                changed_paths=[".automation/bin/second-upgrade-only.py"],
+            )
             full_paths = [
                 ".automation/bin/first-upgrade.py",
                 ".automation/bin/second-upgrade-only.py",
@@ -205,6 +389,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(maintenance, "_remote_head", return_value=self.HEAD),
                 mock.patch.object(maintenance, "_require_review_evidence"),
                 mock.patch.object(maintenance.agent_core, "verify"),
+                mock.patch.object(maintenance.publication, "verification_evidence"),
                 mock.patch.object(maintenance, "_direct_upgrade_publication", return_value=full_paths),
                 mock.patch.object(
                     maintenance.publication,
@@ -231,6 +416,72 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             self.assertEqual(result["stage"], "draft-pr-created")
             self.assertEqual(result["pr"], 22)
 
+    def test_direct_upgrade_proof_covers_all_maintenance_commits_from_task_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            task = temporary / "task"
+            source = temporary / "templates"
+            task.mkdir()
+            source.mkdir()
+            self._init_repo(task)
+            self._init_repo(source)
+
+            self._write(task, ".automation/VERSION", "3\n")
+            self._write(task, ".automation/bin/first-upgrade.py", "base\n")
+            base = self._commit(task, "Task base")
+            self._write(task, ".automation/bin/first-upgrade.py", "first upgrade\n")
+            self._commit(task, "first maintenance upgrade")
+            self._write(task, ".automation/bin/second-upgrade.py", "second upgrade\n")
+            head = self._commit(task, "second maintenance upgrade")
+
+            self._write(source, "components/agent-core/.automation/VERSION", "3\n")
+            self._write(
+                source,
+                "components/agent-core/.automation/bin/first-upgrade.py",
+                "first upgrade\n",
+            )
+            self._write(
+                source,
+                "components/agent-core/.automation/bin/second-upgrade.py",
+                "second upgrade\n",
+            )
+            source_revision = self._commit(source, "final Templates source")
+
+            self._state(task)
+            state = task / ".task-state/task.md"
+            state.write_text(
+                state.read_text(encoding="utf-8")
+                + f"\n## Provenance\n\n- Base revision: {base}\n",
+                encoding="utf-8",
+            )
+            receipt = {
+                "commit_sha": head,
+                "source": str(source),
+                "source_revision": source_revision,
+                "changed_paths": [".automation/bin/second-upgrade.py"],
+            }
+            record = maintenance.lifecycle.WorktreeRecord(
+                task, "task/21-agent-core-v3-1-5", head
+            )
+
+            paths = maintenance._direct_upgrade_publication(record, receipt)
+            self.assertEqual(
+                paths,
+                [
+                    ".automation/bin/first-upgrade.py",
+                    ".automation/bin/second-upgrade.py",
+                ],
+            )
+
+            (task / ".automation/bin/first-upgrade.py").write_text(
+                "stale first upgrade\n", encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                maintenance.MaintenanceError,
+                "does not match the reconstructed direct upgrade",
+            ):
+                maintenance._direct_upgrade_publication(record, receipt)
+
     def test_finalize_revalidates_direct_upgrade_and_uses_dedicated_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -241,7 +492,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             receipt = {"commit_sha": self.HEAD}
             merged = {"mergeCommitOid": self.MERGE}
             sync = {"branch": "main", "revision": "e" * 40, "updated": True}
-            publication_paths = [".automation/bin/a.py"]
+            publication_evidence = ([".automation/bin/a.py"], "21: maintenance", "body")
 
             class Result:
                 returncode = 0
@@ -252,8 +503,8 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
                 mock.patch.object(
                     maintenance,
-                    "_direct_upgrade_publication",
-                    side_effect=[publication_paths, publication_paths],
+                    "_publication_evidence",
+                    side_effect=[publication_evidence, publication_evidence],
                 ) as reconstruct,
                 mock.patch.object(maintenance, "_merged_pr", side_effect=[merged, merged]),
                 mock.patch.object(maintenance.lifecycle, "synchronize_default_branch", return_value=sync),
@@ -267,6 +518,59 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             mark.assert_called_once_with(record, "21")
             self.assertEqual(result["status"], "FINALIZED")
             self.assertEqual(result["stage"], "merged")
+
+    def test_publication_evidence_rejects_stale_verification_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            receipt = self._receipt(commit_sha=self.HEAD)
+            with (
+                mock.patch.object(maintenance, "_require_review_evidence"),
+                mock.patch.object(
+                    maintenance.publication,
+                    "verification_evidence",
+                    side_effect=maintenance.publication.PublicationMetadataError(
+                        "project verification evidence is stale"
+                    ),
+                ),
+                self.assertRaisesRegex(maintenance.MaintenanceError, "verification evidence is stale"),
+            ):
+                maintenance._publication_evidence(record, "21", receipt)
+
+    def test_merged_pr_requires_canonical_title_and_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            details = {
+                "number": 22,
+                "title": "stale title",
+                "body": "canonical body",
+                "headRefName": record.branch,
+                "baseRefName": "main",
+                "headRefOid": self.HEAD,
+                "isCrossRepository": False,
+                "state": "MERGED",
+                "mergeCommit": {"oid": self.MERGE},
+            }
+            with (
+                mock.patch.object(maintenance.agent_core, "pr_details", return_value=details),
+                mock.patch.object(maintenance.lifecycle, "default_branch", return_value="main"),
+                mock.patch.object(
+                    maintenance.agent_core,
+                    "canonical_repository",
+                    return_value="example/repo",
+                ),
+                self.assertRaisesRegex(maintenance.MaintenanceError, "title"),
+            ):
+                maintenance._merged_pr(
+                    root,
+                    record,
+                    "example/repo",
+                    22,
+                    self.HEAD,
+                    "21: canonical title",
+                    "canonical body",
+                )
 
     def test_dedicated_terminal_transition_does_not_change_normal_transition_table(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -297,6 +601,10 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         self.assertEqual(bash["just automation::upgrade *"], "ask")
         self.assertEqual(bash["just agent::push *"], "ask")
         self.assertEqual(bash["git push *"], "deny")
+        build = (
+            ROOT / "components" / "agent-core" / ".opencode" / "agents" / "build.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"just automation::maintenance-review-record *": allow', build)
         command = (
             ROOT
             / "components"
@@ -315,7 +623,11 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             / "agents"
             / "maintenance-orchestrator.md"
         ).read_text(encoding="utf-8")
-        self.assertIn('model: "openai/gpt-5.6-sol"', agent)
+        self.assertIn("model: openai/gpt-5.6-sol", agent)
+        self.assertIn('"just automation::maintenance-review-record *": deny', agent)
+        self.assertNotIn("reviewer: allow", agent)
+        self.assertNotIn("security-reviewer: allow", agent)
+        self.assertNotIn('"just agent::work-unit-state-set *": allow', agent)
 
     def test_generated_maintenance_surface_matches_canonical(self) -> None:
         canonical = ROOT / "components" / "agent-core"

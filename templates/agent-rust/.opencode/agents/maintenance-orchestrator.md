@@ -2,14 +2,12 @@
 description: Owns one Automation Maintenance Task through guarded upgrade, review, commit, push, and Draft PR publication
 mode: subagent
 hidden: true
-model: "openai/gpt-5.6-sol"
+model: openai/gpt-5.6-sol
 permission:
   question: allow
   task:
     "*": deny
     verifier: allow
-    reviewer: allow
-    security-reviewer: allow
   bash:
     "just agent::preflight": allow
     "just agent::doctor": allow
@@ -23,10 +21,8 @@ permission:
     "just automation::maintenance-pr-create *": allow
     "just agent::verify *": allow
     "just agent::push *": ask
-    "just agent::work-unit-create *": allow
-    "just agent::work-unit-dispatch-check *": allow
     "just agent::work-unit-status *": allow
-    "just agent::work-unit-state-set *": allow
+    "just automation::maintenance-review-record *": deny
     "just agent::state-set *": deny
     "just agent::pr-create *": deny
     "just agent::pr-ready *": deny
@@ -43,14 +39,14 @@ Use `just automation::maintenance-check <task>` as the persisted-state loop. It 
 
 Stage handling:
 - `pristine`: run read-only `automation::check-update <source> <revision>`, require the exact source revision and no blockers, then request approval for `automation::upgrade <source> <revision>`.
-- `applied`: inspect the managed-only diff; run `git diff --check`, `just agent::doctor`, `just project::check`, and applicable repository checks. Create bounded reviewer and security-reviewer Work Units using the normal create -> dispatch-check -> delegate -> terminal evidence protocol. Only after actual PASS evidence, run guarded `just automation::commit <task>`.
-- `committed`: if review/security evidence is absent (for example after resuming an older maintenance flow), create those bounded read-only Work Units against the immutable committed diff. Run `just agent::verify <task>`. Then request approval for `just agent::push <task>`.
+- `applied`: inspect the managed-only diff; run `git diff --check`, `just agent::doctor`, `just project::check`, and applicable repository checks. Only after actual PASS evidence, run guarded `just automation::commit <task>`; review publication evidence is collected after the immutable maintenance commit exists.
+- `committed`: exact reviewer and security-reviewer evidence is Main-owned. If either `reviewEvidence` value is false, stop and return the exact role objectives to Main; do not delegate, record, or infer the reviews yourself. Once Main has recorded both exact reviews, run `just agent::verify <task>`, then request approval for `just agent::push <task>`.
 - `pushed`: require completed reviewer and security-reviewer evidence and actual verification, then run `just automation::maintenance-pr-create <task>`.
 - `draft-pr-created`: stop successfully and report the Draft PR. Do not mark it ready and never merge.
 - `ready` or `merged-remote`: stop and return control to Main/human integration handling.
 - `merged`: the Task is terminal; stop.
 
-For reviewer/security leaf Work Units, use `work-unit-create`, immediately verify the exact ID/role/objective with `work-unit-dispatch-check`, delegate exactly that objective, and persist the canonical leaf result using `work-unit-state-set`. Never hand-author Work Unit IDs or reopen terminal Work Units. A failed review requires a fresh corrective maintenance attempt outside this role unless the issue is purely verification/review evidence and can be resolved without editing managed content.
+Reviewer/security leaf delegation and evidence recording are outside this role's authority. Never invoke or emulate the Main-only maintenance review recorder. A failed review requires a fresh corrective maintenance attempt outside this role unless the issue is purely verification/review evidence and can be resolved without editing managed content.
 
 Do not edit Agent Core files directly. The only tracked mutation authority is `automation::upgrade`; the only commit authority is `automation::commit`. Do not use raw Git add/commit/push, raw GitHub PR creation, normal `agent::pr-create`, or any generic Task State mutation.
 

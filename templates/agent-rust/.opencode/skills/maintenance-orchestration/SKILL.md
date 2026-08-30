@@ -14,6 +14,8 @@ Inputs are exact and mandatory:
 
 From Main, run `just automation::maintenance-check <task>`. Launch exactly one `maintenance-orchestrator` only when it returns `status: READY` and `mode: maintenance`. Pass the complete result plus the exact source path and revision. This dedicated readiness path is valid for pristine, applied, committed, pushed, and Draft-PR maintenance stages and does not alter normal `contract-check` / `contract-resume-check` semantics.
 
+At committed stage, Main owns reviewer and security-reviewer delegation. For each false `reviewEvidence` role, delegate the exact returned objective, accept only the canonical completed leaf result, and persist it with `just automation::maintenance-review-record <task> <role> <evidence>`. The Maintenance Orchestrator cannot invoke that recorder. Re-run the check before launch.
+
 The maintenance orchestrator must:
 - reconstruct progress from guarded maintenance evidence, not synthetic Task State transitions;
 - bind `check-update` and `upgrade` to the exact expected source revision;

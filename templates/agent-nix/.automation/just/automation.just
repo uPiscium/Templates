@@ -35,5 +35,9 @@ maintenance-pr-create task:
     python3 {{quote(maintenance)}} pr-create {{quote(task)}}
 
 [working-directory: root]
+maintenance-review-record task role evidence:
+    python3 {{quote(maintenance)}} review-record {{quote(task)}} {{quote(role)}} {{quote(evidence)}}
+
+[working-directory: root]
 maintenance-finalize task pr:
     python3 {{quote(maintenance)}} finalize {{quote(task)}} {{quote(pr)}}

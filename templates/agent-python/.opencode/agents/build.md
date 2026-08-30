@@ -23,6 +23,7 @@ permission:
     "just agent::contract-check *": allow
     "just agent::contract-resume-check *": allow
     "just automation::maintenance-check *": allow
+    "just automation::maintenance-review-record *": allow
     "just automation::maintenance-finalize *": allow
     "just agent::state-set *": deny
     "just agent::batch-plan *": allow
@@ -45,6 +46,8 @@ The initial contract check is also conventionally shown as `just agent::contract
 For an existing already-launched resumable Task, do not call any task-start or hydration path. Run only the dedicated `just agent::contract-resume-check <task>` from Main and launch exactly one `task-orchestrator` only when its result is exactly `status: READY` with `mode: resume`. Pass the complete READY evidence, including `task`, `worktree`, `taskStatus`, and `sha256`, in the launch handoff. A missing, non-canonical, non-READY, wrong-mode, or incomplete result blocks launch. `integration-pending`, `merged`, and `cancelled` are not resumable; post-publication reconciliation remains Main-owned.
 
 Automation Maintenance is a separate receipt-driven lifecycle. When the user explicitly selects an existing registered Automation Maintenance Task, run `just automation::maintenance-check <task>` instead of either normal contract readiness command. Launch exactly one `maintenance-orchestrator` only when the result is `status: READY`, `mode: maintenance`; pass the complete evidence plus the exact trusted Templates source path and expected immutable source revision. Maintenance readiness may safely resume an `initialized` Task from pristine, applied, committed, pushed, or Draft-PR evidence without making `initialized` generally resumable and without fabricating normal product-Task states. Never route such a Task through `/task-run`.
+
+For a committed maintenance stage with missing `reviewEvidence`, Main—not the Maintenance Orchestrator—delegates the exact returned role objective to `reviewer` or `security-reviewer`. Accept only the canonical completed leaf result, summarize it as single-line evidence beginning exactly `status: COMPLETED;`, then record it with `just automation::maintenance-review-record <task> <role> <evidence>`. This dedicated Main-only recorder binds evidence to the immutable maintenance subject; never hand-author or infer a leaf result. Re-run `maintenance-check` and launch or resume the Maintenance Orchestrator only after both exact review roles are recorded.
 
 Own repository-wide Task selection, dependency analysis, Task worktree creation, Task/maintenance orchestrator launch, integration ordering, guarded merge decisions, and post-merge reconciliation.
 

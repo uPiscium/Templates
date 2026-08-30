@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -265,6 +266,56 @@ def _pr_evidence(
     return pr
 
 
+def _review_subject(receipt: dict) -> str:
+    fields = {
+        "commit_sha": receipt.get("commit_sha"),
+        "authority_head": receipt.get("authority_head"),
+        "source": receipt.get("source"),
+        "source_revision": receipt.get("source_revision"),
+        "changed_paths": receipt.get("changed_paths"),
+        "path_fingerprints": receipt.get("path_fingerprints"),
+    }
+    if (
+        not isinstance(fields["commit_sha"], str)
+        or not isinstance(fields["authority_head"], str)
+        or not isinstance(fields["source"], str)
+        or not isinstance(fields["source_revision"], str)
+        or not isinstance(fields["changed_paths"], list)
+        or not isinstance(fields["path_fingerprints"], dict)
+    ):
+        raise MaintenanceError("maintenance review subject is incomplete")
+    return hashlib.sha256(
+        json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _review_objective(task: str, role: str, subject: str) -> str:
+    return (
+        f"Review Automation Maintenance Task {task} as {role}; "
+        f"review_subject_sha256={subject}; report only evidence for this exact immutable upgrade."
+    )
+
+
+def _review_handoff(task: str, receipt: dict) -> dict:
+    subject = _review_subject(receipt)
+    return {
+        "reviewSubjectSha256": subject,
+        "reviewObjectives": {
+            role: _review_objective(task, role, subject)
+            for role in ("reviewer", "security-reviewer")
+        },
+    }
+
+
+def _review_status(
+    record: lifecycle.WorktreeRecord, task: str, receipt: dict
+) -> dict[str, bool]:
+    return {
+        role: _completed_role(record, task, role, receipt)
+        for role in ("reviewer", "security-reviewer")
+    }
+
+
 def _maintenance_stage(
     record: lifecycle.WorktreeRecord, task: str, contract: dict
 ) -> dict:
@@ -321,6 +372,8 @@ def _maintenance_stage(
             "remoteHead": remote,
             "remoteRelation": relation,
             "pr": pr["number"] if pr is not None else None,
+            **_review_handoff(task, receipt),
+            "reviewEvidence": _review_status(record, task, receipt),
         }
 
     try:
@@ -344,27 +397,103 @@ def maintenance_check(root_path: Path, task: str) -> dict:
     return _maintenance_stage(record, task, contract)
 
 
-def _completed_role(record: lifecycle.WorktreeRecord, task: str, role: str) -> bool:
+def _completed_role(
+    record: lifecycle.WorktreeRecord, task: str, role: str, receipt: dict
+) -> bool:
+    subject = _review_subject(receipt)
+    objective = _review_objective(task, role, subject)
     state = lifecycle.read_work_units(record, task)
     return any(
         isinstance(unit, dict)
         and unit.get("requested_role") == role
         and unit.get("state") == "completed"
+        and unit.get("objective") == objective
+        and unit.get("semantic_sha256") == lifecycle.semantic_digest(objective)
+        and isinstance(unit.get("transitions"), list)
+        and bool(unit["transitions"])
+        and unit["transitions"][-1].get("to") == "completed"
+        and isinstance(unit["transitions"][-1].get("evidence_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", unit["transitions"][-1]["evidence_sha256"]
+        )
+        is not None
         for unit in state.get("units", {}).values()
     )
 
 
-def _require_review_evidence(record: lifecycle.WorktreeRecord, task: str) -> None:
+def _require_review_evidence(
+    record: lifecycle.WorktreeRecord, task: str, receipt: dict
+) -> None:
     missing = [
         role
         for role in ("reviewer", "security-reviewer")
-        if not _completed_role(record, task, role)
+        if not _completed_role(record, task, role, receipt)
     ]
     if missing:
         raise MaintenanceError(
             "maintenance publication requires completed review evidence: "
             + ", ".join(missing)
         )
+
+
+def maintenance_review_record(
+    root_path: Path, task: str, role: str, evidence: str
+) -> dict:
+    lifecycle.require_main_worktree(root_path)
+    if role not in {"reviewer", "security-reviewer"}:
+        raise MaintenanceError("maintenance review role must be reviewer or security-reviewer")
+    lifecycle.validate_evidence(evidence)
+    if not evidence.startswith("status: COMPLETED;"):
+        raise MaintenanceError("maintenance review evidence must start with status: COMPLETED;")
+    record, _ = _validated_contract(root_path, task)
+    receipt = _validate_consumed_receipt(record, task)
+    subject = _review_subject(receipt)
+    objective = _review_objective(task, role, subject)
+    with lifecycle.work_units_lock(record):
+        lifecycle.assert_task_identity(record, task)
+        value = lifecycle.read_work_units(record, task)
+        for identifier, unit in value.get("units", {}).items():
+            if (
+                isinstance(unit, dict)
+                and unit.get("requested_role") == role
+                and unit.get("objective") == objective
+                and unit.get("state") == "completed"
+            ):
+                return {
+                    "status": "ALREADY_RECORDED",
+                    "task": task,
+                    "role": role,
+                    "workUnit": identifier,
+                    "reviewSubjectSha256": subject,
+                }
+        identifier = lifecycle.next_work_unit_id(value, task)
+        unit = lifecycle.new_work_unit(identifier, role, objective)
+        now = lifecycle.utc_now()
+        transition = {
+            "from": "in-flight",
+            "to": "completed",
+            "evidence": evidence,
+            "evidence_sha256": lifecycle.semantic_digest(evidence),
+            "recorded_at": now,
+        }
+        unit["state"] = "completed"
+        unit["transitions"].append(transition)
+        unit["updated_at"] = now
+        value["units"][identifier] = unit
+        lifecycle.persist_work_units(
+            record,
+            value,
+            "maintenance_review_recorded="
+            f"{identifier}; requested_role={role}; review_subject_sha256={subject}; "
+            f"evidence_sha256={transition['evidence_sha256']}",
+        )
+    return {
+        "status": "RECORDED",
+        "task": task,
+        "role": role,
+        "workUnit": identifier,
+        "reviewSubjectSha256": subject,
+    }
 
 
 def _direct_upgrade_publication(
@@ -472,6 +601,22 @@ def _direct_upgrade_publication(
     return expected_paths
 
 
+def _publication_evidence(
+    record: lifecycle.WorktreeRecord, task: str, receipt: dict
+) -> tuple[list[str], str, str]:
+    commit = receipt["commit_sha"]
+    _require_review_evidence(record, task, receipt)
+    try:
+        publication.verification_evidence(record.path, task, commit)
+        paths = _direct_upgrade_publication(record, receipt)
+        title, body = publication.canonical_metadata(
+            record.path, task, head=commit, changed_paths=paths
+        )
+    except publication.PublicationMetadataError as exc:
+        raise MaintenanceError(str(exc)) from exc
+    return paths, title, body.rstrip()
+
+
 def maintenance_pr_create(root_path: Path, task: str) -> dict:
     record = lifecycle.require_local_task(root_path, task)
     ready = maintenance_check(root_path, task)
@@ -487,14 +632,11 @@ def maintenance_pr_create(root_path: Path, task: str) -> dict:
         raise MaintenanceError(
             "maintenance PR creation requires the exact commit on the remote Task branch"
         )
-    _require_review_evidence(record, task)
+    _require_review_evidence(record, task, receipt)
 
     try:
         agent_core.verify(root_path, task)
-        paths = _direct_upgrade_publication(record, receipt)
-        title, body_text = publication.canonical_metadata(
-            root_path, task, head=commit, changed_paths=paths
-        )
+        _, title, body_text = _publication_evidence(record, task, receipt)
         publication.write_metadata(root_path, title, body_text)
         _, body_path, validated_body = agent_core._validated_local_metadata(
             root_path, task, commit
@@ -560,6 +702,8 @@ def _merged_pr(
     repository: str,
     pr_number: int,
     commit: str,
+    title: str,
+    body: str,
 ) -> dict:
     details = agent_core.pr_details(record.path, str(pr_number))
     expected = {
@@ -568,6 +712,8 @@ def _merged_pr(
         "headRefOid": commit,
         "isCrossRepository": False,
         "state": "MERGED",
+        "title": title,
+        "body": body,
     }
     mismatches = [
         name for name, wanted in expected.items() if details.get(name) != wanted
@@ -617,8 +763,11 @@ def maintenance_finalize(root_path: Path, task: str, pr_number: int) -> dict:
     record, contract = _stored_contract(root_path, task)
     receipt = _validate_consumed_receipt(record, task)
     commit = receipt["commit_sha"]
-    publication_paths = _direct_upgrade_publication(record, receipt)
-    first = _merged_pr(root_path, record, contract["repository"], pr_number, commit)
+    publication_evidence = _publication_evidence(record, task, receipt)
+    _, title, body = publication_evidence
+    first = _merged_pr(
+        root_path, record, contract["repository"], pr_number, commit, title, body
+    )
     sync = lifecycle.synchronize_default_branch(root_path)
     merge_oid = first["mergeCommitOid"]
     if (
@@ -636,11 +785,13 @@ def maintenance_finalize(root_path: Path, task: str, pr_number: int) -> dict:
         root_path, sync["branch"], sync["revision"]
     )
     receipt_after = _validate_consumed_receipt(record, task)
-    if _direct_upgrade_publication(record, receipt_after) != publication_paths:
+    if _publication_evidence(record, task, receipt_after) != publication_evidence:
         raise MaintenanceError(
             "maintenance publication reconstruction changed during finalization"
         )
-    second = _merged_pr(root_path, record, contract["repository"], pr_number, commit)
+    second = _merged_pr(
+        root_path, record, contract["repository"], pr_number, commit, title, body
+    )
     if second["mergeCommitOid"] != merge_oid:
         raise MaintenanceError(
             "maintenance pull request merge evidence changed during finalization"
@@ -673,6 +824,10 @@ def parser() -> argparse.ArgumentParser:
     check.add_argument("task")
     create = sub.add_parser("pr-create")
     create.add_argument("task")
+    review = sub.add_parser("review-record")
+    review.add_argument("task")
+    review.add_argument("role")
+    review.add_argument("evidence")
     finalize = sub.add_parser("finalize")
     finalize.add_argument("task")
     finalize.add_argument("pr", type=int)
@@ -687,6 +842,10 @@ def main() -> int:
             result = maintenance_check(root_path, args.task)
         elif args.command == "pr-create":
             result = maintenance_pr_create(root_path, args.task)
+        elif args.command == "review-record":
+            result = maintenance_review_record(
+                root_path, args.task, args.role, args.evidence
+            )
         elif args.command == "finalize":
             result = maintenance_finalize(root_path, args.task, args.pr)
         else:
