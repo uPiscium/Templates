@@ -183,6 +183,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
             "number": 93,
             "state": "MERGED",
             "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
+            "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
             "baseRefName": "main",
             "isCrossRepository": False,
             "mergeCommit": {"oid": merge_oid},
@@ -211,6 +212,86 @@ class PostMergeFinalizationTest(RepositoryFixture):
             ),
         ):
             agent_core.integrate_finalize(self.repo, task, "93")
+
+    def cleanup_run(
+        self,
+        evidence: dict,
+        *,
+        fail_update_ref_once: bool = False,
+        fail_worktree_remove_once: bool = False,
+        pr_pages: list[list[dict]] | None = None,
+    ):
+        real_run = lifecycle.run
+        failed = False
+
+        def fake(command_args: list[str], **kwargs):
+            nonlocal failed
+            if command_args[:3] == ["gh", "repo", "view"]:
+                return subprocess.CompletedProcess(
+                    command_args, 0, json.dumps({"nameWithOwner": "acme/widgets"}), ""
+                )
+            if command_args[:2] == ["gh", "api"]:
+                if pr_pages is not None:
+                    return subprocess.CompletedProcess(command_args, 0, json.dumps(pr_pages), "")
+                raw = {
+                    "number": evidence["number"],
+                    "state": "closed" if evidence["state"] == "MERGED" else evidence["state"].lower(),
+                    "merged_at": "2026-08-30T00:00:00Z" if evidence["state"] == "MERGED" else None,
+                    "merge_commit_sha": (evidence.get("mergeCommit") or {}).get("oid"),
+                    "head": {
+                        "ref": evidence["headRefName"],
+                        "sha": evidence["headRefOid"],
+                        "repo": {
+                            "full_name": "other/widgets"
+                            if evidence.get("isCrossRepository")
+                            else "acme/widgets"
+                        },
+                    },
+                    "base": {"ref": evidence["baseRefName"]},
+                }
+                return subprocess.CompletedProcess(command_args, 0, json.dumps([[raw]]), "")
+            if (
+                fail_update_ref_once
+                and not failed
+                and command_args[:4] == ["git", "update-ref", "-d", f"refs/heads/{evidence['headRefName']}"]
+            ):
+                failed = True
+                raise lifecycle.LifecycleError("injected ref deletion failure")
+            if (
+                fail_worktree_remove_once
+                and not failed
+                and command_args[:3] == ["git", "worktree", "remove"]
+            ):
+                failed = True
+                raise lifecycle.LifecycleError("injected worktree removal failure")
+            return real_run(command_args, **kwargs)
+
+        return mock.patch.object(lifecycle, "run", side_effect=fake)
+
+    def merged_cleanup_fixture(
+        self, *, delete_remote: bool, task: str = "TASK-1", slug: str = "demo"
+    ) -> tuple[Path, str, dict]:
+        if task == "TASK-1" and slug == "demo":
+            task_worktree, task_head, evidence = self.prepare()
+        else:
+            task_worktree = self.start_task(task, slug)
+            (task_worktree / "task.txt").write_text("task change\n", encoding="utf-8")
+            command("git", "add", "task.txt", cwd=task_worktree)
+            command("git", "commit", "-m", "task", cwd=task_worktree)
+            task_head = command("git", "rev-parse", "HEAD", cwd=task_worktree)
+            merge_oid = self.publish("squash result")
+            state = task_worktree / ".task-state/task.md"
+            state.write_text(
+                state.read_text(encoding="utf-8").replace("initialized", "integration-pending"),
+                encoding="utf-8",
+            )
+            evidence = self.merged_evidence(task_worktree, merge_oid)
+        branch = evidence["headRefName"]
+        command("git", "push", "-u", "origin", branch, cwd=task_worktree)
+        self.finalize(evidence, task=task)
+        if delete_remote:
+            command("git", "push", "origin", "--delete", branch, cwd=task_worktree)
+        return task_worktree, task_head, evidence
 
     def test_standard_squash_flow_and_idempotent_retry(self) -> None:
         task_worktree, task_head, evidence = self.prepare()
@@ -271,25 +352,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
         branch = evidence["headRefName"]
         command("git", "push", "-u", "origin", branch, cwd=task_worktree)
         self.finalize(evidence)
-        real_run = lifecycle.run
-
-        def fake_gh(command_args: list[str], **kwargs):
-            if command_args[:3] == ["gh", "pr", "view"]:
-                return subprocess.CompletedProcess(
-                    command_args,
-                    0,
-                    json.dumps(
-                        {
-                            "state": "MERGED",
-                            "headRefName": branch,
-                            "headRefOid": command("git", "rev-parse", branch, cwd=self.repo),
-                        }
-                    ),
-                    "",
-                )
-            return real_run(command_args, **kwargs)
-
-        with mock.patch.object(lifecycle, "run", side_effect=fake_gh):
+        with self.cleanup_run(evidence):
             lifecycle.task_cleanup(self.repo, "TASK-1")
         self.assertFalse(task_worktree.exists())
         branch_check = subprocess.run(
@@ -297,6 +360,159 @@ class PostMergeFinalizationTest(RepositoryFixture):
             cwd=self.repo,
         )
         self.assertNotEqual(branch_check.returncode, 0)
+
+    def test_deleted_upstream_merged_pr_head_match_allows_cleanup(self) -> None:
+        task_worktree, task_head, evidence = self.merged_cleanup_fixture(
+            delete_remote=True, task="12", slug="semantic-candidate-expansion"
+        )
+        evidence = dict(evidence, number=18)
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "12")
+        self.assertFalse(task_worktree.exists())
+        branch_check = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{evidence['headRefName']}"],
+            cwd=self.repo,
+        )
+        self.assertNotEqual(branch_check.returncode, 0)
+        self.assertEqual(evidence["headRefOid"], task_head)
+
+    def test_deleted_upstream_with_local_only_commit_is_rejected(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        (task_worktree / "local-only.txt").write_text("local\n", encoding="utf-8")
+        command("git", "add", "local-only.txt", cwd=task_worktree)
+        command("git", "commit", "-m", "local only", cwd=task_worktree)
+        with self.cleanup_run(evidence), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "does not match published PR head"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_deleted_upstream_rejects_unmerged_pr(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(dict(evidence, state="OPEN")), self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_deleted_upstream_rejects_pr_branch_mismatch(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(dict(evidence, headRefName="task/TASK-OTHER-demo")), self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_deleted_upstream_rejects_pr_sha_mismatch(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(dict(evidence, headRefOid="a" * 40)), self.assertRaises(lifecycle.LifecycleError):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cleanup_pr_query_paginates_all_historical_branch_prs(self) -> None:
+        branch = "task/TASK-1-demo"
+
+        def raw(number: int) -> dict:
+            return {
+                "number": number,
+                "state": "closed",
+                "merged_at": "2026-08-30T00:00:00Z",
+                "merge_commit_sha": "b" * 40,
+                "head": {
+                    "ref": branch,
+                    "sha": "a" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
+                "base": {"ref": "main"},
+            }
+
+        pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
+        with mock.patch.object(
+            lifecycle,
+            "gh",
+            return_value=subprocess.CompletedProcess([], 0, json.dumps(pages), ""),
+        ) as query:
+            matches = lifecycle.cleanup_prs(self.repo, branch, "acme/widgets")
+        self.assertEqual(101, len(matches))
+        self.assertIn("--paginate", query.call_args.args)
+        self.assertIn("--slurp", query.call_args.args)
+
+    def test_cleanup_rejects_ambiguity_beyond_first_pr_page(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+
+        def raw(number: int) -> dict:
+            return {
+                "number": number,
+                "state": "closed",
+                "merged_at": "2026-08-30T00:00:00Z",
+                "merge_commit_sha": evidence["mergeCommit"]["oid"],
+                "head": {
+                    "ref": evidence["headRefName"],
+                    "sha": evidence["headRefOid"],
+                    "repo": {"full_name": "acme/widgets"},
+                },
+                "base": {"ref": evidence["baseRefName"]},
+            }
+
+        pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
+        with self.cleanup_run(evidence, pr_pages=pages), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "missing or ambiguous"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_dirty_merged_worktree_is_rejected(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        (task_worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        with self.cleanup_run(evidence), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "uncommitted changes"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cancelled_missing_upstream_with_unpublished_commit_is_rejected(self) -> None:
+        task_worktree = self.start_task()
+        (task_worktree / "unpublished.txt").write_text("unpublished\n", encoding="utf-8")
+        command("git", "add", "unpublished.txt", cwd=task_worktree)
+        command("git", "commit", "-m", "unpublished", cwd=task_worktree)
+        state = task_worktree / ".task-state/task.md"
+        state.write_text(
+            state.read_text(encoding="utf-8").replace("Status: initialized", "Status: cancelled"),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "unpushed commit"):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cleanup_removes_only_expected_registration_and_branch(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        command("git", "branch", "keep-me", "main", cwd=self.repo)
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        self.assertEqual(command("git", "rev-parse", "keep-me", cwd=self.repo), command("git", "rev-parse", "main", cwd=self.repo))
+
+    def test_partial_branch_deletion_failure_is_retryable(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        self.assertTrue(lifecycle.cleanup_receipt_path(self.repo, "TASK-1").exists())
+        self.assertTrue(command("git", "rev-parse", evidence["headRefName"], cwd=self.repo))
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(lifecycle.cleanup_receipt_path(self.repo, "TASK-1").exists())
+
+    def test_worktree_removal_failure_preserves_registration_and_is_retryable(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_worktree_remove_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected worktree removal failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+        self.assertEqual(lifecycle.worktree_for_task(self.repo, "TASK-1").path, task_worktree)
+        self.assertTrue(lifecycle.cleanup_receipt_path(self.repo, "TASK-1").exists())
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
 
     def test_merge_commit_identity_is_accepted(self) -> None:
         task_worktree = self.start_task()

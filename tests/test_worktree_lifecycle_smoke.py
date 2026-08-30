@@ -44,7 +44,19 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         fake_bin = temporary_root / "bin"
         fake_bin.mkdir()
         fake_gh = fake_bin / "gh"
-        fake_gh.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        fake_gh.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1 $2\" = \"repo view\" ]; then\n"
+            "  printf '%s\\n' '{\"nameWithOwner\":\"acme/widgets\"}'\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"$1\" = \"api\" ]; then\n"
+            "  printf '%s\\n' '[[]]'\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
         fake_gh.chmod(0o755)
         self.env = dict(os.environ)
         self.env["PATH"] = f"{fake_bin}:{self.env['PATH']}"

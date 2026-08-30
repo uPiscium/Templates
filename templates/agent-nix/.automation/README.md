@@ -51,6 +51,19 @@ integration-pending -> PR merge -> guarded finalize -> merged
   -> approval-gated cleanup -> dependency re-evaluation -> next Task
 ```
 
+For a merged Task, cleanup reconstructs safety from the unique same-repository
+merged PR: its branch and `headRefOid` must match the registered clean local
+Task branch exactly, and the local branch must contain no later commit. A live
+origin Task branch must have that same OID. A deleted origin branch is accepted
+only after those merged-PR checks, which allows a finalized Task such as
+AgentKnowledgeVault #12 to retry normal cleanup without recreating a remote
+branch. Cancelled Tasks retain the conservative unpublished-commit check and
+never use the merged-PR exception. Cleanup records a private administrative
+receipt before worktree removal and deletes the local branch with an
+expected-head compare-and-swap, so a partial failure remains retryable.
+Cleanup remains Main-owned and approval-gated; no raw cleanup authority is
+added.
+
 `agent::task-start` uses the same guarded default-branch synchronization at
 execution time before creating a branch/worktree, so it does not trust a stale
 remote-tracking ref even if the default branch advanced after finalization.
