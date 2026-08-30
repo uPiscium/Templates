@@ -25,6 +25,7 @@ permission:
     "just agent::batch-plan *": allow
     "just agent::commit *": deny
     "just agent::pr-create *": deny
+    "just agent::pr-prepare *": deny
     "just agent::pr-edit *": deny
     "just agent::pr-ready *": deny
     "just integrate::finalize *": allow

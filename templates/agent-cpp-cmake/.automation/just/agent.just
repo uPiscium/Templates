@@ -84,6 +84,10 @@ pr-create task:
     python3 {{quote(script)}} agent pr-create {{quote(task)}}
 
 [working-directory: root]
+pr-prepare task:
+    python3 {{quote(script)}} agent pr-prepare {{quote(task)}}
+
+[working-directory: root]
 pr-edit task:
     python3 {{quote(script)}} agent pr-edit {{quote(task)}}
 

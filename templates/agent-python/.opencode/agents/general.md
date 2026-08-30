@@ -38,6 +38,7 @@ permission:
     "just agent::commit *": deny
     "just agent::push *": deny
     "just agent::pr-create *": deny
+    "just agent::pr-prepare *": deny
     "just agent::pr-edit *": deny
     "just agent::pr-ready *": deny
     "just agent::cleanup *": deny

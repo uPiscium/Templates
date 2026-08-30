@@ -30,6 +30,7 @@ permission:
     "just agent::work-unit-dispatch-check *": allow
     "just agent::work-unit-status *": allow
     "just agent::work-unit-state-set *": allow
+    "just agent::pr-prepare *": allow
     "just integrate::check *": deny
     "just integrate::finalize *": deny
     "just integrate::merge *": deny
@@ -77,6 +78,6 @@ Before advancing Task State to `publication-ready`, and again before guarded com
 - a reviewer Work Unit for non-trivial changes;
 - a security-reviewer Work Unit when trust- or security-sensitive surfaces changed.
 
-No unexecuted check or Work Unit may count as PASS. If any required review, verifier, or check fails and a bounded correction is possible, create a fresh corrective Work Unit and return to verification. Otherwise set the Task `blocked`, surface the evidence, and stop. Only after this evidence gate passes may Task State become `publication-ready`; then commit only through the guarded Just API, request approval before pushing, and prepare a Draft PR. Never merge.
+No unexecuted check or Work Unit may count as PASS. If any required review, verifier, or check fails and a bounded correction is possible, create a fresh corrective Work Unit and return to verification. Otherwise set the Task `blocked`, surface the evidence, and stop. Only after this evidence gate passes may Task State become `publication-ready`; then commit only through the guarded Just API, request approval before pushing, run `just agent::pr-prepare <task>`, and create or repair the same Draft PR through the guarded publication API. Metadata with placeholders or false `NOT RUN` claims is forbidden. Never merge.
 
 Never invoke another Task Orchestrator. Never merge. Never operate on sibling Task worktrees. Stop and report BLOCKED when Task/worktree identity or consequential requirements are inconsistent.

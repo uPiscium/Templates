@@ -919,10 +919,40 @@ def task_status(root: Path, task: str) -> None:
 def task_state_set(root: Path, task: str, status: str) -> None:
     record = require_local_task(root, task)
     require_resolved_contract(record, task)
+    if status in {"draft-pr-created", "integration-pending"}:
+        raise LifecycleError(
+            f"{status} is reserved for the guarded pull request publication boundary"
+        )
     with work_units_lock(record):
         assert_task_identity(record, task)
         set_state_status(state_path(record.path), status)
     print(json.dumps({"task": task, "status": status}))
+
+
+def mark_task_publication_state(
+    record: WorktreeRecord, task: str, expected: str, target: str
+) -> str:
+    """Narrow transition authority for validated PR creation/readiness."""
+    allowed = {
+        ("publication-ready", "draft-pr-created"),
+        ("draft-pr-created", "integration-pending"),
+    }
+    if (expected, target) not in allowed:
+        raise LifecycleError("invalid guarded publication transition")
+    validate_task(task)
+    require_resolved_contract(record, task)
+    with work_units_lock(record):
+        assert_task_identity(record, task)
+        path = state_path(record.path)
+        previous = state_status(path)
+        if previous == target:
+            return "already-transitioned"
+        if previous != expected:
+            raise LifecycleError(
+                f"guarded publication transition requires {expected}; found {previous}"
+            )
+        set_state_status(path, target)
+    return "transitioned"
 
 
 def mark_task_merged_from_integration(record: WorktreeRecord, task: str) -> str:

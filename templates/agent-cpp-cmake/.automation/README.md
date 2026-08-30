@@ -89,7 +89,16 @@ Before publication, execute `git diff --check`, `just agent::doctor`,
 just automation::commit <task> [message]
 just agent::push <task>
 just agent::pr-create <task>
+just agent::pr-prepare <task>
+just agent::pr-edit <task>
+just agent::pr-ready <task>
 ```
+
+`pr-prepare` renders acceptance criteria as authoritative requirements and
+renders non-empty `Current state` Blockers/Unverified values in the PR risk
+section. Missing Current-state evidence, unresolved placeholders, stale
+verification, missing completed reviewer evidence, an incomplete declared
+security review, or contradictory validation claims block publication.
 
 The normal upgrade flow creates its receipt before verification. If a self-hosted
 pre-receipt upgrade leaves the exact upgraded diff without that receipt, perform

@@ -8,12 +8,15 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import task_lifecycle as lifecycle
+import publication_metadata as publication
+import task_contract
 
 try:
     import tomllib
@@ -101,7 +104,7 @@ def validate_slug(slug: str) -> None:
 def ensure_task_branch(root: Path, task: str) -> str:
     validate_task(task)
     branch = current_branch(root)
-    if task not in branch or not (branch.startswith("task/") or branch.startswith("fix/")):
+    if not (branch.startswith(f"task/{task}-") or branch.startswith(f"fix/{task}-")):
         raise AutomationError(f"current branch {branch!r} is not the Task branch for {task}")
     if branch == default_branch(root):
         raise AutomationError("Task operation refused on the default branch")
@@ -238,7 +241,33 @@ def status(root: Path, task: str) -> None:
 
 def verify(root: Path, task: str) -> None:
     ensure_task_branch(root, task)
-    run(["just", "project::check"], cwd=root)
+    head = git("rev-parse", "HEAD", cwd=root)
+    status_before = git("status", "--porcelain", "--untracked-files=all", cwd=root)
+    result = run(["just", "project::check"], cwd=root, check=False)
+    status_after = git("status", "--porcelain", "--untracked-files=all", cwd=root)
+    receipt = {
+        "schema_version": 1,
+        "task_id": task,
+        "head": head,
+        "clean_tracked_worktree": not status_before and not status_after,
+        "worktree_stable": status_before == status_after,
+        "project_check": {
+            "command": ["just", "project::check"],
+            "returncode": result.returncode,
+            "executed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    try:
+        task_contract.write_verification_receipt(
+            root, (json.dumps(receipt, sort_keys=True) + "\n").encode()
+        )
+    except task_contract.ContractError as exc:
+        raise AutomationError(str(exc)) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise AutomationError(f"just project::check: {detail}")
+    if status_before != status_after:
+        raise AutomationError("project::check changed tracked or untracked product files")
     print("Project verification: PASS")
 
 
@@ -265,54 +294,194 @@ def push_task(root: Path, task: str) -> None:
     print(f"pushed origin/{branch}")
 
 
-def pr_for_branch(root: Path, branch: str) -> dict | None:
-    result = run(["gh", "pr", "view", branch, "--json", "number,title,body,headRefName,baseRefName,isDraft,state,headRefOid"], cwd=root, check=False)
+def canonical_repository(root: Path) -> str:
+    path = root / ".task-state" / "contract.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AutomationError(f"invalid canonical Task Contract metadata: {path}") from exc
+    repository = value.get("repository") if isinstance(value, dict) else None
+    if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise AutomationError("canonical Task Contract repository is invalid")
+    try:
+        live = task_contract.repository_identity(root)
+    except task_contract.ContractError as exc:
+        raise AutomationError(str(exc)) from exc
+    if live.casefold() != repository.casefold():
+        raise AutomationError("live origin repository does not match the canonical Task Contract")
+    return repository
+
+
+def pr_for_branch(root: Path, branch: str, repository: str | None = None) -> dict | None:
+    command = ["gh", "pr", "view", branch]
+    if repository is not None:
+        command.extend(["--repo", repository])
+    command.extend(["--json", "number,title,body,headRefName,baseRefName,isDraft,isCrossRepository,state,headRefOid"])
+    result = run(command, cwd=root, check=False)
     if result.returncode != 0:
-        return None
-    return json.loads(result.stdout)
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        if "no pull requests found" in detail.lower():
+            return None
+        raise AutomationError(f"cannot resolve pull request for {branch}: {detail}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise AutomationError("invalid pull request data returned by GitHub") from exc
+    return value
 
 
-def pr_body(root: Path, task: str) -> Path:
-    state_dir = root / ".task-state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path = state_dir / "pr-body.md"
-    if not path.exists():
-        template = root / ".automation" / "templates" / "pull-request.md"
-        text = template.read_text(encoding="utf-8").replace("@@TASK_ID@@", task)
-        path.write_text(text, encoding="utf-8")
-    return path
+def _publication_context(root: Path, task: str) -> tuple[str, dict, str]:
+    branch = ensure_task_branch(root, task)
+    head = git("rev-parse", "HEAD", cwd=root)
+    try:
+        record = lifecycle.require_local_task(root, task)
+        lifecycle.require_resolved_contract(record, task)
+        status = lifecycle.state_status(lifecycle.state_path(root))
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
+    repository = canonical_repository(root)
+    return branch, {"record": record, "status": status, "repository": repository}, head
+
+
+def pr_prepare(root: Path, task: str) -> None:
+    branch, context, head = _publication_context(root, task)
+    if context["status"] not in {"publication-ready", "draft-pr-created"}:
+        raise AutomationError(f"publication metadata preparation requires publication-ready or draft-pr-created; found {context['status']}")
+    state = lifecycle.state_path(root).read_text(encoding="utf-8")
+    base_revision = re.search(r"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", state)
+    if base_revision is None:
+        raise AutomationError("Task State has no valid Base revision")
+    paths = git("diff", "--name-only", f"{base_revision.group(1)}...{head}", cwd=root).splitlines()
+    try:
+        title, body = publication.canonical_metadata(root, task, head=head, changed_paths=paths)
+        publication.write_metadata(root, title, body)
+    except publication.PublicationMetadataError as exc:
+        raise AutomationError(str(exc)) from exc
+    print(json.dumps({"task": task, "branch": branch, "title": title, "body": str(root / '.task-state' / 'pr-body.md')}))
+
+
+def _validated_local_metadata(root: Path, task: str, head: str) -> tuple[str, Path, str]:
+    try:
+        receipt = publication.verification_evidence(root, task, head)
+        title, body = publication.read_and_validate_metadata(root, receipt=receipt)
+        expected_title, expected_body = publication.canonical_metadata(
+            root,
+            task,
+            head=head,
+            changed_paths=git("diff", "--name-only", f"{_base_revision(root)}...{head}", cwd=root).splitlines(),
+        )
+    except publication.PublicationMetadataError as exc:
+        raise AutomationError(str(exc)) from exc
+    if title != expected_title or body.rstrip() != expected_body.rstrip():
+        raise AutomationError("pull request metadata is stale; run agent::pr-prepare")
+    return title, root / ".task-state" / "pr-body.md", body.rstrip()
+
+
+def _base_revision(root: Path) -> str:
+    text = lifecycle.state_path(root).read_text(encoding="utf-8")
+    match = re.search(r"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", text)
+    if match is None:
+        raise AutomationError("Task State has no valid Base revision")
+    return match.group(1)
+
+
+def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str, body: str, draft: bool) -> None:
+    expected = {
+        "headRefName": branch, "baseRefName": base, "headRefOid": head,
+        "title": title, "body": body, "isDraft": draft, "isCrossRepository": False, "state": "OPEN",
+    }
+    mismatches = [name for name, value in expected.items() if pr.get(name) != value]
+    if mismatches:
+        raise AutomationError("live pull request metadata is stale or inconsistent: " + ", ".join(mismatches))
+
+
+def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> None:
+    expected = {
+        "headRefName": branch, "baseRefName": base, "headRefOid": head,
+        "isDraft": True, "isCrossRepository": False, "state": "OPEN",
+    }
+    mismatches = [name for name, value in expected.items() if pr.get(name) != value]
+    if mismatches or not isinstance(pr.get("number"), int):
+        raise AutomationError("pull request repair target identity is invalid: " + ", ".join(mismatches or ["number"]))
 
 
 def pr_create(root: Path, task: str) -> None:
-    branch = ensure_task_branch(root, task)
-    if pr_for_branch(root, branch):
+    verify(root, task)
+    branch, context, head = _publication_context(root, task)
+    if context["status"] != "publication-ready":
+        raise AutomationError(f"pr-create requires publication-ready; found {context['status']}")
+    repository = context["repository"]
+    if pr_for_branch(root, branch, repository):
         raise AutomationError(f"pull request already exists for {branch}")
     base = default_branch(root)
-    title = f"{task}: {branch.split('/', 1)[1]}"
-    body = pr_body(root, task)
-    gh("pr", "create", "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", str(body), cwd=root)
-    print(json.dumps(pr_for_branch(root, branch)))
+    title, body, body_text = _validated_local_metadata(root, task, head)
+    gh("pr", "create", "--repo", repository, "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", str(body), cwd=root)
+    if canonical_repository(root).casefold() != repository.casefold():
+        raise AutomationError("repository identity changed during pull request creation")
+    pr = pr_for_branch(root, branch, repository)
+    if not pr:
+        raise AutomationError("created pull request cannot be re-read")
+    _validate_live_pr(pr, branch=branch, base=base, head=head, title=title, body=body_text, draft=True)
+    try:
+        lifecycle.mark_task_publication_state(context["record"], task, "publication-ready", "draft-pr-created")
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
+    print(json.dumps(pr))
 
 
 def pr_edit(root: Path, task: str) -> None:
-    branch = ensure_task_branch(root, task)
-    pr = pr_for_branch(root, branch)
+    verify(root, task)
+    branch, context, head = _publication_context(root, task)
+    if context["status"] not in {"publication-ready", "draft-pr-created"}:
+        raise AutomationError(f"pr-edit requires publication-ready or draft-pr-created; found {context['status']}")
+    repository = context["repository"]
+    pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
-    title_file = root / ".task-state" / "pr-title.txt"
-    title = title_file.read_text(encoding="utf-8").strip() if title_file.exists() else pr["title"]
-    body = pr_body(root, task)
-    gh("pr", "edit", str(pr["number"]), "--title", title, "--body-file", str(body), cwd=root)
+    _validate_edit_target(pr, branch=branch, base=default_branch(root), head=head)
+    title, body, body_text = _validated_local_metadata(root, task, head)
+    gh("pr", "edit", str(pr["number"]), "--repo", repository, "--title", title, "--body-file", str(body), cwd=root)
+    if canonical_repository(root).casefold() != repository.casefold():
+        raise AutomationError("repository identity changed during pull request repair")
+    updated = pr_for_branch(root, branch, repository)
+    if not updated or updated.get("number") != pr.get("number"):
+        raise AutomationError("pull request identity changed during guarded repair")
+    _validate_live_pr(updated, branch=branch, base=default_branch(root), head=head, title=title, body=body_text, draft=True)
+    if context["status"] == "publication-ready":
+        try:
+            lifecycle.mark_task_publication_state(context["record"], task, "publication-ready", "draft-pr-created")
+        except lifecycle.LifecycleError as exc:
+            raise AutomationError(str(exc)) from exc
     print(f"updated PR #{pr['number']}")
 
 
 def pr_ready(root: Path, task: str) -> None:
     verify(root, task)
-    branch = ensure_task_branch(root, task)
-    pr = pr_for_branch(root, branch)
+    branch, context, head = _publication_context(root, task)
+    if context["status"] != "draft-pr-created":
+        raise AutomationError(f"pr-ready requires draft-pr-created; found {context['status']}")
+    title, _, body = _validated_local_metadata(root, task, head)
+    repository = context["repository"]
+    pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
-    gh("pr", "ready", str(pr["number"]), cwd=root)
+    if pr.get("isDraft"):
+        _validate_live_pr(pr, branch=branch, base=default_branch(root), head=head, title=title, body=body, draft=True)
+        gh("pr", "ready", str(pr["number"]), "--repo", repository, cwd=root)
+        if canonical_repository(root).casefold() != repository.casefold():
+            raise AutomationError("repository identity changed while marking pull request ready")
+        ready = pr_for_branch(root, branch, repository)
+        if not ready or ready.get("number") != pr.get("number"):
+            raise AutomationError("pull request identity changed while marking ready")
+        _validate_live_pr(ready, branch=branch, base=default_branch(root), head=head, title=title, body=body, draft=False)
+    else:
+        # Reconcile an earlier successful GitHub readiness write whose local
+        # lifecycle transition was interrupted.
+        _validate_live_pr(pr, branch=branch, base=default_branch(root), head=head, title=title, body=body, draft=False)
+    try:
+        lifecycle.mark_task_publication_state(context["record"], task, "draft-pr-created", "integration-pending")
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
     print(f"PR #{pr['number']} marked ready")
 
 
@@ -514,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("doctor", "context"):
         agent_cmd.add_parser(name)
     start = agent_cmd.add_parser("task-start"); start.add_argument("task"); start.add_argument("slug")
-    for name in ("status", "verify", "push", "pr-create", "pr-edit", "pr-ready", "cleanup"):
+    for name in ("status", "verify", "push", "pr-prepare", "pr-create", "pr-edit", "pr-ready", "cleanup"):
         p = agent_cmd.add_parser(name); p.add_argument("task")
     commit = agent_cmd.add_parser("commit"); commit.add_argument("task"); commit.add_argument("message", nargs="?", default="")
     integrate = scope.add_parser("integrate")
@@ -540,6 +709,7 @@ def main() -> int:
                 "verify": lambda: verify(root, args.task),
                 "commit": lambda: commit_task(root, args.task, args.message),
                 "push": lambda: push_task(root, args.task),
+                "pr-prepare": lambda: pr_prepare(root, args.task),
                 "pr-create": lambda: pr_create(root, args.task),
                 "pr-edit": lambda: pr_edit(root, args.task),
                 "pr-ready": lambda: pr_ready(root, args.task),

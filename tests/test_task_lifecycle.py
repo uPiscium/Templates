@@ -17,6 +17,16 @@ spec.loader.exec_module(lifecycle)
 
 
 class TaskLifecycleTest(unittest.TestCase):
+    def test_generic_state_set_cannot_cross_publication_boundaries(self) -> None:
+        record = lifecycle.WorktreeRecord(Path("/task"), "task/101-metadata", "a" * 40)
+        for status in ("draft-pr-created", "integration-pending"):
+            with (
+                mock.patch.object(lifecycle, "require_local_task", return_value=record),
+                mock.patch.object(lifecycle, "require_resolved_contract"),
+                self.assertRaisesRegex(lifecycle.LifecycleError, "guarded pull request publication"),
+            ):
+                lifecycle.task_state_set(Path("/task"), "101", status)
+
     def test_task_branch_matching_is_not_substring_based(self) -> None:
         self.assertTrue(lifecycle.branch_matches_task("task/TASK-1-example", "TASK-1"))
         self.assertFalse(lifecycle.branch_matches_task("task/TASK-10-example", "TASK-1"))
