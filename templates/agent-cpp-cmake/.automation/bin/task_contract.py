@@ -139,6 +139,30 @@ def _restore_state_file(directory_fd: int, name: str, content: bytes | None) -> 
         _write_state_file(directory_fd, name, content)
 
 
+def write_publication_metadata(root: Path, title: bytes, body: bytes) -> None:
+    """Atomically replace the two publication files in pinned Task State."""
+    with contract_state_lock(root) as directory_fd:
+        previous = {
+            name: _read_state_file(directory_fd, name)
+            for name in ("pr-title.txt", "pr-body.md")
+        }
+        try:
+            _write_state_file(directory_fd, "pr-title.txt", title)
+            _write_state_file(directory_fd, "pr-body.md", body)
+            _assert_state_dir_binding(root, directory_fd)
+        except Exception:
+            for name, content in previous.items():
+                _restore_state_file(directory_fd, name, content)
+            raise
+
+
+def write_verification_receipt(root: Path, content: bytes) -> None:
+    """Replace the verification receipt through pinned Task State."""
+    with contract_state_lock(root) as directory_fd:
+        _write_state_file(directory_fd, "verification.json", content)
+        _assert_state_dir_binding(root, directory_fd)
+
+
 def validate_issue_number(value: str) -> int:
     if not ISSUE_RE.fullmatch(value):
         raise ContractError("Issue number must be an exact positive decimal integer")

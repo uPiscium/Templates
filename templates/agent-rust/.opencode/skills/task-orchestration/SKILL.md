@@ -34,7 +34,7 @@ Use this skill when the Main Orchestrator is asked to run a specific Task that a
     - a reviewer Work Unit for non-trivial changes;
     - a security-reviewer Work Unit when trust- or security-sensitive surfaces changed.
 12. No unexecuted check or Work Unit may count as PASS. If any required review, verifier, or check fails and a bounded correction is possible, create a fresh corrective Work Unit and return to verification. Otherwise set the Task `blocked`, surface the evidence, and stop.
-13. Only after the verification evidence gate passes may Task State become `publication-ready`; then use guarded `commit`, request approval for `push`, and create or edit only a Draft PR.
+13. Only after the verification evidence gate passes may Task State become `publication-ready`; then use guarded `commit`, request approval for `push`, run `just agent::pr-prepare <task>`, and create or edit only the same Draft PR. Publication metadata must be regenerated from persisted evidence and must contain no unresolved placeholder or false `NOT RUN` claim.
 14. Persist every transition and continue the loop until integration-pending. Stop for `NEEDS_APPROVAL` or `NEEDS_DECISION` human handling, and otherwise stop at integration-pending. Do not merge from this skill. Never merge.
 
 Do not silently select another Issue or Task. Do not weaken permissions to work around a blocked approval or missing tool/model.

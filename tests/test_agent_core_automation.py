@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -70,6 +71,209 @@ class AgentCoreSafetyTest(unittest.TestCase):
                 self.assertRaisesRegex(agent_core.AutomationError, "head moved"),
             ):
                 agent_core.integrate_merge(root, "10")
+
+
+class PublicationMetadataTest(unittest.TestCase):
+    HEAD = "a" * 40
+
+    def fixture(self, root: Path, *, reviews: bool = False) -> None:
+        state = root / ".task-state"
+        state.mkdir()
+        (state / "task.md").write_text(
+            """# 19
+
+## Identity
+
+- Task ID: 19
+- Branch: task/19-agent-core-v3-1-1
+- Worktree: /fixture
+- Base branch: main
+- Base revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+## Purpose
+
+Repair AgentKnowledgeVault publication metadata without replacing PR #20.
+
+## Acceptance criteria
+
+- [x] Guard publication metadata.
+
+## Follow-up Task candidates
+
+None yet.
+""",
+            encoding="utf-8",
+        )
+        (state / "verification.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": "19",
+                    "head": self.HEAD,
+                    "clean_tracked_worktree": True,
+                    "worktree_stable": True,
+                    "project_check": {
+                        "command": ["just", "project::check"],
+                        "returncode": 0,
+                        "executed_at": "2026-08-30T00:00:00+00:00",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        if reviews:
+            digest = "c" * 64
+            (state / "work-units.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "task_id": "19",
+                        "units": {
+                            "WU-19-04": {
+                                "requested_role": "reviewer",
+                                "state": "completed",
+                                "transitions": [{"evidence_sha256": digest}],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    def test_untouched_default_template_is_rejected(self) -> None:
+        body = (MODULE_PATH.parents[1] / "templates" / "pull-request.md").read_text(encoding="utf-8")
+        with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "placeholder"):
+            agent_core.publication.validate_metadata("19: repair", body)
+
+    def test_unresolved_title_placeholder_is_rejected(self) -> None:
+        with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "placeholder"):
+            agent_core.publication.validate_metadata("@@TITLE@@", "## Summary\n\nDone\n\n## Acceptance criteria\n\n- done\n\n## Validation\n\n- PASS\n\n## Risks and unverified areas\n\n- none\n\n## Follow-up Tasks\n\n- none")
+
+    def test_pass_evidence_contradicting_not_run_is_rejected(self) -> None:
+        receipt = {"project_check": {"returncode": 0}}
+        body = "## Summary\n\nDone\n\n## Acceptance criteria\n\n- done\n\n## Validation\n\n- `just project::check`: NOT RUN\n\n## Risks and unverified areas\n\n- none\n\n## Follow-up Tasks\n\n- none"
+        with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "contradicts"):
+            agent_core.publication.validate_metadata("19: repair", body, receipt=receipt)
+
+    def test_verification_receipt_for_another_task_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            receipt_path = root / ".task-state" / "verification.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["task_id"] = "20"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "another Task"):
+                agent_core.publication.verification_evidence(root, "19", self.HEAD)
+
+    def test_dirty_worktree_verification_cannot_authorize_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            receipt_path = root / ".task-state" / "verification.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["clean_tracked_worktree"] = False
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "clean stable"):
+                agent_core.publication.verification_evidence(root, "19", self.HEAD)
+
+    def test_dogfood_fixture_prepares_complete_metadata_without_product_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root, reviews=True)
+            product = root / "product.txt"
+            product.write_text("unchanged\n", encoding="utf-8")
+            title, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=[".automation/bin/agent_core.py"]
+            )
+            agent_core.publication.write_metadata(root, title, body)
+            self.assertEqual(product.read_text(encoding="utf-8"), "unchanged\n")
+            self.assertIn("`just project::check`: PASS", body)
+            self.assertIn("`WU-19-04` — `reviewer`", body)
+            self.assertNotIn("security-reviewer", body)
+            self.assertNotIn("NOT RUN", body)
+            self.assertNotIn("Describe the implemented", body)
+
+    def test_complete_metadata_allows_draft_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            title, body_text = agent_core.publication.canonical_metadata(root, "19", head=self.HEAD, changed_paths=["one"])
+            agent_core.publication.write_metadata(root, title, body_text)
+            context = {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}
+            live = {"number": 20, "title": title, "body": body_text.rstrip(), "headRefName": "task/19-agent-core-v3-1-1", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+            with (
+                mock.patch.object(agent_core, "_publication_context", return_value=(live["headRefName"], context, self.HEAD)),
+                mock.patch.object(agent_core, "_validated_local_metadata", return_value=(title, root / ".task-state/pr-body.md", body_text.rstrip())),
+                mock.patch.object(agent_core, "default_branch", return_value="main"),
+                mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+                mock.patch.object(agent_core, "pr_for_branch", side_effect=[None, live]),
+                mock.patch.object(agent_core, "gh") as gh,
+                mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+            ):
+                agent_core.pr_create(root, "19")
+            self.assertIn("--draft", gh.call_args.args)
+            transition.assert_called_once()
+
+    def test_existing_stale_draft_is_repaired_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body_file = root / ".task-state/pr-body.md"
+            body_file.parent.mkdir()
+            body_file.write_text("canonical", encoding="utf-8")
+            stale = {"number": 20, "headRefName": "task/19-fix", "baseRefName": "main", "headRefOid": self.HEAD, "isDraft": True, "isCrossRepository": False, "state": "OPEN"}
+            updated = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+            with (
+                mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
+                mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", body_file, "canonical")),
+                mock.patch.object(agent_core, "default_branch", return_value="main"),
+                mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+                mock.patch.object(agent_core, "pr_for_branch", side_effect=[stale, updated]),
+                mock.patch.object(agent_core, "gh") as gh,
+            ):
+                agent_core.pr_edit(root, "19")
+            self.assertEqual(gh.call_args.args[:3], ("pr", "edit", "20"))
+
+    def test_pr_edit_rejects_wrong_identity_before_write(self) -> None:
+        wrong = {"number": 20, "headRefName": "task/19-fix", "baseRefName": "other", "headRefOid": self.HEAD, "isDraft": True, "isCrossRepository": False, "state": "OPEN"}
+        with (
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "pr_for_branch", return_value=wrong),
+            mock.patch.object(agent_core, "gh") as gh,
+            self.assertRaisesRegex(agent_core.AutomationError, "repair target identity"),
+        ):
+            agent_core.pr_edit(Path("."), "19")
+        gh.assert_not_called()
+
+    def test_pr_ready_reconciles_already_ready_pr(self) -> None:
+        ready = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": False, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "pr_for_branch", return_value=ready),
+            mock.patch.object(agent_core, "gh") as gh,
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            agent_core.pr_ready(Path("."), "19")
+        gh.assert_not_called()
+        transition.assert_called_once()
+
+    def test_pr_ready_rejects_stale_live_body_before_write(self) -> None:
+        live = {"number": 20, "title": "title", "body": "stale", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "pr_for_branch", return_value=live),
+            mock.patch.object(agent_core, "gh") as gh,
+            self.assertRaisesRegex(agent_core.AutomationError, "stale or inconsistent"),
+        ):
+            agent_core.pr_ready(Path("."), "19")
+        gh.assert_not_called()
 
 
 if __name__ == "__main__":

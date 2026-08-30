@@ -304,11 +304,15 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(bash["gh pr ready *"], "deny")
         self.assertEqual(bash["gh pr merge *"], "deny")
         self.assertEqual(bash["just agent::commit *"], "allow")
+        self.assertEqual(bash["just agent::pr-prepare *"], "allow")
         self.assertEqual(bash["just agent::pr-create *"], "allow")
         self.assertEqual(bash["just agent::pr-edit *"], "allow")
         self.assertEqual(bash["just agent::pr-ready *"], "allow")
         self.assertEqual(bash["just agent::push *"], "ask")
         self.assertEqual(bash["just integrate::merge *"], "ask")
+        self.assertEqual(permission_for("task-orchestrator")["bash"]["just agent::pr-prepare *"], "allow")
+        self.assertEqual(permission_for("build")["bash"]["just agent::pr-prepare *"], "deny")
+        self.assertEqual(permission_for("general")["bash"]["just agent::pr-prepare *"], "deny")
 
     def test_guarded_finalize_permission_boundaries(self) -> None:
         bash = self.config["permission"]["bash"]

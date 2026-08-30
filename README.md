@@ -417,6 +417,26 @@ its filtered content digest to remain identical to the stored snapshot. A
 coherently rewritten set of ignored Task State files therefore cannot
 self-authenticate. An unavailable or changed Issue fails closed.
 
+Issue #101 makes pull request publication metadata evidence-backed and
+fail-closed. After current-head `just agent::verify <task>` evidence exists and
+the Task is `publication-ready`, run:
+
+```sh
+just agent::pr-prepare <task>
+just agent::pr-create <task>
+```
+
+Preparation deterministically writes only ignored `.task-state/pr-title.txt`
+and `.task-state/pr-body.md` from the resolved Task Contract, changed paths,
+the persisted successful project check, and completed reviewer/security
+reviewer Work Units. Publication rejects untouched placeholders, stale
+metadata, and a `NOT RUN` claim that contradicts persisted PASS evidence.
+`pr-edit` repairs the same existing open Draft PR after preparation;
+`pr-ready` reruns verification and requires exact canonical/live metadata
+before marking Ready and entering `integration-pending`. Generic `state-set`
+cannot cross either publication boundary. Merge remains Main-owned and Agent
+Core VERSION remains 3.
+
 For a pre-fix consumer such as AgentKnowledgeVault Task #19, run the verified
 source-side bridge from a clean Templates checkout containing Issue #99's fix:
 

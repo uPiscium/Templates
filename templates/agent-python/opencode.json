@@ -91,6 +91,7 @@
       "just agent::status *": "allow",
       "just agent::verify *": "allow",
       "just agent::commit *": "allow",
+      "just agent::pr-prepare *": "allow",
       "just agent::pr-create *": "allow",
       "just agent::pr-edit *": "allow",
       "just agent::pr-ready *": "allow",

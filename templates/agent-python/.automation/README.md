@@ -89,6 +89,9 @@ Before publication, execute `git diff --check`, `just agent::doctor`,
 just automation::commit <task> [message]
 just agent::push <task>
 just agent::pr-create <task>
+just agent::pr-prepare <task>
+just agent::pr-edit <task>
+just agent::pr-ready <task>
 ```
 
 The normal upgrade flow creates its receipt before verification. If a self-hosted
