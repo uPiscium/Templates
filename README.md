@@ -167,6 +167,17 @@ Main
 
 Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write path. After merge, Main uses `just integrate::finalize <task> <pr>` to bind actual GitHub merge evidence to a narrow fast-forward-only default-branch synchronization and the dedicated `integration-pending -> merged` transition. `task-start` repeats that synchronization at execution time. Push, merge, cleanup, unknown Bash, and designated external paths require Ask; finalization is non-destructive and cleanup remains separate.
 
+Issue #103 permits that separate guarded cleanup to recover when GitHub has
+already deleted a merged Task's remote branch. A configured upstream is not
+treated as a live revision: cleanup queries origin directly, requires status
+`merged`, a clean registered worktree, one matching merged PR, and exact
+equality among the PR `headRefOid`, recorded published head when present, and
+the local Task branch. Any local-only commit, PR identity mismatch, remote
+head mismatch, or unavailable evidence fails closed. Cancelled Tasks do not
+receive this exception. A private cleanup receipt and expected-OID ref deletion
+make the worktree-removal/branch-removal tail retryable. The operation remains
+Main-owned, human-approved, and Agent Core VERSION 3.
+
 Each role uses one fixed GPT-5.6 model. Agent Core does not substitute models or retry an objective under another model. If the configured provider/model is unavailable, preserve Task and Work Unit evidence, report the exact failure, and return `BLOCKED`.
 
 Task Orchestrators autonomously drive the persisted Work Unit loop through the

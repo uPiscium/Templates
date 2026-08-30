@@ -981,27 +981,46 @@ def extract_identity_value(path: Path, label: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def unpushed_commits(record: WorktreeRecord, state: Path) -> int:
+def remote_branch_head(record: WorktreeRecord) -> str | None:
+    """Resolve the live origin branch, distinguishing deletion from failures."""
     assert record.branch is not None
-    upstream = git(
-        "rev-parse",
-        "--abbrev-ref",
-        f"{record.branch}@{{upstream}}",
+    result = run(
+        [
+            "git",
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            f"refs/heads/{record.branch}",
+        ],
         cwd=record.path,
         check=False,
     )
-    if upstream:
+    if result.returncode == 2 and not result.stdout.strip():
+        return None
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise LifecycleError(f"cleanup refused: cannot inspect live Task branch: {detail}")
+    lines = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    expected_ref = f"refs/heads/{record.branch}"
+    if (
+        len(lines) != 1
+        or len(lines[0]) != 2
+        or lines[0][1] != expected_ref
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", lines[0][0])
+    ):
+        raise LifecycleError("cleanup refused: live Task branch response is invalid or ambiguous")
+    return lines[0][0].lower()
+
+
+def unpushed_commits_from_base(record: WorktreeRecord, base_revision: str) -> int:
+    assert record.branch is not None
+    remote_head = remote_branch_head(record)
+    if remote_head is not None:
         count = git(
-            "rev-list",
-            "--count",
-            f"{upstream}..{record.branch}",
-            cwd=record.path,
+            "rev-list", "--count", f"{remote_head}..{record.branch}", cwd=record.path
         )
         return int(count or "0")
-
-    base_revision = extract_identity_value(state, "Base revision")
-    if not base_revision:
-        raise LifecycleError("Task State is missing Base revision")
     count = git(
         "rev-list",
         "--count",
@@ -1011,8 +1030,156 @@ def unpushed_commits(record: WorktreeRecord, state: Path) -> int:
     return int(count or "0")
 
 
-def task_cleanup(root: Path, task: str) -> None:
-    require_main_worktree(root)
+def unpushed_commits(record: WorktreeRecord, state: Path) -> int:
+    base_revision = extract_identity_value(state, "Base revision")
+    if not base_revision:
+        raise LifecycleError("Task State is missing Base revision")
+    return unpushed_commits_from_base(record, base_revision)
+
+
+def require_cleanup_base_revision(root: Path, base_revision: str) -> None:
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision):
+        raise LifecycleError("cleanup refused: Task Base revision is missing or invalid")
+    result = run(
+        ["git", "merge-base", "--is-ancestor", base_revision, default_branch(root)],
+        cwd=root,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LifecycleError(
+            "cleanup refused: Task Base revision is not trusted default-branch history"
+        )
+
+
+def cleanup_receipt_path(root: Path, task: str) -> Path:
+    validate_task(task)
+    return common_git_dir(root) / "opencode" / "cleanup" / f"{task}.json"
+
+
+@contextmanager
+def cleanup_lock(root: Path):
+    path = common_git_dir(root) / "opencode" / "cleanup.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def cleanup_repository(root: Path) -> str:
+    result = gh("repo", "view", "--json", "nameWithOwner", cwd=root, check=False)
+    if result.returncode != 0:
+        raise LifecycleError("cleanup refused: cannot resolve GitHub repository identity")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise LifecycleError("cleanup refused: GitHub repository identity is invalid") from exc
+    repository = value.get("nameWithOwner") if isinstance(value, dict) else None
+    if not isinstance(repository, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+    ):
+        raise LifecycleError("cleanup refused: GitHub repository identity is invalid")
+    return repository
+
+
+def cleanup_prs(root: Path, branch: str, repository: str) -> list[dict]:
+    owner = repository.split("/", 1)[0]
+    result = gh(
+        "api",
+        "--method",
+        "GET",
+        "--paginate",
+        "--slurp",
+        f"repos/{repository}/pulls",
+        "-f",
+        "state=all",
+        "-f",
+        f"head={owner}:{branch}",
+        "-f",
+        "per_page=100",
+        cwd=root,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise LifecycleError("cleanup refused: cannot reconstruct GitHub pull request evidence")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid") from exc
+    if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
+        raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid")
+    matches = []
+    for item in (entry for page in value for entry in page):
+        if not isinstance(item, dict):
+            raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid")
+        head = item.get("head")
+        base = item.get("base")
+        head_repo = head.get("repo") if isinstance(head, dict) else None
+        if not isinstance(head, dict) or not isinstance(base, dict):
+            raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid")
+        if head.get("ref") != branch:
+            continue
+        matches.append(
+            {
+                "number": item.get("number"),
+                "state": "MERGED" if item.get("merged_at") else str(item.get("state", "")).upper(),
+                "headRefName": head.get("ref"),
+                "headRefOid": head.get("sha"),
+                "baseRefName": base.get("ref"),
+                "isCrossRepository": not isinstance(head_repo, dict)
+                or str(head_repo.get("full_name", "")).casefold() != repository.casefold(),
+                "mergeCommit": {"oid": item.get("merge_commit_sha")},
+            }
+        )
+    return matches
+
+
+def merged_cleanup_evidence(
+    root: Path, record: WorktreeRecord, state: Path, local_head: str
+) -> dict:
+    assert record.branch is not None
+    repository = cleanup_repository(root)
+    matches = cleanup_prs(root, record.branch, repository)
+    if len(matches) != 1:
+        raise LifecycleError("cleanup refused: merged Task pull request identity is missing or ambiguous")
+    pr = matches[0]
+    published_head = pr.get("headRefOid")
+    if (
+        pr.get("state") != "MERGED"
+        or pr.get("headRefName") != record.branch
+        or pr.get("baseRefName") != default_branch(root)
+        or pr.get("isCrossRepository") is not False
+        or not isinstance(pr.get("number"), int)
+        or not isinstance(published_head, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", published_head)
+    ):
+        raise LifecycleError("cleanup refused: merged pull request evidence does not match the Task")
+    published_head = published_head.lower()
+    if local_head.lower() != published_head:
+        raise LifecycleError("cleanup refused: local Task head does not match published PR head")
+    ahead = git(
+        "rev-list", "--count", f"{published_head}..{record.branch}", cwd=record.path
+    )
+    if int(ahead or "0") != 0:
+        raise LifecycleError("cleanup refused: local Task branch is ahead of published PR head")
+    recorded = extract_identity_value(state, "Published head SHA")
+    if recorded and recorded.casefold() != "none":
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", recorded) or recorded.lower() != published_head:
+            raise LifecycleError("cleanup refused: Task State published head does not match GitHub")
+    remote_head = remote_branch_head(record)
+    if remote_head is not None and remote_head != published_head:
+        raise LifecycleError("cleanup refused: live remote Task branch does not match published PR head")
+    return {
+        "repository": repository,
+        "pr": pr["number"],
+        "published_head": published_head,
+        "upstream": "deleted" if remote_head is None else "live",
+    }
+
+
+def cleanup_plan(root: Path, task: str) -> dict:
     record = worktree_for_task(root, task)
     assert_task_identity(record, task)
     state = state_path(record.path)
@@ -1021,45 +1188,158 @@ def task_cleanup(root: Path, task: str) -> None:
         raise LifecycleError(
             f"cleanup refused while Task status is {status}; expected one of {sorted(TERMINAL_STATES)}"
         )
-    if git("status", "--porcelain", cwd=record.path):
+    if git("status", "--porcelain", "--untracked-files=all", cwd=record.path):
         raise LifecycleError("cleanup refused: Task worktree has uncommitted changes")
-    ahead = unpushed_commits(record, state)
-    if ahead:
-        raise LifecycleError(f"cleanup refused: Task branch has {ahead} unpushed commit(s)")
-
     branch = record.branch
     assert branch is not None
-    pr_result = run(
-        ["gh", "pr", "view", branch, "--json", "state,headRefName,headRefOid"],
-        cwd=record.path,
-        check=False,
-    )
+    local_head = git("rev-parse", "--verify", f"refs/heads/{branch}", cwd=record.path).lower()
+    if record.head is None or record.head.lower() != local_head:
+        raise LifecycleError("cleanup refused: registered Task head changed")
+    evidence: dict = {}
     if status == "merged":
-        if pr_result.returncode != 0:
-            raise LifecycleError("cleanup refused: merged Task has no resolvable pull request")
-        data = json.loads(pr_result.stdout)
-        if data.get("state") != "MERGED" or data.get("headRefName") != branch:
-            raise LifecycleError(
-                "cleanup refused: Task pull request is not merged for the expected branch"
-            )
-    elif pr_result.returncode == 0:
-        data = json.loads(pr_result.stdout)
-        if data.get("state") == "OPEN":
+        evidence = merged_cleanup_evidence(root, record, state, local_head)
+    else:
+        base_revision = extract_identity_value(state, "Base revision")
+        if not base_revision:
+            raise LifecycleError("Task State Base revision is missing or invalid")
+        base_revision = base_revision.lower()
+        require_cleanup_base_revision(root, base_revision)
+        ahead = unpushed_commits_from_base(record, base_revision)
+        if ahead:
+            raise LifecycleError(f"cleanup refused: Task branch has {ahead} unpushed commit(s)")
+        repository = cleanup_repository(root)
+        if any(pr.get("state") == "OPEN" for pr in cleanup_prs(root, branch, repository)):
             raise LifecycleError("cleanup refused: cancelled Task still has an open pull request")
+        evidence = {
+            "repository": repository,
+            "upstream": "cancelled-safe",
+            "base_revision": base_revision,
+        }
+    return {
+        "schema_version": 1,
+        "task": task,
+        "status": status,
+        "worktree": str(record.path),
+        "branch": branch,
+        "local_head": local_head,
+        "evidence": evidence,
+    }
 
-    removed_path = str(record.path)
-    run(["git", "worktree", "remove", str(record.path)], cwd=root)
-    run(["git", "branch", "-D", branch], cwd=root)
+
+def read_cleanup_receipt(path: Path, task: str) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise LifecycleError("cleanup receipt is not a regular local file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LifecycleError("cleanup receipt is invalid") from exc
+    required = {"schema_version", "task", "status", "worktree", "branch", "local_head", "evidence"}
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("task") != task
+        or value.get("status") not in TERMINAL_STATES
+        or not isinstance(value.get("worktree"), str)
+        or not branch_matches_task(value.get("branch"), task)
+        or not isinstance(value.get("local_head"), str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", value["local_head"])
+        or not isinstance(value.get("evidence"), dict)
+    ):
+        raise LifecycleError("cleanup receipt is invalid")
+    evidence = value["evidence"]
+    if value["status"] == "cancelled" and (
+        set(evidence) != {"repository", "upstream", "base_revision"}
+        or not isinstance(evidence.get("repository"), str)
+        or evidence.get("upstream") != "cancelled-safe"
+        or not isinstance(evidence.get("base_revision"), str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
+    ):
+        raise LifecycleError("cleanup receipt is invalid")
+    return value
+
+
+def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
+    task = plan["task"]
+    branch = plan["branch"]
+    expected_path = Path(plan["worktree"]).resolve()
+    expected_head = plan["local_head"].lower()
+    records = parse_worktrees(root)
+    registered = [r for r in records if r.path == expected_path or r.branch == branch]
+    if registered:
+        if len(registered) != 1 or registered[0].path != expected_path or registered[0].branch != branch:
+            raise LifecycleError("cleanup receipt conflicts with current worktree registration")
+        current = cleanup_plan(root, task)
+        if current != plan:
+            raise LifecycleError("cleanup evidence changed before worktree removal")
+        run(["git", "worktree", "remove", str(expected_path)], cwd=root)
+    if any(r.path == expected_path or r.branch == branch for r in parse_worktrees(root)):
+        raise LifecycleError("cleanup failed to remove the expected worktree registration")
+
+    branch_ref = f"refs/heads/{branch}"
+    actual = git("rev-parse", "--verify", branch_ref, cwd=root, check=False).lower()
+    if actual:
+        if actual != expected_head:
+            raise LifecycleError("cleanup refused: local Task branch moved after validation")
+        if plan["status"] == "merged":
+            # Reconstruct the externally authoritative evidence again after
+            # Task State/worktree removal, using the receipt-bound identity.
+            repository = cleanup_repository(root)
+            if repository.casefold() != plan["evidence"].get("repository", "").casefold():
+                raise LifecycleError("cleanup repository identity changed after worktree removal")
+            matches = cleanup_prs(root, branch, repository)
+            if (
+                len(matches) != 1
+                or matches[0].get("state") != "MERGED"
+                or matches[0].get("headRefOid", "").lower() != expected_head
+                or matches[0].get("headRefName") != branch
+                or matches[0].get("baseRefName") != default_branch(root)
+                or matches[0].get("isCrossRepository") is not False
+                or matches[0].get("number") != plan["evidence"].get("pr")
+            ):
+                raise LifecycleError("cleanup merged PR evidence changed after worktree removal")
+            remote_head = remote_branch_head(WorktreeRecord(root, branch, expected_head))
+            if remote_head is not None and remote_head != expected_head:
+                raise LifecycleError("cleanup remote Task branch changed after worktree removal")
+        else:
+            require_cleanup_base_revision(root, plan["evidence"]["base_revision"])
+            repository = cleanup_repository(root)
+            if repository.casefold() != plan["evidence"].get("repository", "").casefold():
+                raise LifecycleError("cleanup repository identity changed after worktree removal")
+            if any(pr.get("state") == "OPEN" for pr in cleanup_prs(root, branch, repository)):
+                raise LifecycleError("cleanup refused: cancelled Task still has an open pull request")
+            record = WorktreeRecord(root, branch, expected_head)
+            ahead = unpushed_commits_from_base(record, plan["evidence"]["base_revision"])
+            if ahead:
+                raise LifecycleError(
+                    f"cleanup refused: cancelled Task branch has {ahead} unpublished commit(s)"
+                )
+        run(["git", "update-ref", "-d", branch_ref, expected_head], cwd=root)
+    if git("rev-parse", "--verify", branch_ref, cwd=root, check=False):
+        raise LifecycleError("cleanup failed to delete the expected local Task branch")
+    receipt.unlink(missing_ok=True)
     print(
         json.dumps(
             {
                 "task": task,
-                "removedWorktree": removed_path,
+                "removedWorktree": str(expected_path),
                 "removedBranch": branch,
                 "taskStateDiscarded": True,
             }
         )
     )
+
+
+def task_cleanup(root: Path, task: str) -> None:
+    require_main_worktree(root)
+    receipt = cleanup_receipt_path(root, task)
+    with cleanup_lock(root):
+        if receipt.exists():
+            finish_cleanup(root, read_cleanup_receipt(receipt, task), receipt)
+            return
+        plan = cleanup_plan(root, task)
+        atomic_json(receipt, plan)
+        finish_cleanup(root, plan, receipt)
 
 
 def extract_list(path: Path, heading: str) -> list[str]:
