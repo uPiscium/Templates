@@ -596,8 +596,9 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         )
         bash = config["permission"]["bash"]
         self.assertEqual(bash["just automation::maintenance-check *"], "allow")
-        self.assertEqual(bash["just automation::maintenance-pr-create *"], "allow")
-        self.assertEqual(bash["just automation::maintenance-finalize *"], "allow")
+        self.assertEqual(bash["just automation::maintenance-review-record *"], "deny")
+        self.assertEqual(bash["just automation::maintenance-pr-create *"], "deny")
+        self.assertEqual(bash["just automation::maintenance-finalize *"], "deny")
         self.assertEqual(bash["just automation::upgrade *"], "ask")
         self.assertEqual(bash["just agent::push *"], "ask")
         self.assertEqual(bash["git push *"], "deny")
@@ -605,6 +606,8 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             ROOT / "components" / "agent-core" / ".opencode" / "agents" / "build.md"
         ).read_text(encoding="utf-8")
         self.assertIn('"just automation::maintenance-review-record *": allow', build)
+        self.assertIn('"just automation::maintenance-pr-create *": deny', build)
+        self.assertIn('"just automation::maintenance-finalize *": allow', build)
         command = (
             ROOT
             / "components"
@@ -625,6 +628,8 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("model: openai/gpt-5.6-sol", agent)
         self.assertIn('"just automation::maintenance-review-record *": deny', agent)
+        self.assertIn('"just automation::maintenance-pr-create *": allow', agent)
+        self.assertIn('"just automation::maintenance-finalize *": deny', agent)
         self.assertNotIn("reviewer: allow", agent)
         self.assertNotIn("security-reviewer: allow", agent)
         self.assertNotIn('"just agent::work-unit-state-set *": allow', agent)

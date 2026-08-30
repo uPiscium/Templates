@@ -19,6 +19,7 @@ permission:
     "just automation::upgrade *": ask
     "just automation::commit *": allow
     "just automation::maintenance-pr-create *": allow
+    "just automation::maintenance-finalize *": deny
     "just agent::verify *": allow
     "just agent::push *": ask
     "just agent::work-unit-status *": allow

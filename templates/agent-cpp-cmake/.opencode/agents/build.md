@@ -24,6 +24,7 @@ permission:
     "just agent::contract-resume-check *": allow
     "just automation::maintenance-check *": allow
     "just automation::maintenance-review-record *": allow
+    "just automation::maintenance-pr-create *": deny
     "just automation::maintenance-finalize *": allow
     "just agent::state-set *": deny
     "just agent::batch-plan *": allow
