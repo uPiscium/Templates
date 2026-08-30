@@ -5,6 +5,7 @@ import argparse
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 import agent_core
@@ -22,11 +23,15 @@ def root() -> Path:
     installed = Path(__file__).resolve().parents[2]
     discovered = agent_core.repo_root(installed)
     if discovered != installed:
-        raise MaintenanceError("installed maintenance lifecycle path does not match the Git worktree root")
+        raise MaintenanceError(
+            "installed maintenance lifecycle path does not match the Git worktree root"
+        )
     return installed
 
 
-def _current_or_main_can_inspect(root_path: Path, record: lifecycle.WorktreeRecord) -> None:
+def _current_or_main_can_inspect(
+    root_path: Path, record: lifecycle.WorktreeRecord
+) -> None:
     current = lifecycle.current_worktree(root_path)
     main = lifecycle.main_worktree(root_path)
     if current.path not in {main.path, record.path}:
@@ -35,7 +40,9 @@ def _current_or_main_can_inspect(root_path: Path, record: lifecycle.WorktreeReco
         )
 
 
-def _stored_contract(root_path: Path, task: str) -> tuple[lifecycle.WorktreeRecord, dict]:
+def _stored_contract(
+    root_path: Path, task: str
+) -> tuple[lifecycle.WorktreeRecord, dict]:
     record = lifecycle.worktree_for_task(root_path, task)
     _current_or_main_can_inspect(root_path, record)
     try:
@@ -47,7 +54,9 @@ def _stored_contract(root_path: Path, task: str) -> tuple[lifecycle.WorktreeReco
     return record, result
 
 
-def _validated_contract(root_path: Path, task: str) -> tuple[lifecycle.WorktreeRecord, dict]:
+def _validated_contract(
+    root_path: Path, task: str
+) -> tuple[lifecycle.WorktreeRecord, dict]:
     record, result = _stored_contract(root_path, task)
     try:
         task_contract._validate_authoritative_issue(
@@ -73,7 +82,9 @@ def _read_json_regular(path: Path, description: str) -> dict:
 def _validate_active_receipt(record: lifecycle.WorktreeRecord, task: str) -> dict:
     path = upgrade.receipt_path(record.path)
     try:
-        receipt = upgrade.validate_receipt_schema(_read_json_regular(path, "active maintenance receipt"))
+        receipt = upgrade.validate_receipt_schema(
+            _read_json_regular(path, "active maintenance receipt")
+        )
         upgrade.validate_authority(record.path, receipt)
     except upgrade.UpgradeError as exc:
         raise MaintenanceError(str(exc)) from exc
@@ -86,30 +97,45 @@ def _validate_active_receipt(record: lifecycle.WorktreeRecord, task: str) -> dic
         raise MaintenanceError("active maintenance receipt identity mismatch")
     if upgrade.consumed_receipt_path(record.path).exists():
         raise MaintenanceError("active and consumed maintenance receipts coexist")
-    head = agent_core.git("rev-parse", "HEAD", cwd=record.path)
+    head = upgrade.git_head(record.path)
     if receipt.get("authority_head") != head or record.head != head:
         raise MaintenanceError("active maintenance receipt authority HEAD is stale")
     try:
         paths = upgrade.receipt_paths(record.path, receipt)
         if upgrade.pending_paths(record.path) != paths:
-            raise MaintenanceError("pending paths do not exactly match the active maintenance receipt")
+            raise MaintenanceError(
+                "pending paths do not exactly match the active maintenance receipt"
+            )
         fingerprints = receipt.get("path_fingerprints")
         if not isinstance(fingerprints, dict) or set(fingerprints) != set(paths):
-            raise MaintenanceError("active maintenance receipt fingerprints do not match its paths")
-        if any(upgrade.file_fingerprint(record.path, item) != fingerprints[item] for item in paths):
-            raise MaintenanceError("active maintenance receipt path fingerprint changed")
+            raise MaintenanceError(
+                "active maintenance receipt fingerprints do not match its paths"
+            )
+        if any(
+            upgrade.file_fingerprint(record.path, item) != fingerprints[item]
+            for item in paths
+        ):
+            raise MaintenanceError(
+                "active maintenance receipt path fingerprint changed"
+            )
     except upgrade.UpgradeError as exc:
         raise MaintenanceError(str(exc)) from exc
     return receipt
 
 
-def _validate_consumed_receipt(record: lifecycle.WorktreeRecord, task: str) -> dict:
+def _validate_consumed_receipt(
+    record: lifecycle.WorktreeRecord, task: str
+) -> dict:
     if upgrade.receipt_path(record.path).exists():
         raise MaintenanceError("active maintenance receipt still exists after commit")
     path = upgrade.consumed_receipt_path(record.path)
     value = _read_json_regular(path, "consumed maintenance receipt")
     required = set(upgrade.RECEIPT_FIELDS) | {"commit_sha"}
-    if set(value) != required or value.get("schema_version") != 1 or value.get("status") != "consumed":
+    if (
+        set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("status") != "consumed"
+    ):
         raise MaintenanceError("consumed maintenance receipt has an invalid schema")
     if (
         value.get("task_id") != task
@@ -123,38 +149,67 @@ def _validate_consumed_receipt(record: lifecycle.WorktreeRecord, task: str) -> d
     try:
         upgrade.validate_commit_oid(record.path, commit, field="maintenance commit")
         upgrade.validate_commit_oid(
-            record.path, value.get("authority_head"), field="maintenance authority HEAD"
+            record.path,
+            value.get("authority_head"),
+            field="maintenance authority HEAD",
         )
     except upgrade.UpgradeError as exc:
         raise MaintenanceError(str(exc)) from exc
-    local_head = agent_core.git("rev-parse", "HEAD", cwd=record.path)
-    branch_head = agent_core.git(
-        "rev-parse", "--verify", f"refs/heads/{record.branch}", cwd=record.path
-    )
+    local_head = upgrade.git_head(record.path)
+    branch_head = upgrade.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{record.branch}"],
+        cwd=record.path,
+    ).stdout.strip()
     if local_head != commit or branch_head != commit or record.head != commit:
-        raise MaintenanceError("maintenance Task HEAD does not match the consumed receipt commit")
-    parent = agent_core.git("rev-parse", f"{commit}^", cwd=record.path)
+        raise MaintenanceError(
+            "maintenance Task HEAD does not match the consumed receipt commit"
+        )
+    parent = upgrade.run(
+        ["git", "rev-parse", f"{commit}^"], cwd=record.path
+    ).stdout.strip()
     if parent != value["authority_head"]:
-        raise MaintenanceError("maintenance commit parent does not match the receipt authority HEAD")
+        raise MaintenanceError(
+            "maintenance commit parent does not match the receipt authority HEAD"
+        )
     changed = sorted(
         line
-        for line in agent_core.git(
-            "diff-tree", "--no-commit-id", "--name-only", "-r", commit, cwd=record.path
-        ).splitlines()
+        for line in upgrade.run(
+            [
+                "git",
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                commit,
+            ],
+            cwd=record.path,
+        ).stdout.splitlines()
         if line
     )
     paths = value.get("changed_paths")
     if not isinstance(paths, list) or paths != sorted(set(paths)) or changed != paths:
-        raise MaintenanceError("maintenance commit paths do not match the consumed receipt")
+        raise MaintenanceError(
+            "maintenance commit paths do not match the consumed receipt"
+        )
     fingerprints = value.get("path_fingerprints")
     if not isinstance(fingerprints, dict) or set(fingerprints) != set(paths):
-        raise MaintenanceError("consumed maintenance receipt fingerprints do not match its paths")
+        raise MaintenanceError(
+            "consumed maintenance receipt fingerprints do not match its paths"
+        )
     try:
-        if any(upgrade.file_fingerprint(record.path, item) != fingerprints[item] for item in paths):
+        if any(
+            upgrade.file_fingerprint(record.path, item) != fingerprints[item]
+            for item in paths
+        ):
             raise MaintenanceError("committed maintenance path fingerprint changed")
     except upgrade.UpgradeError as exc:
         raise MaintenanceError(str(exc)) from exc
-    if agent_core.git("status", "--porcelain", "--untracked-files=all", cwd=record.path):
+    status = upgrade.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=record.path,
+    ).stdout.strip()
+    if status:
         raise MaintenanceError("maintenance Task worktree is not clean after commit")
     return value
 
@@ -166,7 +221,28 @@ def _remote_head(record: lifecycle.WorktreeRecord) -> str | None:
         raise MaintenanceError(str(exc)) from exc
 
 
-def _pr_evidence(record: lifecycle.WorktreeRecord, repository: str, commit: str) -> dict | None:
+def _remote_relation(
+    record: lifecycle.WorktreeRecord, remote: str | None, commit: str
+) -> str:
+    if remote is None:
+        return "absent"
+    if remote == commit:
+        return "exact"
+    result = lifecycle.run(
+        ["git", "merge-base", "--is-ancestor", remote, commit],
+        cwd=record.path,
+        check=False,
+    )
+    if result.returncode == 0:
+        return "ancestor"
+    raise MaintenanceError(
+        "live remote Task branch is not the maintenance commit or its ancestor"
+    )
+
+
+def _pr_evidence(
+    record: lifecycle.WorktreeRecord, repository: str, commit: str
+) -> dict | None:
     pr = agent_core.pr_for_branch(record.path, record.branch or "", repository)
     if pr is None:
         return None
@@ -183,11 +259,15 @@ def _pr_evidence(record: lifecycle.WorktreeRecord, repository: str, commit: str)
             + ", ".join(mismatches or ["number"])
         )
     if pr.get("state") not in {"OPEN", "MERGED"}:
-        raise MaintenanceError(f"maintenance pull request has unsupported state: {pr.get('state')}")
+        raise MaintenanceError(
+            f"maintenance pull request has unsupported state: {pr.get('state')}"
+        )
     return pr
 
 
-def _maintenance_stage(record: lifecycle.WorktreeRecord, task: str, contract: dict) -> dict:
+def _maintenance_stage(
+    record: lifecycle.WorktreeRecord, task: str, contract: dict
+) -> dict:
     status = lifecycle.state_status(lifecycle.state_path(record.path))
     if status == "merged":
         return {
@@ -218,12 +298,9 @@ def _maintenance_stage(record: lifecycle.WorktreeRecord, task: str, contract: di
         receipt = _validate_consumed_receipt(record, task)
         commit = receipt["commit_sha"]
         remote = _remote_head(record)
+        relation = _remote_relation(record, remote, commit)
         pr = _pr_evidence(record, contract["repository"], commit)
-        stage = "committed"
-        if remote is not None:
-            if remote != commit:
-                raise MaintenanceError("live remote Task branch does not match the maintenance commit")
-            stage = "pushed"
+        stage = "pushed" if relation == "exact" else "committed"
         if pr is not None:
             if pr.get("state") == "MERGED":
                 stage = "merged-remote"
@@ -242,6 +319,7 @@ def _maintenance_stage(record: lifecycle.WorktreeRecord, task: str, contract: di
             "commit": commit,
             "sourceRevision": receipt["source_revision"],
             "remoteHead": remote,
+            "remoteRelation": relation,
             "pr": pr["number"] if pr is not None else None,
         }
 
@@ -284,8 +362,114 @@ def _require_review_evidence(record: lifecycle.WorktreeRecord, task: str) -> Non
     ]
     if missing:
         raise MaintenanceError(
-            "maintenance publication requires completed review evidence: " + ", ".join(missing)
+            "maintenance publication requires completed review evidence: "
+            + ", ".join(missing)
         )
+
+
+def _direct_upgrade_publication(
+    record: lifecycle.WorktreeRecord, receipt: dict
+) -> list[str]:
+    """Prove the whole Base..HEAD tree equals one direct upgrade to receipt source."""
+    commit = receipt.get("commit_sha")
+    source_text = receipt.get("source")
+    revision = receipt.get("source_revision")
+    if not isinstance(commit, str) or not isinstance(source_text, str) or not source_text:
+        raise MaintenanceError(
+            "consumed maintenance receipt publication provenance is incomplete"
+        )
+    try:
+        base_revision = upgrade.validate_commit_oid(
+            record.path,
+            agent_core._base_revision(record.path),
+            field="Task Base revision",
+        )
+        source = upgrade.resolve_source(Path(source_text))
+        source_revision = upgrade.validate_commit_oid(
+            source, revision, field="receipt source revision"
+        )
+    except (upgrade.UpgradeError, agent_core.AutomationError) as exc:
+        raise MaintenanceError(str(exc)) from exc
+
+    state_dir = upgrade.task_state_dir(record.path)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="maintenance-publication-", dir=state_dir
+        ) as directory:
+            temporary = Path(directory)
+            baseline = temporary / "baseline"
+            upgrade.materialize_tree(
+                record.path, base_revision, baseline, surface_only=True
+            )
+            before = {
+                path.relative_to(baseline).as_posix(): upgrade.bootstrap_fingerprint(
+                    baseline, path.relative_to(baseline).as_posix()
+                )
+                for path in baseline.rglob("*")
+                if path.is_file()
+            }
+            snapshot, source_core = upgrade.materialize_source_snapshot(
+                source, source_revision, temporary / "source-snapshot"
+            )
+            plan = upgrade.build_plan(baseline, snapshot)
+            if plan["blockers"]:
+                raise MaintenanceError(
+                    "direct maintenance publication reconstruction is blocked:\n- "
+                    + "\n- ".join(plan["blockers"])
+                )
+            upgrade.apply_plan_to_tree(baseline, source_core, plan)
+            returned = {
+                item["path"]
+                for item in plan["actions"]
+                if item["action"] != "noop"
+            }
+            expected_paths = sorted(
+                path
+                for path in returned
+                if before.get(
+                    path,
+                    {"state": "absent", "mode": None, "content_sha256": None},
+                )
+                != upgrade.bootstrap_fingerprint(baseline, path)
+            )
+            expected_fingerprints = {
+                path: upgrade.bootstrap_fingerprint(baseline, path)
+                for path in expected_paths
+            }
+    except upgrade.UpgradeError as exc:
+        raise MaintenanceError(str(exc)) from exc
+
+    actual_paths = sorted(
+        line
+        for line in upgrade.run(
+            [
+                "git",
+                "diff",
+                "--no-ext-diff",
+                "--no-renames",
+                "--name-only",
+                f"{base_revision}...{commit}",
+            ],
+            cwd=record.path,
+        ).stdout.splitlines()
+        if line
+    )
+    if actual_paths != expected_paths:
+        raise MaintenanceError(
+            "maintenance branch diff does not exactly match a direct upgrade from Task Base"
+        )
+    try:
+        current_fingerprints = {
+            path: upgrade.file_fingerprint(record.path, path)
+            for path in expected_paths
+        }
+    except upgrade.UpgradeError as exc:
+        raise MaintenanceError(str(exc)) from exc
+    if current_fingerprints != expected_fingerprints:
+        raise MaintenanceError(
+            "maintenance branch content does not match the reconstructed direct upgrade"
+        )
+    return expected_paths
 
 
 def maintenance_pr_create(root_path: Path, task: str) -> dict:
@@ -293,28 +477,28 @@ def maintenance_pr_create(root_path: Path, task: str) -> dict:
     ready = maintenance_check(root_path, task)
     if ready["stage"] not in {"pushed", "draft-pr-created"}:
         raise MaintenanceError(
-            f"maintenance PR creation requires pushed or draft-pr-created stage; found {ready['stage']}"
+            "maintenance PR creation requires pushed or draft-pr-created stage; "
+            f"found {ready['stage']}"
         )
     receipt = _validate_consumed_receipt(record, task)
     commit = receipt["commit_sha"]
     remote = _remote_head(record)
     if remote != commit:
-        raise MaintenanceError("maintenance PR creation requires the exact commit on the remote Task branch")
+        raise MaintenanceError(
+            "maintenance PR creation requires the exact commit on the remote Task branch"
+        )
     _require_review_evidence(record, task)
 
     try:
         agent_core.verify(root_path, task)
-        paths = agent_core.git(
-            "diff", "--name-only", f"{agent_core._base_revision(root_path)}...{commit}", cwd=root_path
-        ).splitlines()
-        paths = sorted(line for line in paths if line)
-        if paths != receipt["changed_paths"]:
-            raise MaintenanceError("published maintenance diff does not match the consumed receipt")
+        paths = _direct_upgrade_publication(record, receipt)
         title, body_text = publication.canonical_metadata(
             root_path, task, head=commit, changed_paths=paths
         )
         publication.write_metadata(root_path, title, body_text)
-        _, body_path, validated_body = agent_core._validated_local_metadata(root_path, task, commit)
+        _, body_path, validated_body = agent_core._validated_local_metadata(
+            root_path, task, commit
+        )
     except (agent_core.AutomationError, publication.PublicationMetadataError) as exc:
         raise MaintenanceError(str(exc)) from exc
 
@@ -341,7 +525,9 @@ def maintenance_pr_create(root_path: Path, task: str) -> dict:
             cwd=root_path,
         )
     if agent_core.canonical_repository(root_path).casefold() != repository.casefold():
-        raise MaintenanceError("repository identity changed during maintenance pull request creation")
+        raise MaintenanceError(
+            "repository identity changed during maintenance pull request creation"
+        )
     pr = agent_core.pr_for_branch(root_path, branch, repository)
     if pr is None:
         raise MaintenanceError("created maintenance pull request cannot be re-read")
@@ -383,7 +569,9 @@ def _merged_pr(
         "isCrossRepository": False,
         "state": "MERGED",
     }
-    mismatches = [name for name, wanted in expected.items() if details.get(name) != wanted]
+    mismatches = [
+        name for name, wanted in expected.items() if details.get(name) != wanted
+    ]
     merge = details.get("mergeCommit")
     merge_oid = merge.get("oid") if isinstance(merge, dict) else None
     if (
@@ -401,7 +589,9 @@ def _merged_pr(
     return {**details, "mergeCommitOid": merge_oid.lower()}
 
 
-def _mark_maintenance_merged(record: lifecycle.WorktreeRecord, task: str) -> str:
+def _mark_maintenance_merged(
+    record: lifecycle.WorktreeRecord, task: str
+) -> str:
     lifecycle.validate_task(task)
     lifecycle.require_resolved_contract(record, task)
     with lifecycle.work_units_lock(record):
@@ -427,24 +617,34 @@ def maintenance_finalize(root_path: Path, task: str, pr_number: int) -> dict:
     record, contract = _stored_contract(root_path, task)
     receipt = _validate_consumed_receipt(record, task)
     commit = receipt["commit_sha"]
+    publication_paths = _direct_upgrade_publication(record, receipt)
     first = _merged_pr(root_path, record, contract["repository"], pr_number, commit)
     sync = lifecycle.synchronize_default_branch(root_path)
     merge_oid = first["mergeCommitOid"]
-    if lifecycle.run(
-        ["git", "merge-base", "--is-ancestor", merge_oid, sync["revision"]],
-        cwd=root_path,
-        check=False,
-    ).returncode != 0:
+    if (
+        lifecycle.run(
+            ["git", "merge-base", "--is-ancestor", merge_oid, sync["revision"]],
+            cwd=root_path,
+            check=False,
+        ).returncode
+        != 0
+    ):
         raise MaintenanceError(
             "maintenance PR merge commit is not present on the synchronized default branch"
         )
     lifecycle.require_synchronized_default_branch_revision(
         root_path, sync["branch"], sync["revision"]
     )
-    _validate_consumed_receipt(record, task)
+    receipt_after = _validate_consumed_receipt(record, task)
+    if _direct_upgrade_publication(record, receipt_after) != publication_paths:
+        raise MaintenanceError(
+            "maintenance publication reconstruction changed during finalization"
+        )
     second = _merged_pr(root_path, record, contract["repository"], pr_number, commit)
     if second["mergeCommitOid"] != merge_oid:
-        raise MaintenanceError("maintenance pull request merge evidence changed during finalization")
+        raise MaintenanceError(
+            "maintenance pull request merge evidence changed during finalization"
+        )
     result = _mark_maintenance_merged(record, task)
     lifecycle.append_task_evidence(
         lifecycle.state_path(record.path),
@@ -465,7 +665,9 @@ def maintenance_finalize(root_path: Path, task: str, pr_number: int) -> dict:
 
 
 def parser() -> argparse.ArgumentParser:
-    value = argparse.ArgumentParser(description="Guarded Automation Maintenance lifecycle")
+    value = argparse.ArgumentParser(
+        description="Guarded Automation Maintenance lifecycle"
+    )
     sub = value.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check")
     check.add_argument("task")
@@ -491,7 +693,11 @@ def main() -> int:
             raise MaintenanceError(f"unsupported command: {args.command}")
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
-    except (MaintenanceError, lifecycle.LifecycleError, upgrade.UpgradeError) as exc:
+    except (
+        MaintenanceError,
+        lifecycle.LifecycleError,
+        upgrade.UpgradeError,
+    ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

@@ -23,6 +23,7 @@ SPEC.loader.exec_module(maintenance)
 class MaintenanceLifecycleTest(unittest.TestCase):
     HEAD = "a" * 40
     BASE = "b" * 40
+    OLD_REMOTE = "9" * 40
     MERGE = "c" * 40
 
     def _record(self, root: Path):
@@ -86,6 +87,32 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             self.assertEqual(result["stage"], "applied")
             self.assertEqual(result["taskStatus"], "initialized")
 
+    def test_consumed_receipt_resumes_when_remote_is_old_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            active = root / "active.json"
+            consumed = root / "consumed.json"
+            consumed.write_text("{}\n", encoding="utf-8")
+            receipt = {"commit_sha": self.HEAD, "source_revision": self.BASE}
+
+            class Result:
+                returncode = 0
+
+            with (
+                mock.patch.object(maintenance.lifecycle, "state_status", return_value="initialized"),
+                mock.patch.object(maintenance.upgrade, "receipt_path", return_value=active),
+                mock.patch.object(maintenance.upgrade, "consumed_receipt_path", return_value=consumed),
+                mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
+                mock.patch.object(maintenance, "_remote_head", return_value=self.OLD_REMOTE),
+                mock.patch.object(maintenance.lifecycle, "run", return_value=Result()),
+                mock.patch.object(maintenance, "_pr_evidence", return_value=None),
+            ):
+                result = maintenance._maintenance_stage(record, "21", self._contract(root))
+            self.assertEqual(result["stage"], "committed")
+            self.assertEqual(result["remoteHead"], self.OLD_REMOTE)
+            self.assertEqual(result["remoteRelation"], "ancestor")
+
     def test_consumed_receipt_stages_resume_from_commit_push_and_draft_pr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -140,7 +167,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 with self.assertRaisesRegex(maintenance.MaintenanceError, "security-reviewer"):
                     maintenance._require_review_evidence(record, "21")
 
-    def test_pr_create_is_idempotent_for_exact_existing_draft(self) -> None:
+    def test_pr_create_uses_full_direct_upgrade_diff_not_latest_receipt_delta(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             record = self._record(root)
@@ -149,8 +176,12 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             body_path.write_text("body\n", encoding="utf-8")
             receipt = {
                 "commit_sha": self.HEAD,
-                "changed_paths": [".automation/bin/example.py"],
+                "changed_paths": [".automation/bin/second-upgrade-only.py"],
             }
+            full_paths = [
+                ".automation/bin/first-upgrade.py",
+                ".automation/bin/second-upgrade-only.py",
+            ]
             live = {
                 "number": 22,
                 "title": "21: maintenance",
@@ -162,12 +193,6 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 "isCrossRepository": False,
                 "state": "OPEN",
             }
-
-            def fake_git(*args, cwd=None, check=True):
-                if args[:2] == ("diff", "--name-only"):
-                    return ".automation/bin/example.py"
-                return ""
-
             with (
                 mock.patch.object(maintenance.lifecycle, "require_local_task", return_value=record),
                 mock.patch.object(
@@ -179,13 +204,12 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(maintenance, "_remote_head", return_value=self.HEAD),
                 mock.patch.object(maintenance, "_require_review_evidence"),
                 mock.patch.object(maintenance.agent_core, "verify"),
-                mock.patch.object(maintenance.agent_core, "_base_revision", return_value=self.BASE),
-                mock.patch.object(maintenance.agent_core, "git", side_effect=fake_git),
+                mock.patch.object(maintenance, "_direct_upgrade_publication", return_value=full_paths),
                 mock.patch.object(
                     maintenance.publication,
                     "canonical_metadata",
                     return_value=("21: maintenance", "body\n"),
-                ),
+                ) as metadata,
                 mock.patch.object(maintenance.publication, "write_metadata"),
                 mock.patch.object(
                     maintenance.agent_core,
@@ -200,10 +224,13 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             ):
                 result = maintenance.maintenance_pr_create(root, "21")
             gh_mock.assert_not_called()
+            metadata.assert_called_once_with(
+                root, "21", head=self.HEAD, changed_paths=full_paths
+            )
             self.assertEqual(result["stage"], "draft-pr-created")
             self.assertEqual(result["pr"], 22)
 
-    def test_finalize_uses_dedicated_initialized_to_merged_transition(self) -> None:
+    def test_finalize_revalidates_direct_upgrade_and_uses_dedicated_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task_root = root / "task"
@@ -213,6 +240,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             receipt = {"commit_sha": self.HEAD}
             merged = {"mergeCommitOid": self.MERGE}
             sync = {"branch": "main", "revision": "e" * 40, "updated": True}
+            publication_paths = [".automation/bin/a.py"]
 
             class Result:
                 returncode = 0
@@ -221,6 +249,11 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(maintenance.lifecycle, "require_main_worktree"),
                 mock.patch.object(maintenance, "_stored_contract", return_value=(record, contract)),
                 mock.patch.object(maintenance, "_validate_consumed_receipt", return_value=receipt),
+                mock.patch.object(
+                    maintenance,
+                    "_direct_upgrade_publication",
+                    side_effect=[publication_paths, publication_paths],
+                ) as reconstruct,
                 mock.patch.object(maintenance, "_merged_pr", side_effect=[merged, merged]),
                 mock.patch.object(maintenance.lifecycle, "synchronize_default_branch", return_value=sync),
                 mock.patch.object(maintenance.lifecycle, "run", return_value=Result()),
@@ -229,6 +262,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(maintenance.lifecycle, "append_task_evidence"),
             ):
                 result = maintenance.maintenance_finalize(root, "21", 22)
+            self.assertEqual(reconstruct.call_count, 2)
             mark.assert_called_once_with(record, "21")
             self.assertEqual(result["status"], "FINALIZED")
             self.assertEqual(result["stage"], "merged")
