@@ -98,6 +98,7 @@
       "just integrate::check *": "allow",
       "just integrate::finalize *": "allow",
       "just agent::push *": "ask",
+      "just agent::discard-pristine *": "ask",
       "just agent::cleanup *": "ask",
       "just integrate::merge *": "ask",
       "git add *": "deny",

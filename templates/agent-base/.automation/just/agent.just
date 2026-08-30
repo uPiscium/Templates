@@ -1,6 +1,7 @@
 root := justfile_directory()
 script := root / ".automation/bin/agent_core.py"
 lifecycle := root / ".automation/bin/task_lifecycle.py"
+discard_pristine := root / ".automation/bin/discard_pristine.py"
 init := root / ".automation/bin/init_context.py"
 
 [working-directory: root]
@@ -94,6 +95,10 @@ pr-edit task:
 [working-directory: root]
 pr-ready task:
     python3 {{quote(script)}} agent pr-ready {{quote(task)}}
+
+[working-directory: root]
+discard-pristine task:
+    python3 {{quote(discard_pristine)}} {{quote(task)}}
 
 [working-directory: root]
 cleanup task:
