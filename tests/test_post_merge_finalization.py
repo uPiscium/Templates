@@ -293,6 +293,31 @@ class PostMergeFinalizationTest(RepositoryFixture):
             command("git", "push", "origin", "--delete", branch, cwd=task_worktree)
         return task_worktree, task_head, evidence
 
+    def cancelled_cleanup_fixture(self, *, publish_commit: bool) -> tuple[Path, str, dict]:
+        task_worktree = self.start_task()
+        branch = command("git", "branch", "--show-current", cwd=task_worktree)
+        if publish_commit:
+            (task_worktree / "cancelled.txt").write_text("cancelled\n", encoding="utf-8")
+            command("git", "add", "cancelled.txt", cwd=task_worktree)
+            command("git", "commit", "-m", "cancelled task", cwd=task_worktree)
+            command("git", "push", "-u", "origin", branch, cwd=task_worktree)
+        task_head = command("git", "rev-parse", "HEAD", cwd=task_worktree)
+        state = task_worktree / ".task-state/task.md"
+        state.write_text(
+            state.read_text(encoding="utf-8").replace("Status: initialized", "Status: cancelled"),
+            encoding="utf-8",
+        )
+        evidence = {
+            "number": 94,
+            "state": "CLOSED",
+            "headRefName": branch,
+            "headRefOid": task_head,
+            "baseRefName": "main",
+            "isCrossRepository": False,
+            "mergeCommit": None,
+        }
+        return task_worktree, task_head, evidence
+
     def test_standard_squash_flow_and_idempotent_retry(self) -> None:
         task_worktree, task_head, evidence = self.prepare()
         self.finalize(evidence)
@@ -479,6 +504,93 @@ class PostMergeFinalizationTest(RepositoryFixture):
         with self.assertRaisesRegex(lifecycle.LifecycleError, "unpushed commit"):
             lifecycle.task_cleanup(self.repo, "TASK-1")
         self.assertTrue(task_worktree.exists())
+
+    def test_cancelled_tampered_task_base_cannot_hide_unpublished_commit(self) -> None:
+        task_worktree = self.start_task()
+        (task_worktree / "unpublished.txt").write_text("unpublished\n", encoding="utf-8")
+        command("git", "add", "unpublished.txt", cwd=task_worktree)
+        command("git", "commit", "-m", "unpublished", cwd=task_worktree)
+        task_head = command("git", "rev-parse", "HEAD", cwd=task_worktree)
+        state = task_worktree / ".task-state/task.md"
+        original_base = lifecycle.extract_identity_value(state, "Base revision")
+        self.assertIsNotNone(original_base)
+        state.write_text(
+            state.read_text(encoding="utf-8")
+            .replace("Status: initialized", "Status: cancelled")
+            .replace(f"Base revision: {original_base}", f"Base revision: {task_head}"),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(lifecycle.LifecycleError, "not trusted"):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cancelled_receipt_retry_rejects_deleted_published_upstream(self) -> None:
+        task_worktree, task_head, evidence = self.cancelled_cleanup_fixture(publish_commit=True)
+        branch = evidence["headRefName"]
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        command("git", "push", "origin", "--delete", branch, cwd=self.repo)
+        with self.cleanup_run(evidence), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "unpublished commit"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertEqual(task_head, command("git", "rev-parse", branch, cwd=self.repo))
+        self.assertTrue(lifecycle.cleanup_receipt_path(self.repo, "TASK-1").exists())
+
+    def test_cancelled_receipt_retry_rejects_rewound_published_upstream(self) -> None:
+        task_worktree, task_head, evidence = self.cancelled_cleanup_fixture(publish_commit=True)
+        branch = evidence["headRefName"]
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        command("git", "push", "--force", "origin", f"main:refs/heads/{branch}", cwd=self.repo)
+        with self.cleanup_run(evidence), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "unpublished commit"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertEqual(task_head, command("git", "rev-parse", branch, cwd=self.repo))
+        self.assertTrue(lifecycle.cleanup_receipt_path(self.repo, "TASK-1").exists())
+
+    def test_cancelled_tampered_receipt_base_cannot_hide_unpublished_commit(self) -> None:
+        task_worktree, task_head, evidence = self.cancelled_cleanup_fixture(publish_commit=True)
+        branch = evidence["headRefName"]
+        receipt = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        command("git", "push", "origin", "--delete", branch, cwd=self.repo)
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["evidence"]["base_revision"] = task_head
+        receipt.write_text(json.dumps(payload), encoding="utf-8")
+        with self.cleanup_run(evidence), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "not trusted"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertEqual(task_head, command("git", "rev-parse", branch, cwd=self.repo))
+        self.assertTrue(receipt.exists())
+
+    def test_cancelled_pristine_receipt_retry_uses_base_revision_fallback(self) -> None:
+        task_worktree, _, evidence = self.cancelled_cleanup_fixture(publish_commit=False)
+        branch = evidence["headRefName"]
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(lifecycle.cleanup_receipt_path(self.repo, "TASK-1").exists())
+        branch_check = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=self.repo
+        )
+        self.assertNotEqual(branch_check.returncode, 0)
 
     def test_cleanup_removes_only_expected_registration_and_branch(self) -> None:
         task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
