@@ -92,12 +92,123 @@ class AutomationJustPathTest(unittest.TestCase):
         text = (ROOT / "just" / "agent-core.just").read_text(encoding="utf-8")
         self.assertIn("maintenance-finalize target task pr expected_implementation_revision:", text)
         self.assertIn(
-            '"$python" -I {{quote(tool)}} maintenance-finalize '
+            '"$resolved_python" -I {{quote(tool)}} maintenance-finalize '
             "{{quote(target)}} {{quote(task)}} {{quote(pr)}} "
             "{{quote(expected_implementation_revision)}}",
             text,
         )
-        self.assertIn("/nix/store/*/bin/python3|/usr/bin/python3", text)
+        self.assertIn("os.path.realpath(sys.executable)", text)
+        self.assertIn("/run/current-system/sw/bin/python3", text)
+
+    @staticmethod
+    def _fake_python(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1-}\" = -I ] && [ \"${2-}\" = -c ]; then\n"
+            "  printf %s \"${FAKE_PYTHON_CANONICAL-}\"\n"
+            "  exit \"${FAKE_PYTHON_RESOLUTION_STATUS-0}\"\n"
+            "fi\n"
+            "printf '%s\\n' \"$0 $*\" > \"$FAKE_PYTHON_LOG\"\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
+    @staticmethod
+    def _maintenance_recipe_command(root: Path) -> str:
+        line = next(
+            line.strip()
+            for line in (ROOT / "just" / "agent-core.just").read_text(encoding="utf-8").splitlines()
+            if "selected_python=" in line
+        )
+        replacements = {
+            "/nix/store": str(root / "nix/store"),
+            "/usr/bin/python3": str(root / "usr/bin/python3"),
+            "/run/current-system/sw/bin/python3": str(root / "run/current-system/sw/bin/python3"),
+            "/nix/var/nix/profiles/default/bin/python3": str(
+                root / "nix/var/nix/profiles/default/bin/python3"
+            ),
+            "{{quote(tool)}}": "bridge.py",
+            "{{quote(target)}}": "consumer-main",
+            "{{quote(task)}}": "22",
+            "{{quote(pr)}}": "23",
+            "{{quote(expected_implementation_revision)}}": "a" * 40,
+        }
+        for old, new in replacements.items():
+            line = line.replace(old, shlex.quote(new))
+        return line
+
+    def _run_python_resolver(
+        self, root: Path, selected: Path, canonical: str
+    ) -> subprocess.CompletedProcess[str]:
+        log = root / "executed.log"
+        environment = {
+            "PATH": str(selected.parent),
+            "FAKE_PYTHON_CANONICAL": canonical,
+            "FAKE_PYTHON_LOG": str(log),
+        }
+        return subprocess.run(
+            ("/bin/sh", "-cu", self._maintenance_recipe_command(root)),
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+
+    def test_trusted_python_resolver_accepts_direct_store_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "nix/store/python/bin/python3"
+            self._fake_python(selected)
+            result = self._run_python_resolver(root, selected, str(selected))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((root / "executed.log").is_file())
+
+    def test_trusted_python_resolver_executes_profile_symlink_store_target(self) -> None:
+        profiles = (
+            "run/current-system/sw/bin/python3",
+            "nix/var/nix/profiles/default/bin/python3",
+        )
+        for relative in profiles:
+            with self.subTest(profile=relative), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                target = root / "nix/store/python/bin/python3.14"
+                selected = root / relative
+                self._fake_python(target)
+                selected.parent.mkdir(parents=True)
+                selected.symlink_to(target)
+                result = self._run_python_resolver(root, selected, str(target))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                executed = (root / "executed.log").read_text(encoding="utf-8")
+                self.assertTrue(executed.startswith(str(target) + " "), executed)
+
+    def test_trusted_python_resolver_rejects_user_controlled_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "user/bin/python3"
+            self._fake_python(selected)
+            result = self._run_python_resolver(root, selected, str(selected))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "executed.log").exists())
+
+    def test_trusted_python_resolver_rejects_broken_or_ambiguous_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            selected = root / "run/current-system/sw/bin/python3"
+            selected.parent.mkdir(parents=True)
+            selected.symlink_to(root / "missing/python3")
+            broken = self._run_python_resolver(root, selected, "")
+            self.assertNotEqual(broken.returncode, 0)
+
+            self._fake_python(selected.parent / "python3-real")
+            selected.unlink()
+            selected.symlink_to(selected.parent / "python3-real")
+            ambiguous = self._run_python_resolver(
+                root,
+                selected,
+                str(root / "nix/store/python/bin/python3") + "\nextra",
+            )
+            self.assertNotEqual(ambiguous.returncode, 0)
+            self.assertFalse((root / "executed.log").exists())
 
     def test_dry_runs_select_main_repository_script(self) -> None:
         self._assert_dry_run_selects_local_script(linked=False)

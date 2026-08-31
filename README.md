@@ -183,6 +183,10 @@ clean. The target must be the consumer's actual clean default-branch/Main
 worktree, not a Task worktree or a source checkout. The bridge verifies the
 source bootstrap and loads the maintenance implementation from verified Git
 blobs at that revision; it does not copy or execute live source files.
+The launcher requires `python3` to resolve either directly from the immutable
+Nix store, through the root-controlled NixOS system/default profile, or from
+the trusted `/usr/bin/python3` system installation. It canonicalizes approved
+profile symlinks and executes only the resolved immutable store/system target.
 
 The command performs the canonical contract, receipt, publication, review,
 repository, and worktree validations, re-reads the exact merged PR and its
