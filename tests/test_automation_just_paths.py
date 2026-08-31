@@ -86,6 +86,19 @@ class AutomationJustPathTest(unittest.TestCase):
             text,
         )
 
+    def test_source_maintenance_finalize_recipe_uses_expected_revision(self) -> None:
+        root_justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+        self.assertIn('set shell := ["/bin/sh", "-cu"]', root_justfile)
+        text = (ROOT / "just" / "agent-core.just").read_text(encoding="utf-8")
+        self.assertIn("maintenance-finalize target task pr expected_implementation_revision:", text)
+        self.assertIn(
+            '"$python" -I {{quote(tool)}} maintenance-finalize '
+            "{{quote(target)}} {{quote(task)}} {{quote(pr)}} "
+            "{{quote(expected_implementation_revision)}}",
+            text,
+        )
+        self.assertIn("/nix/store/*/bin/python3|/usr/bin/python3", text)
+
     def test_dry_runs_select_main_repository_script(self) -> None:
         self._assert_dry_run_selects_local_script(linked=False)
 

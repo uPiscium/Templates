@@ -167,6 +167,37 @@ Main
 
 Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write path. After merge, Main uses `just integrate::finalize <task> <pr>` to bind actual GitHub merge evidence to a narrow fast-forward-only default-branch synchronization and the dedicated `integration-pending -> merged` transition. `task-start` repeats that synchronization at execution time. Push, merge, cleanup, unknown Bash, and designated external paths require Ask; finalization is non-destructive and cleanup remains separate.
 
+### Issue #112: source-side first-adoption finalization
+
+When a consumer's installed Agent Core is too old to run its maintenance
+finalizer, run this source-side bootstrap from a clean, trusted Templates
+source checkout at the exact expected implementation revision:
+
+```sh
+just agent-core::maintenance-finalize <consumer-main-worktree> <task> <pr> <expected-implementation-revision>
+```
+
+The source checkout must be the trusted Templates worktree at the exact full
+`HEAD` named by `<expected-implementation-revision>`, with the relevant source
+clean. The target must be the consumer's actual clean default-branch/Main
+worktree, not a Task worktree or a source checkout. The bridge verifies the
+source bootstrap and loads the maintenance implementation from verified Git
+blobs at that revision; it does not copy or execute live source files.
+
+The command performs the canonical contract, receipt, publication, review,
+repository, and worktree validations, re-reads the exact merged PR and its
+publication metadata, and synchronizes the consumer default branch
+fast-forward-only. It revalidates the merge and publication evidence after
+synchronization, then records the dedicated maintenance terminal transition
+`initialized -> merged`. A repeated invocation is exactly idempotent: it
+requires the same finalized publication evidence and returns the already-
+finalized result without a second lifecycle transition. Cleanup remains a
+separate approval-gated operation. Ordinary consumers continue to use
+`just automation::maintenance-finalize <task> <pr>`; this bridge adds no generic authority
+or arbitrary consumer mutation surface. AKV #22/#23 are the motivating example
+for this first-adoption path; that example is not claimed as executed. Agent
+Core VERSION remains 3.
+
 Issue #103 permits that separate guarded cleanup to recover when GitHub has
 already deleted a merged Task's remote branch. A configured upstream is not
 treated as a live revision: cleanup queries origin directly, requires status
