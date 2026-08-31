@@ -528,7 +528,12 @@ class OpenCodeContractTest(unittest.TestCase):
             env["OPENCODE_CONFIG_HOME"] = str(config)
 
             effective = {}
-            for agent in ("build", "maintenance-orchestrator"):
+            for agent in (
+                "build",
+                "maintenance-orchestrator",
+                "reviewer",
+                "security-reviewer",
+            ):
                 result = subprocess.run(
                     [opencode, "debug", "agent", agent, "--pure"],
                     cwd=project,
@@ -549,17 +554,21 @@ class OpenCodeContractTest(unittest.TestCase):
             return matches[-1]
 
         expected = {
-            "just automation::maintenance-check *": ("allow", "allow"),
-            "just automation::maintenance-review-record *": ("allow", "deny"),
-            "just automation::maintenance-pr-create *": ("deny", "allow"),
-            "just automation::maintenance-finalize *": ("allow", "deny"),
+            "just automation::maintenance-check *": ("allow", "allow", "allow"),
+            "just automation::maintenance-review-record *": ("allow", "deny", "deny"),
+            "just automation::maintenance-pr-create *": ("deny", "allow", "deny"),
+            "just automation::maintenance-finalize *": ("allow", "deny", "deny"),
         }
-        for command, (build_action, maintenance_action) in expected.items():
+        for command, (build_action, maintenance_action, leaf_action) in expected.items():
             with self.subTest(command=command):
                 self.assertEqual(last_action(effective["build"], command), build_action)
                 self.assertEqual(
                     last_action(effective["maintenance-orchestrator"], command),
                     maintenance_action,
+                )
+                self.assertEqual(last_action(effective["reviewer"], command), leaf_action)
+                self.assertEqual(
+                    last_action(effective["security-reviewer"], command), leaf_action
                 )
 
 
