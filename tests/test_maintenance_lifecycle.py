@@ -303,7 +303,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 ):
                     maintenance._require_review_evidence(record, "21", new_receipt)
 
-    def test_main_only_review_recorder_persists_exact_subject_evidence(self) -> None:
+    def test_review_recorder_persists_exact_subject_without_physical_main_guard(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             record = self._record(root / "task")
@@ -311,7 +311,11 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             units = {"schema_version": 1, "task_id": "21", "units": {}}
             evidence = "status: COMPLETED; no findings for the exact maintenance subject"
             with (
-                mock.patch.object(maintenance.lifecycle, "require_main_worktree") as main_only,
+                mock.patch.object(
+                    maintenance.lifecycle,
+                    "require_main_worktree",
+                    side_effect=AssertionError("review recording must not inspect physical main"),
+                ) as main_only,
                 mock.patch.object(
                     maintenance, "_validated_contract", return_value=(record, self._contract(record.path))
                 ),
@@ -330,7 +334,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 result = maintenance.maintenance_review_record(
                     root, "21", "security-reviewer", evidence
                 )
-            main_only.assert_called_once_with(root)
+            main_only.assert_not_called()
             persisted = persist.call_args.args[1]
             unit = persisted["units"][result["workUnit"]]
             self.assertEqual(unit["state"], "completed")
@@ -342,15 +346,182 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             )
             self.assertEqual(unit["transitions"][-1]["evidence"], evidence)
 
-            with (
-                mock.patch.object(maintenance.lifecycle, "require_main_worktree"),
-                self.assertRaisesRegex(
+            with self.assertRaisesRegex(
                     maintenance.MaintenanceError, "must start with status: COMPLETED;"
-                ),
             ):
                 maintenance.maintenance_review_record(
                     root, "21", "security-reviewer", "status: BLOCKED; no result"
                 )
+
+    def test_task_worktree_dogfood_review_gate_is_exact_and_fails_closed(self) -> None:
+        """Exercise Issue #110 from a linked worktree, not a synthetic record."""
+        with tempfile.TemporaryDirectory() as directory:
+            temporary = Path(directory)
+            repository = temporary / "repository"
+            remote = temporary / "remote.git"
+            task = temporary / "task-21"
+            repository.mkdir()
+            self._init_repo(repository)
+            self._git(temporary, "init", "--bare", str(remote))
+            self._git(repository, "remote", "add", "origin", "https://github.com/example/repo.git")
+            self._git(repository, "remote", "add", "fixture-remote", str(remote))
+
+            template = (
+                ROOT / "components" / "agent-core" / ".automation" / "templates" / "task-state.md"
+            ).read_text(encoding="utf-8")
+            self._write(repository, ".automation/templates/task-state.md", template)
+            self._write(repository, ".automation/VERSION", "3\n")
+            self._write(repository, ".automation/bin/maintenance.py", "recipe: pre-v3.1.6\n")
+            base = self._commit(repository, "pre-v3.1.6 Agent Core")
+            self._git(repository, "push", "fixture-remote", "main")
+            self._git(repository, "update-ref", "refs/remotes/origin/main", base)
+            self._git(
+                repository,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            )
+            self._git(repository, "worktree", "add", "-b", "task/21-agent-core-v3-1-5", str(task), base)
+            self._git(repository, "push", "fixture-remote", "task/21-agent-core-v3-1-5")
+            common_git = maintenance.upgrade.common_git_dir(task)
+            (common_git / "info" / "exclude").write_text("/.task-state/\n", encoding="utf-8")
+
+            self._write(
+                task,
+                ".task-state/task.md",
+                template.replace("@@TASK_ID@@", "21")
+                .replace("@@BRANCH@@", "task/21-agent-core-v3-1-5")
+                .replace("@@WORKTREE@@", str(task))
+                .replace("@@BASE_BRANCH@@", "main")
+                .replace("@@BASE_REVISION@@", base),
+            )
+            payload = {
+                "number": 21,
+                "url": "https://github.com/example/repo/issues/21",
+                "title": "Agent Core maintenance v3.1.6",
+                "body": "Upgrade the Agent Core marker and maintenance recipe.",
+                "state": "open",
+                "repository": "example/repo",
+                "labels": ["maintenance"],
+                "assignees": [],
+                "milestone": None,
+            }
+            digest = maintenance.task_contract._digest(payload)
+            self._write(task, ".task-state/issue.json", json.dumps({
+                "schema_version": 1, "issue": 21, "repository": "example/repo",
+                "sha256": digest, "payload": payload,
+            }) + "\n")
+            self._write(task, ".task-state/contract.json", json.dumps({
+                "schema_version": 1, "issue": 21, "repository": "example/repo",
+                "snapshot": ".task-state/issue.json", "sha256": digest,
+            }) + "\n")
+            state = task / ".task-state/task.md"
+            state.write_text(
+                maintenance.task_contract._canonical_state(state.read_text(encoding="utf-8"), 21, digest),
+                encoding="utf-8",
+            )
+
+            self._write(task, ".automation/VERSION", "3\n")
+            self._write(task, ".automation/bin/maintenance.py", "recipe: v3.1.6\n")
+            commit = self._commit(task, "upgrade Agent Core to v3.1.6")
+            # Keep the fixture remote at the previous commit while the local Task advances.
+            self._git(repository, "push", "--force", "fixture-remote", f"{base}:refs/heads/task/21-agent-core-v3-1-5")
+
+            changed_paths = [".automation/bin/maintenance.py"]
+            receipt = {
+                "schema_version": 1,
+                "status": "consumed",
+                "task_id": "21",
+                "branch": "task/21-agent-core-v3-1-5",
+                "worktree": str(task),
+                "source": str(repository),
+                "source_revision": base,
+                "current_version": "3",
+                "upstream_version": "3",
+                "changed_paths": changed_paths,
+                "authority_head": base,
+                "authority_nonce": "a" * 64,
+                "path_fingerprints": {
+                    path: maintenance.upgrade.file_fingerprint(task, path) for path in changed_paths
+                },
+                "commit_sha": commit,
+            }
+            self._write(task, ".task-state/automation-maintenance.consumed.json", json.dumps(receipt) + "\n")
+
+            external = mock.patch.object(
+                maintenance.task_contract, "_validate_authoritative_issue"
+            )
+            with (
+                external,
+                mock.patch.object(maintenance, "_remote_head", return_value=base),
+                mock.patch.object(maintenance, "_pr_evidence", return_value=None),
+            ):
+                ready = maintenance.maintenance_check(task, "21")
+                validated_receipt = maintenance._validate_consumed_receipt(
+                    maintenance.lifecycle.WorktreeRecord(
+                        task, "task/21-agent-core-v3-1-5", commit
+                    ),
+                    "21",
+                )
+                self.assertEqual(validated_receipt["commit_sha"], commit)
+                self.assertEqual(
+                    validated_receipt["path_fingerprints"], receipt["path_fingerprints"]
+                )
+                self.assertEqual(ready["stage"], "committed")
+                self.assertEqual(ready["taskStatus"], "initialized")
+                self.assertEqual(ready["remoteHead"], base)
+                self.assertEqual(ready["remoteRelation"], "ancestor")
+                self.assertIsNone(ready["pr"])
+                self.assertEqual(ready["reviewEvidence"], {"reviewer": False, "security-reviewer": False})
+
+                evidence = "status: COMPLETED; exact Task #21 upgrade evidence"
+                for role in ("reviewer", "security-reviewer"):
+                    recorded = maintenance.maintenance_review_record(task, "21", role, evidence)
+                    self.assertEqual(recorded["status"], "RECORDED")
+                    units = maintenance.lifecycle.read_work_units(
+                        maintenance.lifecycle.WorktreeRecord(
+                            task, "task/21-agent-core-v3-1-5", commit
+                        ),
+                        "21",
+                    )
+                    self.assertEqual(
+                        units["units"][recorded["workUnit"]]["objective"],
+                        ready["reviewObjectives"][role],
+                    )
+                    duplicate = maintenance.maintenance_review_record(task, "21", role, evidence)
+                    self.assertEqual(duplicate["status"], "ALREADY_RECORDED")
+                    with self.assertRaisesRegex(
+                        maintenance.MaintenanceError, "different or invalid completed evidence"
+                    ):
+                        maintenance.maintenance_review_record(
+                            task,
+                            "21",
+                            role,
+                            "status: COMPLETED; different evidence for the same subject",
+                        )
+
+                checked = maintenance.maintenance_check(task, "21")
+                self.assertEqual(checked["reviewEvidence"], {"reviewer": True, "security-reviewer": True})
+                maintenance._require_review_evidence(
+                    maintenance.lifecycle.WorktreeRecord(task, "task/21-agent-core-v3-1-5", commit),
+                    "21",
+                    validated_receipt,
+                )
+
+                receipt["source_revision"] = "b" * 40
+                self._write(task, ".task-state/automation-maintenance.consumed.json", json.dumps(receipt) + "\n")
+                stale = maintenance.maintenance_check(task, "21")
+                self.assertEqual(stale["taskStatus"], "initialized")
+                self.assertEqual(stale["reviewEvidence"], {"reviewer": False, "security-reviewer": False})
+                with self.assertRaisesRegex(maintenance.MaintenanceError, "reviewer, security-reviewer"):
+                    maintenance._require_review_evidence(
+                        maintenance.lifecycle.WorktreeRecord(task, "task/21-agent-core-v3-1-5", commit),
+                        "21",
+                        maintenance._validate_consumed_receipt(
+                            maintenance.lifecycle.WorktreeRecord(task, "task/21-agent-core-v3-1-5", commit), "21"
+                        ),
+                    )
+                self.assertNotIn("merged", maintenance.lifecycle.LINEAR_TRANSITIONS["initialized"])
 
     def test_pr_create_uses_full_direct_upgrade_diff_not_latest_receipt_delta(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

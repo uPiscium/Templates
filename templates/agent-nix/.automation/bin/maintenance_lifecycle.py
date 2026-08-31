@@ -439,7 +439,6 @@ def _require_review_evidence(
 def maintenance_review_record(
     root_path: Path, task: str, role: str, evidence: str
 ) -> dict:
-    lifecycle.require_main_worktree(root_path)
     if role not in {"reviewer", "security-reviewer"}:
         raise MaintenanceError("maintenance review role must be reviewer or security-reviewer")
     lifecycle.validate_evidence(evidence)
@@ -459,13 +458,26 @@ def maintenance_review_record(
                 and unit.get("objective") == objective
                 and unit.get("state") == "completed"
             ):
-                return {
-                    "status": "ALREADY_RECORDED",
-                    "task": task,
-                    "role": role,
-                    "workUnit": identifier,
-                    "reviewSubjectSha256": subject,
-                }
+                transitions = unit.get("transitions")
+                transition = transitions[-1] if isinstance(transitions, list) and transitions else None
+                if (
+                    unit.get("semantic_sha256") == lifecycle.semantic_digest(objective)
+                    and isinstance(transition, dict)
+                    and transition.get("to") == "completed"
+                    and transition.get("evidence") == evidence
+                    and transition.get("evidence_sha256") == lifecycle.semantic_digest(evidence)
+                ):
+                    return {
+                        "status": "ALREADY_RECORDED",
+                        "task": task,
+                        "role": role,
+                        "workUnit": identifier,
+                        "reviewSubjectSha256": subject,
+                    }
+                raise MaintenanceError(
+                    "maintenance review role already has different or invalid completed evidence "
+                    "for the exact review subject"
+                )
         identifier = lifecycle.next_work_unit_id(value, task)
         unit = lifecycle.new_work_unit(identifier, role, objective)
         now = lifecycle.utc_now()
