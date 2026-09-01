@@ -1,5 +1,7 @@
 root := justfile_directory()
 tool := root / "tools/automation_recovery_bridge.py"
+release_gate := root / "tools/agent_core_release_gate.py"
+release_gate_launcher := root / "tools/run_agent_core_release_gate.sh"
 set shell := ["/bin/sh", "-cu"]
 
 [working-directory: root]
@@ -9,6 +11,22 @@ recover-maintenance-authority target:
 [working-directory: root]
 commit-recovered-maintenance target task message="":
     python3 -I {{quote(tool)}} commit-recovered-maintenance {{quote(target)}} {{quote(task)}} {{quote(message)}}
+
+[working-directory: root]
+release-candidate-check pr:
+    /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-candidate-check {{quote(pr)}}
+
+[working-directory: root]
+release-candidate-worktree pr path:
+    /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-candidate-worktree {{quote(pr)}} {{quote(path)}}
+
+[working-directory: root]
+dogfood-evidence-record pr operation task="" downstream_pr="":
+    /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} dogfood-evidence-record {{quote(pr)}} {{quote(operation)}} --task {{quote(task)}} --downstream-pr {{quote(downstream_pr)}}
+
+[working-directory: root]
+release-gate-check pr merge_commit dogfood_head dogfood_tree version="":
+    /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-gate-check {{quote(pr)}} {{quote(merge_commit)}} {{quote(dogfood_head)}} {{quote(dogfood_tree)}} --version {{quote(version)}}
 
 [working-directory: root]
 recover-task-contract-from-issue target issue:

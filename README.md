@@ -149,6 +149,11 @@ Generated Agent-ready repositories include a repository-local `plan` agent for r
 
 Main schedules Tasks. Each Task owns one branch, one repo-local worktree under `.worktrees/`, one disposable `.task-state/task.md`, and one Task Orchestrator. Leaf agents cannot delegate or mutate Task State.
 
+For downstream-sensitive Agent Core changes, use the documented release gate
+from Issue through exact-revision AKV dogfood and post-merge tree equality:
+[`docs/agent-core-release-gate.md`](docs/agent-core-release-gate.md). It is
+human-gated and does not automate merge or release publication.
+
 Typical flow:
 
 ```text
