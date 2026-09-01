@@ -18,6 +18,8 @@ from typing import Any
 
 
 CANONICAL_REPO = "upiscium/Templates"
+CANONICAL_GIT_URL = "https://github.com/upiscium/Templates.git"
+CANONICAL_WORKFLOW_PATH = ".github/workflows/template-ci.yml"
 DOWNSTREAM_REPO = "upiscium/AgentKnowledgeVault"
 DEFAULT_BRANCH = "main"
 EVIDENCE_ROOT_NAME = ".agent-core-release-gate/evidence"
@@ -26,6 +28,16 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 PR_RE = re.compile(r"[1-9][0-9]{0,8}")
 OPERATION_RE = re.compile(r"[a-z][a-z0-9._-]{0,63}")
 VERSION_RE = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?")
+CANONICAL_REMOTE_RE = re.compile(
+    r"https://github\.com/upiscium/Templates(?:\.git)?",
+    re.IGNORECASE,
+)
+UNSAFE_LOCAL_CONFIG_RE = re.compile(
+    r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|filter\..*|protocol\..*|"
+    r"core\.(?:gitproxy|hookspath|sshcommand|worktree)|"
+    r"remote\..+\.(?:proxy|proxyauthmethod|receivepack|uploadpack|vcs))",
+    re.IGNORECASE,
+)
 
 _TRUSTED_EXECUTABLES: dict[str, Path] = {}
 
@@ -245,6 +257,110 @@ query($owner:String!,$name:String!,$number:Int!){
             raise GateError("statusCheckRollup contains an unknown context type")
 
 
+def workflow_run_subject(
+    run: Any,
+    workflow_id: int,
+    expected_head: str,
+    expected_pr: int,
+) -> tuple[int, int]:
+    if not isinstance(run, dict):
+        raise GateError("Template CI workflow run is invalid")
+    run_id = run.get("id")
+    attempt = run.get("run_attempt")
+    if (
+        isinstance(run_id, bool)
+        or not isinstance(run_id, int)
+        or run_id <= 0
+        or isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt <= 0
+    ):
+        raise GateError("Template CI workflow run identity is invalid")
+    if (
+        run.get("workflow_id") != workflow_id
+        or run.get("path") != CANONICAL_WORKFLOW_PATH
+        or run.get("event") != "pull_request"
+        or run.get("head_sha") != expected_head
+    ):
+        raise GateError("Template CI workflow run is not bound to the exact candidate")
+    pull_requests = run.get("pull_requests")
+    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+        raise GateError("Template CI workflow run has ambiguous pull request identity")
+    associated = pull_requests[0]
+    if (
+        not isinstance(associated, dict)
+        or associated.get("number") != expected_pr
+        or (associated.get("head") or {}).get("sha") != expected_head
+        or (associated.get("head") or {}).get("repo", {}).get("url")
+        != f"https://api.github.com/repos/{CANONICAL_REPO}"
+        or (associated.get("base") or {}).get("ref") != DEFAULT_BRANCH
+        or (associated.get("base") or {}).get("repo", {}).get("url")
+        != f"https://api.github.com/repos/{CANONICAL_REPO}"
+    ):
+        raise GateError("Template CI workflow run belongs to another pull request")
+    return run_id, attempt
+
+
+def exact_template_ci_run(
+    root: Path,
+    workflow_id: int,
+    expected_head: str,
+    expected_pr: int,
+) -> dict[str, Any]:
+    response = gh(
+        [
+            "api",
+            f"repos/{CANONICAL_REPO}/actions/workflows/{workflow_id}/runs"
+            f"?event=pull_request&head_sha={expected_head}&per_page=100",
+        ],
+        root,
+    )
+    if not isinstance(response, dict):
+        raise GateError("Template CI workflow runs response is invalid")
+    runs = response.get("workflow_runs")
+    total = response.get("total_count")
+    if isinstance(total, bool) or not isinstance(total, int) or not isinstance(runs, list):
+        raise GateError("Template CI workflow runs response is invalid")
+    if total != len(runs):
+        raise GateError("Template CI workflow run pagination is incomplete")
+    if total == 0:
+        raise GateError("Template CI workflow is missing for the exact candidate")
+    if total != 1:
+        raise GateError("Template CI workflow run is ambiguous for the exact candidate")
+    workflow_run_subject(runs[0], workflow_id, expected_head, expected_pr)
+    return runs[0]
+
+
+def check_template_ci(root: Path, expected_head: str, expected_pr: int) -> None:
+    workflow = gh(
+        ["api", f"repos/{CANONICAL_REPO}/actions/workflows/template-ci.yml"],
+        root,
+    )
+    if not isinstance(workflow, dict):
+        raise GateError("canonical Template CI workflow metadata is invalid")
+    workflow_id = workflow.get("id")
+    if (
+        isinstance(workflow_id, bool)
+        or not isinstance(workflow_id, int)
+        or workflow_id <= 0
+        or workflow.get("path") != CANONICAL_WORKFLOW_PATH
+        or workflow.get("state") != "active"
+    ):
+        raise GateError("canonical Template CI workflow is missing or inactive")
+
+    first = exact_template_ci_run(root, workflow_id, expected_head, expected_pr)
+    run_id, attempt = workflow_run_subject(first, workflow_id, expected_head, expected_pr)
+    detail = gh(["api", f"repos/{CANONICAL_REPO}/actions/runs/{run_id}"], root)
+    if workflow_run_subject(detail, workflow_id, expected_head, expected_pr) != (run_id, attempt):
+        raise GateError("Template CI workflow attempt changed during validation")
+    if detail.get("status") != "completed" or detail.get("conclusion") != "success":
+        raise GateError("Template CI workflow is incomplete or unsuccessful")
+
+    final = exact_template_ci_run(root, workflow_id, expected_head, expected_pr)
+    if workflow_run_subject(final, workflow_id, expected_head, expected_pr) != (run_id, attempt):
+        raise GateError("Template CI workflow run changed during validation")
+
+
 def commit_tree(root: Path, commit: str, name: str = "commit") -> str:
     response = gh(["api", f"repos/{CANONICAL_REPO}/git/commits/{commit}"], root)
     if not isinstance(response, dict) or response.get("sha") != commit:
@@ -257,6 +373,7 @@ def candidate(root: Path, number: str, *, require_open: bool = True) -> dict[str
     first = pull_request(root, number)
     head = validate_pr_identity(first, require_open=require_open)
     tree = commit_tree(root, head, "candidate commit")
+    check_template_ci(root, head, int(number))
     check_rollup(root, number, head)
     final = pull_request(root, number)
     final_head = validate_pr_identity(final, require_open=require_open)
@@ -272,22 +389,40 @@ def candidate(root: Path, number: str, *, require_open: bool = True) -> dict[str
     }
 
 
-def worktree_records(root: Path) -> dict[Path, dict[str, Any]]:
-    records: dict[Path, dict[str, Any]] = {}
-    current: dict[str, Any] | None = None
-    for line in git(["worktree", "list", "--porcelain"], root).splitlines() + [""]:
-        if line.startswith("worktree "):
-            if current is not None:
-                records[current["path"]] = current
-            current = {"path": Path(line.removeprefix("worktree ")).resolve(), "detached": False}
-        elif current is not None and line.startswith("HEAD "):
-            current["head"] = line.removeprefix("HEAD ")
-        elif current is not None and line == "detached":
-            current["detached"] = True
-        elif not line and current is not None:
-            records[current["path"]] = current
-            current = None
-    return records
+def validate_git_execution_configuration(root: Path) -> None:
+    raw_names = git(
+        ["config", "--local", "--no-includes", "--null", "--name-only", "--list"],
+        root,
+    )
+    names = [item for item in raw_names.split("\0") if item]
+    for name in names:
+        if UNSAFE_LOCAL_CONFIG_RE.fullmatch(name):
+            raise GateError(f"unsafe local Git configuration is forbidden: {name}")
+
+    if any(name.lower() == "extensions.worktreeconfig" for name in names):
+        worktree_config = git(
+            ["config", "--local", "--bool", "--get", "extensions.worktreeConfig"],
+            root,
+        ).strip()
+        if worktree_config != "true":
+            raise GateError("extensions.worktreeConfig must be a valid true boolean")
+        raw_worktree_names = git(
+            ["config", "--worktree", "--no-includes", "--null", "--name-only", "--list"],
+            root,
+        )
+        for name in (item for item in raw_worktree_names.split("\0") if item):
+            if UNSAFE_LOCAL_CONFIG_RE.fullmatch(name):
+                raise GateError(f"unsafe worktree Git configuration is forbidden: {name}")
+
+
+def validate_local_git_configuration(root: Path) -> str:
+    validate_git_execution_configuration(root)
+
+    raw_urls = git(["remote", "get-url", "--all", "origin"], root)
+    urls = [line for line in raw_urls.splitlines() if line]
+    if len(urls) != 1 or not CANONICAL_REMOTE_RE.fullmatch(urls[0]):
+        raise GateError("origin is not the canonical Templates HTTPS repository")
+    return urls[0]
 
 
 def ensure_owned_directory(path: Path, *, create: bool, private: bool) -> None:
@@ -364,25 +499,25 @@ def verify_worktree(path: Path, expected_head: str, expected_tree: str) -> None:
 
 def create_or_verify_worktree(root: Path, number: str, destination: str) -> dict[str, Any]:
     checked = candidate(root, number)
+    validate_local_git_configuration(root)
     path = safe_worktree_path(root, destination, create_parents=True)
-    records = worktree_records(root)
-    registered = records.get(path.resolve())
-    if registered is not None:
-        if registered.get("head") != checked["head"] or not registered.get("detached"):
-            raise GateError("existing worktree is bound to another revision or branch")
+    if path.exists():
+        validate_git_execution_configuration(path)
         verify_worktree(path, checked["head"], checked["tree"])
     else:
-        if path.exists():
-            raise GateError("existing destination is not a registered worktree")
-        object_type = git(["cat-file", "-t", checked["head"]], root, check=False).strip()
-        if object_type != "commit":
-            git(["fetch", "--no-tags", "origin", checked["head"]], root)
-        if git(["cat-file", "-t", checked["head"]], root).strip() != "commit":
+        path.mkdir(mode=0o700)
+        git(["init", "--quiet", "--initial-branch=main", "."], path)
+        validate_git_execution_configuration(path)
+        git(["fetch", "--no-tags", CANONICAL_GIT_URL, checked["head"]], path)
+        validate_git_execution_configuration(path)
+        if git(["cat-file", "-t", checked["head"]], path).strip() != "commit":
             raise GateError("candidate revision is not an immutable Git commit")
-        local_tree = git(["rev-parse", f"{checked['head']}^{{tree}}"], root).strip()
+        local_tree = git(["rev-parse", f"{checked['head']}^{{tree}}"], path).strip()
         if local_tree != checked["tree"]:
             raise GateError("local candidate object has an unexpected tree")
-        git(["worktree", "add", "--detach", str(path), checked["head"]], root)
+        validate_git_execution_configuration(path)
+        git(["checkout", "--quiet", "--detach", checked["head"]], path)
+        validate_git_execution_configuration(path)
         verify_worktree(path, checked["head"], checked["tree"])
 
     final = candidate(root, number)
@@ -560,11 +695,16 @@ def record_evidence(
 def release_absent(root: Path, version: str) -> None:
     if not VERSION_RE.fullmatch(version):
         raise GateError("invalid release version")
-    status = gh_status(["api", f"repos/{CANONICAL_REPO}/releases/tags/{version}"], root)
-    if status == 200:
+    release_status = gh_status(["api", f"repos/{CANONICAL_REPO}/releases/tags/{version}"], root)
+    if release_status == 200:
         raise GateError("release already exists for the supplied version")
-    if status != 404:
-        raise GateError(f"release lookup returned unexpected HTTP status {status}")
+    if release_status != 404:
+        raise GateError(f"release lookup returned unexpected HTTP status {release_status}")
+    tag_status = gh_status(["api", f"repos/{CANONICAL_REPO}/git/ref/tags/{version}"], root)
+    if tag_status == 200:
+        raise GateError("Git tag already exists for the supplied version")
+    if tag_status != 404:
+        raise GateError(f"Git tag lookup returned unexpected HTTP status {tag_status}")
 
 
 def post_merge_gate(

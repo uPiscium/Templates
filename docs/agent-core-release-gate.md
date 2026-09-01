@@ -20,10 +20,12 @@ Issue -> Draft PR -> full Templates CI/review/security
 * There is no automatic merge and no automatic release publication. A human
   decides whether to merge and separately performs the release.
 * Run the operator surfaces only from a trusted operator process and
-  environment. As with any dynamically linked command, a process already
-  started under hostile loader injection is outside the tool's recoverable
-  trust boundary. The launcher removes loader variables before starting its
-  validated, root-owned Python interpreter.
+  environment on a trusted local filesystem without a hostile same-identity
+  process. Such a process can replace any operator-owned checkout or evidence
+  regardless of mode bits. As with any dynamically linked command, a process
+  already started under hostile loader injection is outside the tool's
+  recoverable trust boundary. The launcher removes loader variables before
+  starting its validated, root-owned Python interpreter.
 * A release tag is not a testing primitive. Tests and dogfood bind directly to
   immutable commit IDs and tree IDs; the tag/version is an output of successful
   validation.
@@ -48,14 +50,28 @@ just agent-core::dogfood-evidence-record <pr> <operation> [task] [downstream_pr]
 just agent-core::release-gate-check <pr> <merge-commit> <dogfood-head> <dogfood-tree> [version]
 ```
 
-`release-candidate-check` verifies the current open PR and the complete GitHub
-CI rollup for its exact head. Human review and security review remain explicit
-operator prerequisites rather than inferred CI evidence. The result identifies
-the exact PR head that can be frozen. `release-candidate-worktree` creates or
-verifies a clean detached worktree at that head; `<path>` must resolve under
-the source checkout's `.worktrees/` (a name such as `pr-123-rc` or an explicit
-`.worktrees/pr-123-rc` both work), must be disposable, and must not already
-contain unrelated work. Neither surface merges, pushes, tags, or publishes.
+`release-candidate-check` verifies the current open PR and proves that the
+canonical `.github/workflows/template-ci.yml` workflow has exactly one
+unambiguous `pull_request` run for its exact head, with the current attempt
+completed successfully. It also requires the complete GitHub status rollup to
+be successful; an unrelated green context cannot substitute for Template CI.
+Human review and security review remain explicit operator prerequisites rather
+than inferred CI evidence. The result identifies the exact PR head that can be
+frozen.
+
+`release-candidate-worktree` creates or verifies a clean detached worktree at
+that head; `<path>` must resolve under the source checkout's `.worktrees/` (a
+name such as `pr-123-rc` or an explicit `.worktrees/pr-123-rc` both work), must
+be disposable, and must not already contain unrelated work. Before any fetch or
+checkout it requires the canonical Templates HTTPS `origin` and rejects local
+Git include, URL rewrite, HTTP, credential, filter, protocol, SSH/proxy, custom
+upload-pack/receive-pack, hooks, and worktree execution overrides. A missing
+candidate is materialized as a standalone detached Git worktree: its private
+repository is initialized inside the destination, then the exact commit is
+fetched only from the pinned canonical HTTPS URL and checked out without
+consuming the source repository's local transport/filter configuration. An
+existing destination is accepted only when it is already the exact detached,
+clean candidate root. Neither surface merges, pushes, tags, or publishes.
 
 `dogfood-evidence-record` records the auditable PASS outcome and concise
 operation identifier (and, where applicable, the downstream Task and PR) after
@@ -73,8 +89,14 @@ and record the aggregate PASS only after every applicable step has passed.
 `release-gate-check` is the final read-only assertion. It requires the recorded
 evidence, supplied merge commit, exact dogfooded **Templates** PR head/tree,
 and (when supplied) the intended version. It checks that the merge commit has
-the same tree as the frozen candidate. It does not
+the same tree as the frozen candidate. When a version is supplied, both the
+GitHub Release and the exact Git tag must be absent; an existing tag fails
+closed even without a Release object. It does not
 merge, create a release, publish a tag, or claim that a release was published.
+This is point-in-time pre-publication evidence: the separate human-controlled
+publisher must create the version tag at the verified merge commit with
+create-only/fail-if-present semantics, then create the Release from that exact
+tag. It must never reuse a tag that appeared after the gate check.
 
 ## Operating procedure
 

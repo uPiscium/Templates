@@ -32,6 +32,7 @@ class ReleaseGateTest(unittest.TestCase):
         (self.root / "file").write_text("one\n", encoding="utf-8")
         run_git(self.root, "add", "file")
         run_git(self.root, "commit", "-qm", "one")
+        run_git(self.root, "remote", "add", "origin", gate.CANONICAL_GIT_URL)
         self.head = run_git(self.root, "rev-parse", "HEAD")
         self.tree = run_git(self.root, "rev-parse", "HEAD^{tree}")
         (self.root / ".worktrees").mkdir(mode=0o700)
@@ -46,9 +47,59 @@ class ReleaseGateTest(unittest.TestCase):
             "head": {"sha": head or self.head, "repo": {"full_name": gate.CANONICAL_REPO}},
         }
 
-    def gh_candidate(self, *, pr_values=None, rollup=None, commit_trees=None, comparison=None):
+    def workflow_run(
+        self,
+        *,
+        head: str | None = None,
+        status: str = "completed",
+        conclusion: str | None = "success",
+        run_id: int = 700,
+        attempt: int = 1,
+    ) -> dict:
+        return {
+            "id": run_id,
+            "workflow_id": 600,
+            "path": gate.CANONICAL_WORKFLOW_PATH,
+            "event": "pull_request",
+            "head_sha": head or self.head,
+            "run_attempt": attempt,
+            "status": status,
+            "conclusion": conclusion,
+            "pull_requests": [
+                {
+                    "number": 115,
+                    "head": {
+                        "sha": head or self.head,
+                        "repo": {"url": f"https://api.github.com/repos/{gate.CANONICAL_REPO}"},
+                    },
+                    "base": {
+                        "ref": "main",
+                        "repo": {"url": f"https://api.github.com/repos/{gate.CANONICAL_REPO}"},
+                    },
+                }
+            ],
+        }
+
+    def gh_candidate(
+        self,
+        *,
+        pr_values=None,
+        rollup=None,
+        commit_trees=None,
+        comparison=None,
+        workflow_runs=None,
+        workflow_detail=None,
+        workflow=None,
+    ):
         values = iter(pr_values or [self.pr(), self.pr(), self.pr(), self.pr()])
         trees = commit_trees or {self.head: self.tree}
+        runs = [self.workflow_run()] if workflow_runs is None else workflow_runs
+        detail = workflow_detail or (runs[0] if runs else self.workflow_run())
+        workflow_metadata = workflow or {
+            "id": 600,
+            "path": gate.CANONICAL_WORKFLOW_PATH,
+            "state": "active",
+        }
         rollup = rollup or {"data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
             "oid": self.head, "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False}, "nodes": [
                 {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}
@@ -59,6 +110,12 @@ class ReleaseGateTest(unittest.TestCase):
             if args[:2] == ["api", "graphql"]:
                 return rollup
             endpoint = args[1]
+            if endpoint.endswith("/actions/workflows/template-ci.yml"):
+                return workflow_metadata
+            if "/actions/workflows/600/runs?" in endpoint:
+                return {"total_count": len(runs), "workflow_runs": runs}
+            if endpoint.endswith("/actions/runs/700"):
+                return detail
             if "/pulls/" in endpoint:
                 return next(values)
             if "/git/commits/" in endpoint:
@@ -73,6 +130,61 @@ class ReleaseGateTest(unittest.TestCase):
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
             result = gate.candidate(self.root, "115")
         self.assertEqual({"pr": 115, "head": self.head, "tree": self.tree, "base": "main", "ci": "PASS", "status": "READY_FOR_DOGFOOD"}, result)
+
+    def test_only_unrelated_successful_rollup_without_template_ci_is_blocked(self) -> None:
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.gh_candidate(workflow_runs=[]),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "Template CI workflow is missing"):
+                gate.candidate(self.root, "115")
+
+    def test_template_ci_for_older_head_is_blocked(self) -> None:
+        older = "a" * 40
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.gh_candidate(workflow_runs=[self.workflow_run(head=older)]),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "exact candidate"):
+                gate.candidate(self.root, "115")
+
+    def test_template_ci_pending_and_failed_are_blocked(self) -> None:
+        for run in (
+            self.workflow_run(status="in_progress", conclusion=None),
+            self.workflow_run(status="completed", conclusion="failure"),
+        ):
+            with self.subTest(status=run["status"], conclusion=run["conclusion"]):
+                with mock.patch.object(
+                    gate,
+                    "gh",
+                    side_effect=self.gh_candidate(workflow_runs=[run], workflow_detail=run),
+                ):
+                    with self.assertRaisesRegex(gate.GateError, "incomplete or unsuccessful"):
+                        gate.candidate(self.root, "115")
+
+    def test_multiple_exact_head_template_ci_runs_are_ambiguous(self) -> None:
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.gh_candidate(
+                workflow_runs=[self.workflow_run(), self.workflow_run(run_id=701)]
+            ),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "ambiguous"):
+                gate.candidate(self.root, "115")
+
+    def test_template_ci_for_another_pr_with_same_head_is_blocked(self) -> None:
+        run = self.workflow_run()
+        run["pull_requests"][0]["number"] = 999
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.gh_candidate(workflow_runs=[run], workflow_detail=run),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "another pull request"):
+                gate.candidate(self.root, "115")
 
     def test_pending_and_failed_ci_are_blocked(self) -> None:
         for context in (
@@ -93,7 +205,9 @@ class ReleaseGateTest(unittest.TestCase):
                 gate.candidate(self.root, "115")
 
     def test_detached_exact_clean_worktree_is_created_and_verified(self) -> None:
-        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()), mock.patch.object(
+            gate, "CANONICAL_GIT_URL", self.root.as_uri()
+        ):
             result = gate.create_or_verify_worktree(self.root, "115", "rc")
         path = self.root / ".worktrees" / "rc"
         self.assertEqual(result["path"], str(path))
@@ -123,14 +237,27 @@ class ReleaseGateTest(unittest.TestCase):
         path = self.root / ".worktrees" / "rc"
         path.mkdir()
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
-            with self.assertRaisesRegex(gate.GateError, "not a registered"):
+            with self.assertRaisesRegex(gate.GateError, "exact registered worktree root"):
                 gate.create_or_verify_worktree(self.root, "115", "rc")
         path.rmdir()
-        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()), mock.patch.object(
+            gate, "CANONICAL_GIT_URL", self.root.as_uri()
+        ):
             gate.create_or_verify_worktree(self.root, "115", "rc")
         (path / "dirty").write_text("dirty", encoding="utf-8")
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
             with self.assertRaisesRegex(gate.GateError, "not clean"):
+                gate.create_or_verify_worktree(self.root, "115", "rc")
+
+    def test_existing_candidate_with_unsafe_config_is_rejected_before_verification(self) -> None:
+        path = self.root / ".worktrees" / "rc"
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()), mock.patch.object(
+            gate, "CANONICAL_GIT_URL", self.root.as_uri()
+        ):
+            gate.create_or_verify_worktree(self.root, "115", "rc")
+        run_git(path, "config", "--local", "filter.attack.process", "attacker-process")
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            with self.assertRaisesRegex(gate.GateError, "unsafe local Git configuration"):
                 gate.create_or_verify_worktree(self.root, "115", "rc")
 
     def evidence(self, *, head=None, tree=None, operation="dogfood") -> dict:
@@ -208,6 +335,47 @@ class ReleaseGateTest(unittest.TestCase):
         argv = runner.call_args.args[0]
         self.assertEqual(argv[:4], ["gh", "api", "--hostname", "github.com"])
 
+    def test_local_git_configuration_and_canonical_origin_are_required(self) -> None:
+        self.assertEqual(
+            gate.validate_local_git_configuration(self.root),
+            gate.CANONICAL_GIT_URL,
+        )
+        run_git(self.root, "remote", "set-url", "origin", "https://example.invalid/Templates.git")
+        with self.assertRaisesRegex(gate.GateError, "canonical Templates"):
+            gate.validate_local_git_configuration(self.root)
+
+    def test_unsafe_local_git_execution_and_transport_configuration_is_rejected(self) -> None:
+        unsafe = (
+            ("core.sshCommand", "attacker-ssh"),
+            ("url.ssh://attacker.invalid/.insteadOf", "https://github.com/"),
+            ("credential.helper", "attacker-helper"),
+            ("filter.attack.smudge", "attacker-smudge"),
+            ("filter.attack.process", "attacker-process"),
+            ("remote.origin.uploadpack", "attacker-upload-pack"),
+            ("include.path", "/tmp/attacker-config"),
+        )
+        for name, value in unsafe:
+            with self.subTest(name=name):
+                run_git(self.root, "config", "--local", name, value)
+                try:
+                    with self.assertRaisesRegex(gate.GateError, "unsafe local Git configuration"):
+                        gate.validate_local_git_configuration(self.root)
+                finally:
+                    run_git(self.root, "config", "--local", "--unset-all", name)
+
+    def test_worktree_refuses_unsafe_config_before_checkout(self) -> None:
+        run_git(self.root, "config", "--local", "filter.attack.smudge", "attacker-smudge")
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            with self.assertRaisesRegex(gate.GateError, "unsafe local Git configuration"):
+                gate.create_or_verify_worktree(self.root, "115", "unsafe")
+        self.assertFalse((self.root / ".worktrees" / "unsafe").exists())
+
+    def test_unsafe_worktree_scoped_git_configuration_is_rejected(self) -> None:
+        run_git(self.root, "config", "--local", "extensions.worktreeConfig", "true")
+        run_git(self.root, "config", "--worktree", "filter.attack.process", "attacker-process")
+        with self.assertRaisesRegex(gate.GateError, "unsafe worktree Git configuration"):
+            gate.validate_local_git_configuration(self.root)
+
     def merge_gh(self, merge: str, merge_tree: str, *, evidence=None, pr_values=None, comparison=None):
         values = iter(pr_values or [self.pr(state="closed", merged=True, merge=merge)] * 4)
         trees = {self.head: self.tree, merge: merge_tree}
@@ -215,6 +383,13 @@ class ReleaseGateTest(unittest.TestCase):
             if args[:2] == ["api", "graphql"]:
                 raise AssertionError("graphql must be routed to the rollup fixture")
             endpoint = args[1]
+            if endpoint.endswith("/actions/workflows/template-ci.yml"):
+                return {"id": 600, "path": gate.CANONICAL_WORKFLOW_PATH, "state": "active"}
+            if "/actions/workflows/600/runs?" in endpoint:
+                run = self.workflow_run()
+                return {"total_count": 1, "workflow_runs": [run]}
+            if endpoint.endswith("/actions/runs/700"):
+                return self.workflow_run()
             if "/pulls/" in endpoint:
                 return next(values)
             if "/git/commits/" in endpoint:
@@ -304,16 +479,35 @@ class ReleaseGateTest(unittest.TestCase):
             [f"repos/{gate.CANONICAL_REPO}/compare/{merge}...main"],
         )
 
-    def test_path_traversal_symlink_stale_rollup_and_existing_release_rejected(self) -> None:
+    def test_path_traversal_and_symlink_are_rejected(self) -> None:
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
             for destination in ("../escape", "/tmp/outside"):
                 with self.assertRaises(gate.GateError): gate.create_or_verify_worktree(self.root, "115", destination)
         link = self.root / ".worktrees" / "link"
         link.symlink_to(self.root)
         with self.assertRaises(gate.GateError): gate.safe_worktree_path(self.root, "link", create_parents=True)
-        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()), mock.patch.object(gate, "gh_status", return_value=200):
-            with self.assertRaisesRegex(gate.GateError, "already exists"):
-                gate.release_absent(self.root, "v1.2.3")
+
+    def test_release_and_tag_must_both_be_absent(self) -> None:
+        cases = (
+            ([200], "release already exists"),
+            ([404, 200], "Git tag already exists"),
+            ([500], "release lookup returned unexpected"),
+            ([404, 500], "Git tag lookup returned unexpected"),
+        )
+        for statuses, message in cases:
+            with self.subTest(statuses=statuses):
+                with mock.patch.object(gate, "gh_status", side_effect=statuses):
+                    with self.assertRaisesRegex(gate.GateError, message):
+                        gate.release_absent(self.root, "v1.2.3")
+        with mock.patch.object(gate, "gh_status", side_effect=[404, 404]) as status:
+            gate.release_absent(self.root, "v1.2.3")
+        self.assertEqual(
+            [call.args[0][1] for call in status.call_args_list],
+            [
+                f"repos/{gate.CANONICAL_REPO}/releases/tags/v1.2.3",
+                f"repos/{gate.CANONICAL_REPO}/git/ref/tags/v1.2.3",
+            ],
+        )
 
 
 if __name__ == "__main__":
