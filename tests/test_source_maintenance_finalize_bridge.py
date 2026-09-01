@@ -123,8 +123,23 @@ class FirstAdoptionFinalizeBridgeTest(unittest.TestCase):
             record = maintenance.lifecycle.WorktreeRecord(
                 task, "task/22-maintenance", task_head
             )
-            publication = (["Justfile"], "22: maintenance", "canonical body")
-            merged = {"mergeCommitOid": merge_oid}
+            canonical_body = "canonical body"
+            live_body = canonical_body + "\n"
+            publication = (["Justfile"], "22: maintenance", canonical_body)
+            merged = {
+                "number": 23,
+                "title": "22: maintenance",
+                "body": live_body,
+                "baseRefName": "main",
+                "headRefName": "task/22-maintenance",
+                "headRefOid": task_head,
+                "isDraft": False,
+                "isCrossRepository": False,
+                "mergeCommit": {"oid": merge_oid},
+                "mergeable": "MERGEABLE",
+                "statusCheckRollup": [],
+                "state": "MERGED",
+            }
             revision = "a" * 40
 
             def run_bridge() -> dict:
@@ -145,14 +160,20 @@ class FirstAdoptionFinalizeBridgeTest(unittest.TestCase):
                 return json.loads(output.getvalue())
 
             with mock.patch.object(
-                maintenance, "_stored_contract", return_value=(record, {"repository": "upiscium/AgentKnowledgeVault"})
+                maintenance,
+                "_stored_contract",
+                return_value=(record, {"repository": "upiscium/AgentKnowledgeVault"}),
             ), mock.patch.object(
                 maintenance, "_validate_consumed_receipt", return_value={"commit_sha": task_head}
             ) as receipts, mock.patch.object(
                 maintenance, "_publication_evidence", return_value=publication
             ) as publications, mock.patch.object(
-                maintenance, "_merged_pr", return_value=merged
+                maintenance.agent_core, "pr_details", return_value=merged
             ) as prs, mock.patch.object(
+                maintenance.agent_core,
+                "canonical_repository",
+                return_value="upiscium/AgentKnowledgeVault",
+            ), mock.patch.object(
                 maintenance.lifecycle, "require_resolved_contract"
             ):
                 first = run_bridge()
@@ -161,13 +182,20 @@ class FirstAdoptionFinalizeBridgeTest(unittest.TestCase):
 
             self.assertEqual(self.git(main, "rev-parse", "HEAD"), merge_oid)
             self.assertEqual(first["transition"], "finalized")
+            self.assertEqual(first["status"], "FINALIZED")
+            self.assertEqual(first["publishedHead"], task_head)
             self.assertEqual(second["transition"], "already-finalized")
+            self.assertEqual(second["status"], "FINALIZED")
             self.assertEqual(state.read_bytes(), first_state)
             self.assertIn("- Status: merged", first_state.decode("utf-8"))
             self.assertEqual(first_state.count(b"### Maintenance publication"), 1)
             self.assertEqual(receipts.call_count, 6)
             self.assertEqual(publications.call_count, 6)
             self.assertEqual(prs.call_count, 6)
+            self.assertTrue(all(call.args[1] == "23" for call in prs.call_args_list))
+            self.assertEqual(merged["body"], live_body)
+            self.assertEqual(live_body.count("\n"), 1)
+            self.assertEqual(publication[2].rstrip("\n"), publication[2])
 
 
 if __name__ == "__main__":

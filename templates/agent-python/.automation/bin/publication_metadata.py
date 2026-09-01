@@ -188,12 +188,28 @@ def validate_metadata(title: str, body: str, *, receipt: dict | None = None) -> 
         raise PublicationMetadataError("pull request body is missing required sections")
 
 
+def canonical_pr_body_matches(canonical: str, live: str | None) -> bool:
+    """Compare PR bodies while tolerating only one transport-level terminal LF."""
+
+    if not isinstance(live, str) or canonical.endswith("\r\n") or live.endswith(
+        "\r\n"
+    ):
+        return False
+
+    def without_transport_lf(body: str) -> str:
+        if body.endswith("\n") and not body.endswith("\n\n"):
+            return body[:-1]
+        return body
+
+    return without_transport_lf(canonical) == without_transport_lf(live)
+
+
 def write_metadata(root: Path, title: str, body: str) -> None:
     try:
         task_contract.write_publication_metadata(
             root,
-            (title.strip() + "\n").encode(),
-            (body.rstrip() + "\n").encode(),
+            (title + "\n").encode(),
+            body.encode(),
         )
     except task_contract.ContractError as exc:
         raise PublicationMetadataError(str(exc)) from exc
@@ -203,7 +219,9 @@ def read_and_validate_metadata(root: Path, *, receipt: dict | None = None) -> tu
     title_path = root / ".task-state" / "pr-title.txt"
     body_path = root / ".task-state" / "pr-body.md"
     try:
-        title = title_path.read_text(encoding="utf-8").strip()
+        title = title_path.read_text(encoding="utf-8")
+        if title.endswith("\n"):
+            title = title[:-1]
         body = body_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise PublicationMetadataError("run agent::pr-prepare before publication") from exc

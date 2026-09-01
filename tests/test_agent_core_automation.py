@@ -76,6 +76,38 @@ class AgentCoreSafetyTest(unittest.TestCase):
 class PublicationMetadataTest(unittest.TestCase):
     HEAD = "a" * 40
 
+    def test_canonical_pr_body_matches_allows_only_one_terminal_lf(self) -> None:
+        matches = agent_core.publication.canonical_pr_body_matches
+        self.assertTrue(matches("canonical body", "canonical body"))
+        self.assertTrue(matches("canonical body", "canonical body\n"))
+        self.assertTrue(matches("canonical body\n", "canonical body"))
+        for actual in (
+            "canonical body\n\n",
+            "canonical body ",
+            "changed body\n",
+            "canonical body\r\n",
+        ):
+            self.assertFalse(matches("canonical body", actual))
+        self.assertFalse(matches("canonical body\r\n", "canonical body\r\n"))
+        self.assertFalse(matches("canonical body\n\n", "canonical body\n"))
+
+    def test_live_validation_uses_terminal_lf_helper(self) -> None:
+        pr = {
+            "headRefName": "task/19", "baseRefName": "main", "headRefOid": self.HEAD,
+            "title": "19: title", "body": "canonical body", "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        with mock.patch.object(
+            agent_core.publication,
+            "canonical_pr_body_matches",
+            wraps=agent_core.publication.canonical_pr_body_matches,
+        ) as matches:
+            agent_core._validate_live_pr(
+                pr, branch="task/19", base="main", head=self.HEAD,
+                title="19: title", body="canonical body\n", draft=True,
+            )
+        matches.assert_called_once_with("canonical body\n", "canonical body")
+
     def fixture(self, root: Path, *, reviews: bool = True) -> None:
         state = root / ".task-state"
         state.mkdir()
