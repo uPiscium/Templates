@@ -675,7 +675,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(
                     maintenance,
                     "_publication_evidence",
-                    side_effect=[publication_evidence, publication_evidence],
+                    return_value=publication_evidence,
                 ) as reconstruct,
                 mock.patch.object(maintenance, "_merged_pr", side_effect=[merged, merged]),
                 mock.patch.object(maintenance.lifecycle, "synchronize_default_branch", return_value=sync),
@@ -686,7 +686,17 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             ):
                 result = maintenance.maintenance_finalize(root, "21", 22)
             self.assertEqual(reconstruct.call_count, 2)
-            mark.assert_called_once_with(record, "21")
+            mark.assert_called_once_with(
+                record,
+                "21",
+                publication_line=(
+                    f"PR #22 merged from {self.HEAD}; merge commit {self.MERGE}; "
+                    "finalization finalized"
+                ),
+                validate_before_write=mock.ANY,
+                default_branch="main",
+                default_revision="e" * 40,
+            )
             self.assertEqual(result["status"], "FINALIZED")
             self.assertEqual(result["stage"], "merged")
 
@@ -752,6 +762,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 mock.patch.object(maintenance.lifecycle, "require_resolved_contract"),
                 mock.patch.object(maintenance.lifecycle, "assert_task_identity"),
                 mock.patch.object(maintenance.lifecycle, "work_units_lock", return_value=nullcontext()),
+                mock.patch.object(maintenance, "_terminal_ref_locks", return_value=nullcontext()),
             ):
                 result = maintenance._mark_maintenance_merged(record, "21")
             self.assertEqual(result, "finalized")
@@ -760,6 +771,183 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 "merged",
             )
             self.assertNotIn("merged", maintenance.lifecycle.LINEAR_TRANSITIONS["initialized"])
+
+    def test_finalize_publication_is_byte_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root)
+            record = self._record(root)
+            line = (
+                f"PR #22 merged from {self.HEAD}; merge commit {self.MERGE}; "
+                "finalization finalized"
+            )
+            with (
+                mock.patch.object(maintenance.lifecycle, "require_resolved_contract"),
+                mock.patch.object(maintenance.lifecycle, "assert_task_identity"),
+                mock.patch.object(maintenance.lifecycle, "work_units_lock", return_value=nullcontext()),
+                mock.patch.object(maintenance, "_terminal_ref_locks", return_value=nullcontext()),
+            ):
+                self.assertEqual(
+                    maintenance._mark_maintenance_merged(
+                        record, "21", publication_line=line
+                    ),
+                    "finalized",
+                )
+                path = root / ".task-state" / "task.md"
+                first = path.read_bytes()
+                self.assertEqual(
+                    maintenance._mark_maintenance_merged(
+                        record, "21", publication_line=line
+                    ),
+                    "already-finalized",
+                )
+                self.assertEqual(path.read_bytes(), first)
+            self.assertEqual(first.count(b"### Maintenance publication"), 1)
+            self.assertEqual(first.count(("- " + line).encode("utf-8")), 1)
+
+    def test_finalize_publication_coexists_with_canonical_evidence_subsections(self) -> None:
+        template = (
+            ROOT / "components" / "agent-core" / ".automation" / "templates" / "task-state.md"
+        ).read_text(encoding="utf-8")
+        line = (
+            f"PR #22 merged from {self.HEAD}; merge commit {self.MERGE}; "
+            "finalization finalized"
+        )
+        updated = maintenance._add_finalized_publication(template, line)
+        maintenance._validate_finalized_publication(updated, line)
+        self.assertIn("### Changed files\n\nNone yet.", updated)
+        self.assertEqual(updated.count("### Maintenance publication"), 1)
+
+    def test_finalize_rejects_duplicate_or_conflicting_publication_evidence(self) -> None:
+        line = f"PR #22 merged from {self.HEAD}; merge commit {self.MERGE}"
+        for evidence in (
+            f"### Maintenance publication\n\n- {line}\n- {line}\n",
+            "### Maintenance publication\n\n- a different publication\n",
+        ):
+            with self.subTest(evidence=evidence):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._state(root)
+                    path = root / ".task-state" / "task.md"
+                    path.write_text(path.read_text(encoding="utf-8") + evidence, encoding="utf-8")
+                    record = self._record(root)
+                    with (
+                        mock.patch.object(maintenance.lifecycle, "require_resolved_contract"),
+                        mock.patch.object(maintenance.lifecycle, "assert_task_identity"),
+                        mock.patch.object(maintenance.lifecycle, "work_units_lock", return_value=nullcontext()),
+                        mock.patch.object(maintenance, "_terminal_ref_locks", return_value=nullcontext()),
+                    ):
+                        with self.assertRaisesRegex(maintenance.MaintenanceError, "publication evidence"):
+                            maintenance._mark_maintenance_merged(
+                                record, "21", publication_line=line
+                            )
+                    self.assertEqual(maintenance.lifecycle.state_status(path), "initialized")
+
+    def test_terminal_transition_revalidates_before_writing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._state(root)
+            record = self._record(root)
+
+            def moved() -> None:
+                raise maintenance.MaintenanceError(
+                    "maintenance receipt changed before terminal transition"
+                )
+
+            with (
+                mock.patch.object(maintenance.lifecycle, "require_resolved_contract"),
+                mock.patch.object(maintenance.lifecycle, "assert_task_identity"),
+                mock.patch.object(
+                    maintenance.lifecycle, "work_units_lock", return_value=nullcontext()
+                ),
+                mock.patch.object(maintenance, "_terminal_ref_locks", return_value=nullcontext()),
+                self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "receipt changed"
+                ),
+            ):
+                maintenance._mark_maintenance_merged(
+                    record,
+                    "21",
+                    publication_line="exact publication",
+                    validate_before_write=moved,
+                )
+            self.assertEqual(
+                maintenance.lifecycle.state_status(
+                    root / ".task-state" / "task.md"
+                ),
+                "initialized",
+            )
+
+    def test_terminal_ref_lock_blocks_concurrent_task_branch_movement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init_repo(root)
+            self._write(root, "tracked.txt", "base\n")
+            base = self._commit(root, "base")
+            self._git(root, "checkout", "-b", "task/21-maintenance")
+            self._write(root, "tracked.txt", "maintenance\n")
+            head = self._commit(root, "maintenance")
+            record = maintenance.lifecycle.WorktreeRecord(
+                root, "task/21-maintenance", head
+            )
+            with maintenance._terminal_ref_locks(
+                record, default_branch="main", default_revision=base
+            ):
+                for branch, old, new in (
+                    ("task/21-maintenance", head, base),
+                    ("main", base, head),
+                ):
+                    attempted = subprocess.run(
+                        ("git", "update-ref", f"refs/heads/{branch}", new, old),
+                        cwd=root,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(attempted.returncode, 0)
+                self.assertEqual(self._git(root, "rev-parse", "HEAD"), head)
+            self._git(
+                root,
+                "update-ref",
+                "refs/heads/task/21-maintenance",
+                base,
+                head,
+            )
+            self.assertEqual(self._git(root, "rev-parse", "HEAD"), base)
+
+    def test_terminal_ref_lock_supports_packed_nested_task_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init_repo(root)
+            self._write(root, "tracked.txt", "base\n")
+            base = self._commit(root, "base")
+            self._git(root, "checkout", "-b", "task/21-maintenance")
+            head = self._git(root, "rev-parse", "HEAD")
+            self._git(root, "pack-refs", "--all", "--prune")
+            nested = Path(self._git(root, "rev-parse", "--git-common-dir")) / "refs/heads/task"
+            if not nested.is_absolute():
+                nested = root / nested
+            self.assertFalse(nested.exists())
+            record = maintenance.lifecycle.WorktreeRecord(
+                root, "task/21-maintenance", head
+            )
+            with maintenance._terminal_ref_locks(
+                record, default_branch="main", default_revision=base
+            ):
+                self.assertTrue(nested.is_dir())
+
+    def test_terminal_ref_lock_rejects_symlinked_ref_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            top = Path(directory)
+            common = top / "git"
+            outside = top / "outside"
+            (common / "refs").mkdir(parents=True)
+            outside.mkdir()
+            (common / "refs" / "heads").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(
+                maintenance.MaintenanceError, "ref directory is unsafe"
+            ):
+                maintenance._safe_ref_parent(common, "task/21-maintenance")
+            self.assertEqual(list(outside.iterdir()), [])
 
     def test_permission_and_command_surfaces_are_explicit(self) -> None:
         config = json.loads(

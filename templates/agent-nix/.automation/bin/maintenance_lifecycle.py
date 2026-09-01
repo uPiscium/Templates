@@ -4,9 +4,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 import tempfile
+from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 
 import agent_core
@@ -748,26 +752,192 @@ def _merged_pr(
 
 
 def _mark_maintenance_merged(
-    record: lifecycle.WorktreeRecord, task: str
+    record: lifecycle.WorktreeRecord,
+    task: str,
+    *,
+    publication_line: str | None = None,
+    validate_before_write: Callable[[], None] | None = None,
+    default_branch: str | None = None,
+    default_revision: str | None = None,
 ) -> str:
+    """Atomically finalize Task State and its canonical publication evidence.
+
+    All Git, network, and publication reconstruction must happen before this
+    function is called.  The work-units lock is consequently held only while
+    the identity, current state, and final byte contents are checked and
+    written.
+    """
     lifecycle.validate_task(task)
     lifecycle.require_resolved_contract(record, task)
     with lifecycle.work_units_lock(record):
         lifecycle.assert_task_identity(record, task)
-        path = lifecycle.state_path(record.path)
-        previous = lifecycle.state_status(path)
-        if previous == "merged":
-            return "already-finalized"
-        if previous != "initialized":
-            raise MaintenanceError(
-                f"maintenance finalization requires initialized or merged; found {previous}"
-            )
-        text = path.read_text(encoding="utf-8")
-        marker = "- Status: initialized"
-        if text.count(marker) != 1:
-            raise MaintenanceError("maintenance Task State status marker is ambiguous")
-        lifecycle.atomic_text(path, text.replace(marker, "- Status: merged", 1))
+        with _terminal_ref_locks(
+            record,
+            default_branch=default_branch,
+            default_revision=default_revision,
+        ):
+            if validate_before_write is not None:
+                validate_before_write()
+            path = lifecycle.state_path(record.path)
+            previous = lifecycle.state_status(path)
+            if previous == "merged":
+                if publication_line is not None:
+                    _validate_finalized_publication(path.read_text(encoding="utf-8"), publication_line)
+                return "already-finalized"
+            if previous != "initialized":
+                raise MaintenanceError(
+                    f"maintenance finalization requires initialized or merged; found {previous}"
+                )
+            text = path.read_text(encoding="utf-8")
+            marker = "- Status: initialized"
+            if text.count(marker) != 1:
+                raise MaintenanceError("maintenance Task State status marker is ambiguous")
+            updated = text.replace(marker, "- Status: merged", 1)
+            if publication_line is not None:
+                updated = _add_finalized_publication(updated, publication_line)
+            lifecycle.atomic_text(path, updated)
     return "finalized"
+
+
+def _safe_ref_parent(common: Path, branch: str) -> Path:
+    refs = common / "refs"
+    heads = refs / "heads"
+    for directory in (common, refs, heads):
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise MaintenanceError("maintenance ref directory is unavailable") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise MaintenanceError("maintenance ref directory is unsafe")
+    current = heads
+    for part in branch.split("/")[:-1]:
+        current = current / part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise MaintenanceError("maintenance ref directory is unavailable") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise MaintenanceError("maintenance ref directory is unsafe")
+    return current
+
+
+@contextmanager
+def _terminal_ref_locks(
+    record: lifecycle.WorktreeRecord,
+    *,
+    default_branch: str | None,
+    default_revision: str | None,
+):
+    """Hold Git's exact Task/default ref locks through terminal state commit."""
+    branch = record.branch
+    if branch is None or record.head is None:
+        raise MaintenanceError("maintenance Task ref identity is incomplete")
+    refs = [(branch, record.head)]
+    if (default_branch is None) != (default_revision is None):
+        raise MaintenanceError("maintenance default ref identity is incomplete")
+    if default_branch is not None and default_revision is not None:
+        refs.append((default_branch, default_revision))
+    if len({name for name, _ in refs}) != len(refs):
+        raise MaintenanceError("maintenance Task and default refs must be distinct")
+    common = lifecycle.common_git_dir(record.path)
+    acquired: list[tuple[int, Path, os.stat_result]] = []
+    try:
+        for name, revision in sorted(refs):
+            lifecycle.validate_branch_name(name)
+            parent = _safe_ref_parent(common, name)
+            lock = parent / (name.rsplit("/", 1)[-1] + ".lock")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(lock, flags, 0o600)
+            except OSError as exc:
+                raise MaintenanceError(
+                    "maintenance refs are concurrently locked or unavailable"
+                ) from exc
+            try:
+                os.write(descriptor, (revision + "\n").encode("ascii", "strict"))
+                os.fsync(descriptor)
+                acquired.append((descriptor, lock, os.fstat(descriptor)))
+            except Exception:
+                os.close(descriptor)
+                lock.unlink(missing_ok=True)
+                raise
+        yield
+    finally:
+        cleanup_error: MaintenanceError | None = None
+        for descriptor, lock, locked in reversed(acquired):
+            os.close(descriptor)
+            try:
+                current = lock.lstat()
+            except OSError as exc:
+                cleanup_error = MaintenanceError(
+                    "maintenance ref lock changed unexpectedly"
+                )
+                cleanup_error.__cause__ = exc
+                continue
+            if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+                locked.st_dev,
+                locked.st_ino,
+            ):
+                cleanup_error = MaintenanceError(
+                    "maintenance ref lock changed unexpectedly"
+                )
+                continue
+            lock.unlink()
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _publication_section(text: str) -> list[str] | None:
+    heading = "### Maintenance publication"
+    heading_lines = [line for line in text.splitlines() if line == heading]
+    if len(heading_lines) > 1:
+        raise MaintenanceError("maintenance publication evidence is duplicated")
+    if not heading_lines:
+        return None
+    lines = text.splitlines()
+    index = lines.index(heading)
+    content: list[str] = []
+    for line in lines[index + 1 :]:
+        if line.startswith("#"):
+            break
+        if line.strip():
+            content.append(line.strip())
+    return content
+
+
+def _validate_finalized_publication(text: str, publication_line: str) -> None:
+    expected = "- " + publication_line
+    if text.count(expected) > 1:
+        raise MaintenanceError("maintenance publication evidence is duplicated")
+    section = _publication_section(text)
+    if section != [expected]:
+        raise MaintenanceError(
+            "maintenance publication evidence is missing or conflicting"
+        )
+
+
+def _add_finalized_publication(text: str, publication_line: str) -> str:
+    expected = "- " + publication_line
+    if expected in text:
+        raise MaintenanceError("maintenance publication evidence is duplicated")
+    section = _publication_section(text)
+    if section not in (None, ["None yet."]):
+        raise MaintenanceError("maintenance publication evidence is conflicting")
+    heading = "### Maintenance publication"
+    replacement = heading + "\n\n" + expected
+    if section == ["None yet."]:
+        return text.replace(heading + "\n\nNone yet.", replacement, 1)
+    if section is not None:
+        return text.replace(heading, replacement, 1)
+    if "## Evidence" in text:
+        return text.replace("## Evidence", "## Evidence\n\n" + replacement, 1)
+    return text.rstrip("\n") + "\n\n## Evidence\n\n" + replacement + "\n"
 
 
 def maintenance_finalize(root_path: Path, task: str, pr_number: int) -> dict:
@@ -808,11 +978,39 @@ def maintenance_finalize(root_path: Path, task: str, pr_number: int) -> dict:
         raise MaintenanceError(
             "maintenance pull request merge evidence changed during finalization"
         )
-    result = _mark_maintenance_merged(record, task)
-    lifecycle.append_task_evidence(
-        lifecycle.state_path(record.path),
-        "### Maintenance publication",
-        f"PR #{pr_number} merged from {commit}; merge commit {merge_oid}; finalization {result}",
+    publication_line = (
+        f"PR #{pr_number} merged from {commit}; merge commit {merge_oid}; "
+        "finalization finalized"
+    )
+
+    def validate_terminal_evidence() -> None:
+        lifecycle.require_synchronized_default_branch_revision(
+            root_path, sync["branch"], sync["revision"]
+        )
+        terminal_receipt = _validate_consumed_receipt(record, task)
+        if terminal_receipt != receipt_after:
+            raise MaintenanceError(
+                "maintenance receipt changed before terminal transition"
+            )
+        if _publication_evidence(record, task, terminal_receipt) != publication_evidence:
+            raise MaintenanceError(
+                "maintenance publication reconstruction changed before terminal transition"
+            )
+        terminal_pr = _merged_pr(
+            root_path, record, contract["repository"], pr_number, commit, title, body
+        )
+        if terminal_pr["mergeCommitOid"] != merge_oid:
+            raise MaintenanceError(
+                "maintenance pull request merge evidence changed before terminal transition"
+            )
+
+    result = _mark_maintenance_merged(
+        record,
+        task,
+        publication_line=publication_line,
+        validate_before_write=validate_terminal_evidence,
+        default_branch=sync["branch"],
+        default_revision=sync["revision"],
     )
     return {
         "status": "FINALIZED",

@@ -711,6 +711,44 @@ The canonical publication flows are:
 
 The required sequence is `git diff --check`, `just agent::doctor`, `just project::check`, and the repository CI/smoke suite, followed by `just automation::commit <task> [message]`, existing `just agent::push <task>`, and `just agent::pr-create <task>` (Draft PR). Raw Git/GitHub bypass is not permitted. Merge is excluded from this workflow and remains a separately gated Main Orchestrator operation.
 
+#### Issue #112 source-side first-adoption finalization
+
+For a consumer whose installed Agent Core cannot run the maintenance
+finalizer, the exact source-side bootstrap command is run from a clean,
+trusted Templates source worktree:
+
+```sh
+just agent-core::maintenance-finalize <consumer-main-worktree> <task> <pr> <expected-implementation-revision>
+```
+
+The Templates source must be clean and at the exact full immutable `HEAD`
+specified by `<expected-implementation-revision>`. The target is the
+consumer's actual clean default-branch/Main worktree; it must not be a Task
+worktree and must not be the source root. The source-side bridge verifies its
+bootstrap and loads the implementation and maintenance modules from the
+verified source Git blobs at that revision, rather than copying or trusting
+live source files. A source race, revision mismatch, dirty source, or invalid
+target fails closed before target lifecycle publication.
+
+The operation applies the canonical validations for the consumer contract,
+maintenance receipt and authority, exact repository/worktree identity,
+publication/review evidence, and merged PR identity. It synchronizes the
+actual default branch only by a clean fast-forward-only update, then
+revalidates the exact merged PR, published head, merge commit, and canonical
+publication reconstruction against the synchronized branch. Only after those
+checks does it write the dedicated maintenance terminal transition
+`initialized -> merged` and its publication evidence.
+
+Idempotency is exact: a second invocation is accepted only when the Task is
+already `merged` with the one identical finalized publication record and the
+same PR/commit evidence; it returns the already-finalized result and does not
+perform another lifecycle transition. Cleanup remains separate and
+approval-gated. The ordinary consumer finalizer remains
+`just automation::maintenance-finalize <task> <pr>`; this source-side bridge is not a
+generic authority-expansion or arbitrary consumer-mutation primitive. AKV
+#22/#23 motivate this first-adoption example, but their execution is not
+claimed. Agent Core VERSION remains 3.
+
 #### Issue #97 provenance correction
 
 The active-consumer correction is deliberately narrow, not generic receipt

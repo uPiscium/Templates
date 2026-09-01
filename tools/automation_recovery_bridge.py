@@ -23,9 +23,26 @@ BOOTSTRAP_PATH = ROOT / "tools" / "automation_recovery_bridge.py"
 ENGINE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "automation_upgrade.py"
 CONTRACT_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_contract.py"
 LIFECYCLE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_lifecycle.py"
+PUBLICATION_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "publication_metadata.py"
+AGENT_CORE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "agent_core.py"
+MAINTENANCE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "maintenance_lifecycle.py"
+CANONICAL_MODULES = (
+    ("task_lifecycle", "components/agent-core/.automation/bin/task_lifecycle.py"),
+    ("task_contract", "components/agent-core/.automation/bin/task_contract.py"),
+    ("publication_metadata", "components/agent-core/.automation/bin/publication_metadata.py"),
+    ("agent_core", "components/agent-core/.automation/bin/agent_core.py"),
+    ("automation_upgrade", "components/agent-core/.automation/bin/automation_upgrade.py"),
+    ("maintenance_lifecycle", "components/agent-core/.automation/bin/maintenance_lifecycle.py"),
+)
 _TRUSTED_GIT: Path | None = None
 _TRUSTED_GH: Path | None = None
 _REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_UNSAFE_LOCAL_CONFIG = re.compile(
+    r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|filter\..*|protocol\..*|"
+    r"core\.(?:gitproxy|hookspath|sshcommand|worktree)|"
+    r"remote\.[^.]+\.(?:proxy|proxyauthmethod|receivepack|uploadpack|vcs))",
+    re.IGNORECASE,
+)
 
 
 class BridgeError(RuntimeError):
@@ -162,6 +179,114 @@ def _verify_bootstrap(root: Path, revision: str) -> None:
         raise BridgeError("live recovery bootstrap is not a regular file with the HEAD executable mode")
     if live != _blob(root, oid):
         raise BridgeError("live recovery bootstrap does not match its HEAD blob")
+
+
+def _pinned_run(command, *, cwd=None, check=True, remove_env=(), env_overrides=None,
+                input_text=None):
+    if not command or command[0] not in {"git", "gh"}:
+        raise BridgeError("verified maintenance runner accepts only Git or GitHub commands")
+    executable = trusted_git() if command[0] == "git" else trusted_gh()
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("GIT_", "LD_", "DYLD_"))
+        and key not in {"EMAIL", "GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"}
+    }
+    if command[0] == "git":
+        environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                            "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+    for name in remove_env:
+        environment.pop(name, None)
+    if env_overrides:
+        environment.update(env_overrides)
+    argv = [str(executable), *command[1:]]
+    if command[0] == "git":
+        argv = [
+            str(executable),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=",
+            *command[1:],
+        ]
+    result = subprocess.run(argv, cwd=cwd, text=True, input=input_text,
+                            capture_output=True, env=environment)
+    if check and result.returncode:
+        raise BridgeError(f"{' '.join(command)}: {result.stderr.strip() or result.stdout.strip() or result.returncode}")
+    return result
+
+
+def _validate_target_git_configuration(target: Path) -> None:
+    """Reject consumer-local configuration that can redirect or execute Git work."""
+    result = _pinned_run(
+        ["git", "config", "--local", "--no-includes", "--null", "--name-only", "--list"],
+        cwd=target,
+    )
+    unsafe = sorted(
+        name
+        for name in result.stdout.split("\0")
+        if name and _UNSAFE_LOCAL_CONFIG.fullmatch(name)
+    )
+    if unsafe:
+        raise BridgeError(
+            "consumer repository has unsafe local Git configuration: "
+            + ", ".join(unsafe)
+        )
+
+
+@contextmanager
+def _verified_modules(root: Path, revision: str):
+    """Load the complete maintenance bridge exclusively from immutable HEAD blobs."""
+    blobs = [(name, path, _tree_blob(root, revision, path)[0])
+             for name, path in CANONICAL_MODULES]
+    old_path = list(sys.path)
+    old_modules = {name: sys.modules.get(name) for name, _ in CANONICAL_MODULES}
+    old_bytecode = sys.dont_write_bytecode
+    with tempfile.TemporaryDirectory(prefix="automation-maintenance-") as directory:
+        private = Path(directory)
+        for name, _, oid in blobs:
+            path = private / f"{name}.py"
+            path.write_bytes(_blob(root, oid))
+            os.chmod(path, 0o600)
+        sys.path.insert(0, str(private))
+        sys.dont_write_bytecode = True
+        loaded = {}
+        try:
+            for name, _, _ in blobs:
+                sys.modules.pop(name, None)
+                spec = importlib.util.spec_from_file_location(name, private / f"{name}.py")
+                if spec is None or spec.loader is None:
+                    raise BridgeError(f"cannot create specification for verified {name}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+                loaded[name] = module
+
+            git = trusted_git()
+            gh = trusted_gh()
+            for module in (loaded["task_lifecycle"], loaded["agent_core"],
+                           loaded["automation_upgrade"]):
+                module.run = _pinned_run
+            loaded["automation_upgrade"]._GIT_EXECUTABLE = git
+            loaded["automation_upgrade"].git_executable = lambda: git
+            loaded["task_lifecycle"].gh = lambda *args, cwd, check=True: _pinned_run(
+                ["gh", *args], cwd=cwd, check=check)
+            loaded["agent_core"].gh = lambda *args, cwd=None: _pinned_run(
+                ["gh", *args], cwd=cwd).stdout.strip()
+            yield loaded
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise BridgeError(f"cannot load verified maintenance modules: {exc}") from exc
+        finally:
+            sys.path[:] = old_path
+            for name, module in old_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
+            sys.dont_write_bytecode = old_bytecode
 
 
 @contextmanager
@@ -304,6 +429,11 @@ def parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume-contract-check")
     resume.add_argument("target", type=Path)
     resume.add_argument("task", type=_issue_argument)
+    finalize = sub.add_parser("maintenance-finalize")
+    finalize.add_argument("target", type=Path)
+    finalize.add_argument("task", type=_issue_argument)
+    finalize.add_argument("pr", type=_issue_argument)
+    finalize.add_argument("expected_implementation_revision", type=_revision_argument)
     return result
 
 
@@ -344,14 +474,24 @@ def _check_resume_contract(contract, target: Path, task: str) -> dict:
 
 
 def main() -> int:
+    revision = None
+    failure = None
     try:
         args = parser().parse_args()
         if Path(__file__).resolve() != BOOTSTRAP_PATH:
             raise BridgeError("bootstrap path is not exactly the expected Templates path")
-        revision = _clean_root(ROOT)
+        revision = _clean_root(
+            ROOT,
+            args.expected_implementation_revision
+            if args.command == "maintenance-finalize" else None,
+        )
         _verify_bootstrap(ROOT, revision)
         _clean_root(ROOT, revision)
         target = args.target.resolve()
+        if args.command == "maintenance-finalize" and target == ROOT:
+            raise BridgeError("maintenance finalization target must not be the source root")
+        if args.command == "maintenance-finalize":
+            _validate_target_git_configuration(target)
         with maintenance_environment():
             if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
                 trusted_git()
@@ -363,6 +503,13 @@ def main() -> int:
                     else:
                         result = _check_resume_contract(contract, target, args.task)
                         result["implementationRevision"] = revision
+            elif args.command == "maintenance-finalize":
+                with _verified_modules(ROOT, revision) as modules:
+                    _clean_root(ROOT, revision)
+                    value = modules["maintenance_lifecycle"].maintenance_finalize(
+                        target, args.task, int(args.pr)
+                    )
+                    result = {**value, "implementationRevision": revision}
             else:
                 with _verified_engine(ROOT, revision) as engine:
                     if engine.git_executable().resolve() != trusted_git():
@@ -380,11 +527,22 @@ def main() -> int:
                             expected_implementation_revision=revision)
                     else:  # pragma: no cover
                         raise BridgeError(f"unsupported bridge command: {args.command}")
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
     except Exception as exc:
-        print(f"ERROR: {_error_text(exc)}", file=sys.stderr)
+        failure = exc
+    finally:
+        if revision is not None:
+            try:
+                _clean_root(ROOT, revision)
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                else:
+                    failure = BridgeError(f"{_error_text(failure)}; source recheck failed: {_error_text(exc)}")
+    if failure is not None:
+        print(f"ERROR: {_error_text(failure)}", file=sys.stderr)
         return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
