@@ -630,7 +630,7 @@ def _publication_evidence(
         )
     except publication.PublicationMetadataError as exc:
         raise MaintenanceError(str(exc)) from exc
-    return paths, title, body.rstrip()
+    return paths, title, body
 
 
 def maintenance_pr_create(root_path: Path, task: str) -> dict:
@@ -729,11 +729,12 @@ def _merged_pr(
         "isCrossRepository": False,
         "state": "MERGED",
         "title": title,
-        "body": body,
     }
     mismatches = [
         name for name, wanted in expected.items() if details.get(name) != wanted
     ]
+    if not publication.canonical_pr_body_matches(body, details.get("body")):
+        mismatches.append("body")
     merge = details.get("mergeCommit")
     merge_oid = merge.get("oid") if isinstance(merge, dict) else None
     if (

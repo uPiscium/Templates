@@ -753,6 +753,31 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                     "canonical body",
                 )
 
+    def test_merged_pr_uses_terminal_lf_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            details = {
+                "number": 22, "title": "21: canonical title", "body": "canonical body",
+                "headRefName": record.branch, "baseRefName": "main", "headRefOid": self.HEAD,
+                "isCrossRepository": False, "state": "MERGED", "mergeCommit": {"oid": self.MERGE},
+            }
+            with (
+                mock.patch.object(maintenance.agent_core, "pr_details", return_value=details),
+                mock.patch.object(maintenance.lifecycle, "default_branch", return_value="main"),
+                mock.patch.object(maintenance.agent_core, "canonical_repository", return_value="example/repo"),
+                mock.patch.object(
+                    maintenance.publication,
+                    "canonical_pr_body_matches",
+                    wraps=maintenance.publication.canonical_pr_body_matches,
+                ) as matches,
+            ):
+                maintenance._merged_pr(
+                    root, record, "example/repo", 22, self.HEAD,
+                    "21: canonical title", "canonical body\n",
+                )
+            matches.assert_called_once_with("canonical body\n", "canonical body")
+
     def test_dedicated_terminal_transition_does_not_change_normal_transition_table(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -372,9 +372,11 @@ def _validated_local_metadata(root: Path, task: str, head: str) -> tuple[str, Pa
         )
     except publication.PublicationMetadataError as exc:
         raise AutomationError(str(exc)) from exc
-    if title != expected_title or body.rstrip() != expected_body.rstrip():
+    if title != expected_title or not publication.canonical_pr_body_matches(
+        expected_body, body
+    ):
         raise AutomationError("pull request metadata is stale; run agent::pr-prepare")
-    return title, root / ".task-state" / "pr-body.md", body.rstrip()
+    return title, root / ".task-state" / "pr-body.md", body
 
 
 def _base_revision(root: Path) -> str:
@@ -388,9 +390,11 @@ def _base_revision(root: Path) -> str:
 def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str, body: str, draft: bool) -> None:
     expected = {
         "headRefName": branch, "baseRefName": base, "headRefOid": head,
-        "title": title, "body": body, "isDraft": draft, "isCrossRepository": False, "state": "OPEN",
+        "title": title, "isDraft": draft, "isCrossRepository": False, "state": "OPEN",
     }
     mismatches = [name for name, value in expected.items() if pr.get(name) != value]
+    if not publication.canonical_pr_body_matches(body, pr.get("body")):
+        mismatches.append("body")
     if mismatches:
         raise AutomationError("live pull request metadata is stale or inconsistent: " + ", ".join(mismatches))
 
