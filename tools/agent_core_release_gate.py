@@ -23,6 +23,8 @@ CANONICAL_WORKFLOW_PATH = ".github/workflows/template-ci.yml"
 DOWNSTREAM_REPO = "upiscium/AgentKnowledgeVault"
 DEFAULT_BRANCH = "main"
 EVIDENCE_ROOT_NAME = ".agent-core-release-gate/evidence"
+GATE_TOOL_RELATIVE = "tools/agent_core_release_gate.py"
+GATE_LAUNCHER_RELATIVE = "tools/run_agent_core_release_gate.sh"
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 PR_RE = re.compile(r"[1-9][0-9]{0,8}")
@@ -126,6 +128,31 @@ def git(args: list[str], cwd: Path, *, check: bool = True) -> str:
     return command(["git", "--no-pager", *args], cwd, check=check).stdout
 
 
+def git_bytes(args: list[str], cwd: Path, *, check: bool = True) -> bytes:
+    executable = trusted_executable("git")
+    result = subprocess.run(
+        [
+            str(executable),
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=",
+            "--no-pager",
+            *args,
+        ],
+        cwd=cwd,
+        env=sanitized_environment(),
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip() or f"exit {result.returncode}"
+        raise GateError(f"git command failed: {detail}")
+    return result.stdout
+
+
 def gh(args: list[str], cwd: Path) -> Any:
     if not args or args[0] != "api":
         raise GateError("GitHub runner only accepts API reads")
@@ -151,13 +178,95 @@ def gh_status(args: list[str], cwd: Path) -> int:
     return int(statuses[-1])
 
 
-def source_root() -> Path:
+def source_blob(root: Path, revision: str, relative: str) -> tuple[str, int]:
+    if not SHA_RE.fullmatch(revision):
+        raise GateError("source implementation revision is invalid")
+    raw = git_bytes(["ls-tree", "-z", revision, "--", relative], root)
+    records = [record for record in raw.split(b"\0") if record]
+    matches: list[tuple[str, int]] = []
+    for record in records:
+        header, separator, path = record.partition(b"\t")
+        fields = header.split()
+        if (
+            not separator
+            or len(fields) != 3
+            or path.decode("utf-8", "surrogateescape") != relative
+        ):
+            continue
+        mode, kind, oid = fields
+        if kind != b"blob" or mode not in {b"100644", b"100755"} or not SHA_RE.fullmatch(
+            oid.decode("ascii", "strict")
+        ):
+            raise GateError(f"source implementation path is not a safe regular Git blob: {relative}")
+        matches.append((oid.decode("ascii"), int(mode, 8)))
+    if len(matches) != 1:
+        raise GateError(f"source implementation must contain exactly one Git blob: {relative}")
+    return matches[0]
+
+
+def verify_live_source_blob(root: Path, revision: str, relative: str, live_path: Path) -> None:
+    expected_path = root / relative
+    if live_path.resolve() != expected_path.resolve():
+        raise GateError(f"live source implementation path is unexpected: {relative}")
+    oid, git_mode = source_blob(root, revision, relative)
+    try:
+        metadata = expected_path.lstat()
+        live_content = expected_path.read_bytes()
+    except OSError as exc:
+        raise GateError(f"cannot read live source implementation: {relative}") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or bool(stat.S_IMODE(metadata.st_mode) & 0o111) != bool(git_mode & 0o111)
+    ):
+        raise GateError(f"live source implementation type or mode differs from HEAD: {relative}")
+    if live_content != git_bytes(["cat-file", "blob", oid], root):
+        raise GateError(f"live source implementation content differs from HEAD: {relative}")
+
+
+def verify_source_implementation(
+    root: Path,
+    *,
+    expected_head: str | None = None,
+    tool_path: Path | None = None,
+    launcher_path: Path | None = None,
+) -> str:
+    root = root.resolve()
+    head = git(["rev-parse", "--verify", "HEAD^{commit}"], root).strip()
+    valid_sha(head, "source implementation HEAD")
+    if expected_head is not None and head != expected_head:
+        raise GateError("source implementation HEAD moved during the operation")
+    verify_live_source_blob(
+        root,
+        head,
+        GATE_TOOL_RELATIVE,
+        tool_path or root / GATE_TOOL_RELATIVE,
+    )
+    verify_live_source_blob(
+        root,
+        head,
+        GATE_LAUNCHER_RELATIVE,
+        launcher_path or root / GATE_LAUNCHER_RELATIVE,
+    )
+    if git_bytes(["status", "--porcelain=v1", "-z", "--untracked-files=all"], root):
+        raise GateError("Templates source worktree must be clean")
+    if git(["rev-parse", "--verify", "HEAD^{commit}"], root).strip() != head:
+        raise GateError("source implementation HEAD moved during verification")
+    return head
+
+
+def source_root() -> tuple[Path, str]:
     tool_root = Path(__file__).resolve().parent.parent
     root_text = git(["rev-parse", "--show-toplevel"], tool_root).strip()
     root = Path(root_text).resolve()
     if root != tool_root:
         raise GateError("release-gate tool must be installed at the source checkout root")
-    return root
+    head = verify_source_implementation(
+        root,
+        tool_path=Path(__file__),
+        launcher_path=root / GATE_LAUNCHER_RELATIVE,
+    )
+    return root, head
 
 
 def valid_pr(value: str) -> str:
@@ -596,6 +705,31 @@ def validate_evidence_payload(value: Any) -> dict[str, Any]:
     return value
 
 
+def evidence_subject(
+    repository: str,
+    pr: int,
+    head: str,
+    tree: str,
+    downstream_repository: str,
+) -> str:
+    return hashlib.sha256(
+        f"{repository}:{pr}:{head}:{tree}:{downstream_repository}".encode("utf-8")
+    ).hexdigest()
+
+
+def evidence_filename(payload: dict[str, Any]) -> str:
+    return (
+        evidence_subject(
+            payload["repo"],
+            payload["pr"],
+            payload["head"],
+            payload["tree"],
+            payload["downstreamRepo"],
+        )
+        + ".json"
+    )
+
+
 def load_evidence(root: Path, *, create: bool = False) -> list[dict[str, Any]]:
     directory = evidence_root(root, create=create)
     records: list[dict[str, Any]] = []
@@ -613,7 +747,10 @@ def load_evidence(root: Path, *, create: bool = False) -> list[dict[str, Any]]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise GateError(f"invalid evidence record: {path.name}") from exc
-        records.append(validate_evidence_payload(payload))
+        validated = validate_evidence_payload(payload)
+        if path.name != evidence_filename(validated):
+            raise GateError(f"evidence filename does not match its immutable subject: {path.name}")
+        records.append(validated)
     return records
 
 
@@ -660,13 +797,10 @@ def record_evidence(
         "recordedAt": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     validate_evidence_payload(payload)
-    subject = hashlib.sha256(
-        f"{CANONICAL_REPO}:{checked['pr']}:{checked['head']}:{checked['tree']}:{DOWNSTREAM_REPO}".encode()
-    ).hexdigest()
     directory = evidence_root(root, create=False)
     # The deterministic subject path makes the check-and-create operation
     # atomic across concurrent recorders. O_EXCL permits exactly one winner.
-    target = directory / f"{subject}.json"
+    target = directory / evidence_filename(payload)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(target, flags, 0o600)
@@ -800,7 +934,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     arguments = parser().parse_args()
-    root = source_root()
+    root, implementation_head = source_root()
     if arguments.command == "release-candidate-check":
         output = candidate(root, arguments.pr)
     elif arguments.command == "release-candidate-worktree":
@@ -822,6 +956,13 @@ def main() -> int:
             arguments.dogfood_tree,
             arguments.version,
         )
+    verify_source_implementation(
+        root,
+        expected_head=implementation_head,
+        tool_path=Path(__file__),
+        launcher_path=root / GATE_LAUNCHER_RELATIVE,
+    )
+    output["implementationHead"] = implementation_head
     print(json.dumps(output, separators=(",", ":"), sort_keys=True))
     return 0
 

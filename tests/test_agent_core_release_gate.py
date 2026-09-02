@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -46,6 +47,65 @@ class ReleaseGateTest(unittest.TestCase):
             "base": {"ref": "main", "repo": {"full_name": gate.CANONICAL_REPO}},
             "head": {"sha": head or self.head, "repo": {"full_name": gate.CANONICAL_REPO}},
         }
+
+    def source_fixture(self) -> tuple[Path, str]:
+        source = Path(tempfile.mkdtemp(dir=self.temp.name))
+        tools = source / "tools"
+        tools.mkdir()
+        (tools / "agent_core_release_gate.py").write_text("gate implementation\n", encoding="utf-8")
+        (tools / "run_agent_core_release_gate.sh").write_text("launcher implementation\n", encoding="utf-8")
+        (source / "unrelated").write_text("tracked\n", encoding="utf-8")
+        run_git(source, "init", "-q")
+        run_git(source, "config", "user.email", "test@example.invalid")
+        run_git(source, "config", "user.name", "Release Gate Test")
+        run_git(source, "add", ".")
+        run_git(source, "commit", "-qm", "source implementation")
+        return source, run_git(source, "rev-parse", "HEAD")
+
+    def test_exact_clean_source_implementation_is_accepted(self) -> None:
+        source, head = self.source_fixture()
+        self.assertEqual(gate.verify_source_implementation(source), head)
+
+    def test_modified_live_gate_tool_is_rejected(self) -> None:
+        source, _ = self.source_fixture()
+        (source / "tools" / "agent_core_release_gate.py").write_text("modified\n", encoding="utf-8")
+        with self.assertRaisesRegex(gate.GateError, "content differs from HEAD"):
+            gate.verify_source_implementation(source)
+
+    def test_modified_live_launcher_is_rejected(self) -> None:
+        source, _ = self.source_fixture()
+        (source / "tools" / "run_agent_core_release_gate.sh").write_text("modified\n", encoding="utf-8")
+        with self.assertRaisesRegex(gate.GateError, "content differs from HEAD"):
+            gate.verify_source_implementation(source)
+
+    def test_dirty_unrelated_tracked_source_file_is_rejected(self) -> None:
+        source, _ = self.source_fixture()
+        (source / "unrelated").write_text("dirty\n", encoding="utf-8")
+        with self.assertRaisesRegex(gate.GateError, "source worktree must be clean"):
+            gate.verify_source_implementation(source)
+
+    def test_source_head_movement_is_rejected(self) -> None:
+        source, head = self.source_fixture()
+        (source / "unrelated").write_text("next\n", encoding="utf-8")
+        run_git(source, "add", "unrelated")
+        run_git(source, "commit", "-qm", "move source head")
+        with self.assertRaisesRegex(gate.GateError, "HEAD moved"):
+            gate.verify_source_implementation(source, expected_head=head)
+
+    def test_operation_fails_when_source_head_moves_before_success(self) -> None:
+        implementation = "a" * 40
+        arguments = SimpleNamespace(command="release-candidate-check", pr="115")
+        parser = mock.Mock()
+        parser.parse_args.return_value = arguments
+        with mock.patch.object(gate, "parser", return_value=parser), mock.patch.object(
+            gate, "source_root", return_value=(self.root, implementation)
+        ), mock.patch.object(gate, "candidate", return_value={"status": "READY_FOR_DOGFOOD"}), mock.patch.object(
+            gate,
+            "verify_source_implementation",
+            side_effect=gate.GateError("source implementation HEAD moved during the operation"),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "HEAD moved"):
+                gate.main()
 
     def workflow_run(
         self,
@@ -268,10 +328,12 @@ class ReleaseGateTest(unittest.TestCase):
 
     def write_evidence(self, *records: dict) -> None:
         directory = gate.evidence_root(self.root, create=True)
-        start = len(list(directory.iterdir()))
-        for index, record in enumerate(records, start=start):
-            (directory / f"{index}.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
-            os.chmod(directory / f"{index}.json", 0o600)
+        for record in records:
+            target = directory / gate.evidence_filename(record)
+            if target.exists():
+                raise AssertionError("test attempted to overwrite canonical evidence")
+            target.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            os.chmod(target, 0o600)
 
     def test_recorded_pass_evidence_contains_all_identity_bindings(self) -> None:
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
@@ -289,6 +351,28 @@ class ReleaseGateTest(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "already exists"):
                 gate.record_evidence(self.root, "115", "second-run", "116", "7")
         self.assertEqual(len(list(gate.evidence_root(self.root, create=False).iterdir())), 1)
+
+    def test_evidence_filename_must_match_canonical_subject(self) -> None:
+        record = self.evidence()
+        directory = gate.evidence_root(self.root, create=True)
+        canonical = directory / gate.evidence_filename(record)
+        canonical.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        canonical.chmod(0o600)
+        self.assertEqual(gate.load_evidence(self.root), [record])
+
+        canonical.unlink()
+        arbitrary = directory / "arbitrary.json"
+        arbitrary.write_text(json.dumps(record) + "\n", encoding="utf-8")
+        arbitrary.chmod(0o600)
+        with self.assertRaisesRegex(gate.GateError, "filename does not match"):
+            gate.load_evidence(self.root)
+
+        arbitrary.unlink()
+        changed = dict(record, head="a" * 40)
+        canonical.write_text(json.dumps(changed) + "\n", encoding="utf-8")
+        canonical.chmod(0o600)
+        with self.assertRaisesRegex(gate.GateError, "filename does not match"):
+            gate.load_evidence(self.root)
 
     def test_launcher_rejects_python_from_untrusted_path(self) -> None:
         fake_bin = Path(self.temp.name) / "fake-bin"
@@ -417,10 +501,12 @@ class ReleaseGateTest(unittest.TestCase):
         for key, value in (("repo", "other/repo"), ("pr", 999), ("downstreamRepo", "other/downstream"), ("head", "d" * 40), ("tree", "e" * 40)):
             bad = self.evidence(); bad[key] = value
             directory = gate.evidence_root(self.root, create=False)
-            (directory / "0.json").write_text(json.dumps(bad), encoding="utf-8")
+            manual = directory / "manual.json"
+            manual.write_text(json.dumps(bad), encoding="utf-8")
+            manual.chmod(0o600)
             with mock.patch.object(gate, "gh", side_effect=self.merge_gh(merge, self.tree)):
                 with self.assertRaises(gate.GateError): gate.post_merge_gate(self.root, "115", merge, self.head, self.tree, "")
-            (directory / "0.json").write_text(json.dumps(record), encoding="utf-8")
+            manual.unlink()
 
     def test_old_evidence_moved_head_and_duplicate_conflict_fail_closed(self) -> None:
         moved = "f" * 40
@@ -438,11 +524,6 @@ class ReleaseGateTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(gate.GateError, "dogfooded head"):
                 gate.post_merge_gate(self.root, "115", moved_merge, self.head, self.tree, "")
-        self.write_evidence(self.evidence(operation="other"))
-        merge = "c" * 40
-        with mock.patch.object(gate, "gh", side_effect=self.merge_gh(merge, self.tree)):
-            with self.assertRaisesRegex(gate.GateError, "duplicated"):
-                gate.post_merge_gate(self.root, "115", merge, self.head, self.tree, "")
 
     def test_stale_rollup_oid_is_blocked(self) -> None:
         rollup = {"data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {

@@ -29,6 +29,12 @@ Issue -> Draft PR -> full Templates CI/review/security
 * A release tag is not a testing primitive. Tests and dogfood bind directly to
   immutable commit IDs and tree IDs; the tag/version is an output of successful
   validation.
+* The gate implementation is itself an immutable commit subject. Every command
+  requires a clean Templates source worktree, resolves its exact full `HEAD`,
+  and verifies the live launcher and Python gate tool against their regular Git
+  blobs and executable modes at that commit. It repeats the implementation
+  `HEAD`, content, mode, and cleanliness checks before returning success and
+  reports the commit as `implementationHead`. No release tag is required.
 * Do not release before downstream dogfood for a downstream-sensitive change.
 * A moving PR head invalidates all candidate, CI/review/security, and dogfood
   evidence bound to the previous head. Re-run the gate from the new head;
@@ -155,10 +161,15 @@ Evidence is local and auditable under:
 Each record is immutable and must not overwrite an earlier record. It binds
 the Templates PR number and exact frozen PR head/tree and the canonical AKV
 repository, operation, PASS outcome, timestamp, and Task/downstream PR when
-present. Run evidence recording and final gate consumption from the same
-operator source checkout so this ignored local directory remains available.
-Keep detailed downstream logs alongside the operational record, and retain or
-archive them according to repository practice.
+present. This is a narrow local operator self-attestation within the trusted
+operator/filesystem boundary, not a cryptographic downstream receipt. Its
+filename is exactly the SHA-256 digest of the canonical repository,
+PR, head, tree, and downstream-repository subject followed by `.json`; records
+under arbitrary or mismatched names are rejected even when their JSON schema is
+otherwise valid. Run evidence recording and final gate consumption from the
+same operator source checkout so this ignored local directory remains
+available. Keep detailed downstream logs alongside the operational record, and
+retain or archive them according to repository practice.
 
 If a guarded downstream operation stops part-way through, preserve its
 receipts and resume through its canonical recovery/resume surface. Do not
