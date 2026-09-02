@@ -172,7 +172,8 @@ repository, the exact Template CI workflow ID/path and run ID/attempt,
 operation, PASS outcome, timestamp, and Task/downstream PR when present. The
 loader accepts schema v1 structurally so old files remain readable; post-merge
 trusts v1 only for the narrow hardcoded issue #117 PR/head/tree/run/workflow/
-attempt/merge binding. There is no migration or evidence-upgrade command; do
+attempt/merge binding and exact safely read evidence-file SHA-256. There is no
+migration or evidence-upgrade command; do
 not rewrite evidence files. This is a narrow local operator self-attestation within the trusted
 operator/filesystem boundary, not a cryptographic downstream receipt. Its
 filename is exactly the SHA-256 digest of the canonical repository,
@@ -216,7 +217,14 @@ tree:       7c5c6fb0bd5e0e881510e256f0b76e95c304c9c5
 merge:      67fbc64e1127c19b9e424ab99dff4626f67be63b
 workflow:   .github/workflows/template-ci.yml (ID 329870494)
 run:        33584314368 (attempt 1)
+evidence:   317dd08ea4840dac4a820043630315ece7c098e13ff77c992af63568442190ce
 ```
+
+The evidence value is the SHA-256 of the exact existing serialized file bytes.
+The gate opens the canonical evidence file without following symlinks, checks
+its owner, regular-file type, private mode, schema, and subject-derived
+filename, and hashes the bytes read. Semantically equivalent JSON with different
+bytes is not the known record. The old file is neither rewritten nor migrated.
 
 Post-merge accepts a singleton `pull_requests` association only when it matches
 the merged PR exactly. An empty association is accepted only with immutable v2

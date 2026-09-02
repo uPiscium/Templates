@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import subprocess
@@ -361,16 +362,21 @@ class ReleaseGateTest(unittest.TestCase):
         return {"schema": "agent-core-release-gate", "version": 1, "repo": gate.CANONICAL_REPO,
                 "pr": 117, "head": gate.ISSUE_117_COMPATIBILITY["head"],
                 "tree": gate.ISSUE_117_COMPATIBILITY["tree"],
-                "downstreamRepo": gate.DOWNSTREAM_REPO, "task": 116, "downstreamPr": 7,
-                "outcome": "PASS", "operation": "dogfood", "recordedAt": "2026-09-01T00:00:00Z"}
+                "downstreamRepo": gate.DOWNSTREAM_REPO, "task": 22, "downstreamPr": 23,
+                "outcome": "PASS", "operation": "maintenance-finalize",
+                "recordedAt": "2026-09-02T03:06:11.405547Z"}
 
-    def write_evidence(self, *records: dict) -> None:
+    def write_evidence(self, *records: dict, canonical_bytes: bool = False) -> None:
         directory = gate.evidence_root(self.root, create=True)
         for record in records:
             target = directory / gate.evidence_filename(record)
             if target.exists():
                 raise AssertionError("test attempted to overwrite canonical evidence")
-            target.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            if canonical_bytes:
+                content = json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n"
+            else:
+                content = json.dumps(record) + "\n"
+            target.write_text(content, encoding="utf-8")
             os.chmod(target, 0o600)
 
     def test_recorded_pass_evidence_contains_all_identity_bindings(self) -> None:
@@ -411,6 +417,45 @@ class ReleaseGateTest(unittest.TestCase):
         canonical.chmod(0o600)
         with self.assertRaisesRegex(gate.GateError, "filename does not match"):
             gate.load_evidence(self.root)
+
+    def test_evidence_reader_rejects_symlink_non_private_and_non_regular_entries(self) -> None:
+        record = self.evidence()
+        directory = gate.evidence_root(self.root, create=True)
+        canonical = directory / gate.evidence_filename(record)
+        content = json.dumps(record) + "\n"
+
+        target = self.root / "outside-evidence.json"
+        target.write_text(content, encoding="utf-8")
+        target.chmod(0o600)
+        canonical.symlink_to(target)
+        with self.assertRaisesRegex(gate.GateError, "unsafe or unexpected"):
+            gate.load_evidence(self.root)
+        canonical.unlink()
+
+        canonical.write_text(content, encoding="utf-8")
+        canonical.chmod(0o644)
+        with self.assertRaisesRegex(gate.GateError, "unsafe or unexpected"):
+            gate.load_evidence(self.root)
+        canonical.unlink()
+
+        canonical.mkdir(mode=0o700)
+        with self.assertRaisesRegex(gate.GateError, "unsafe or unexpected"):
+            gate.load_evidence(self.root)
+
+    def test_evidence_reader_rejects_object_replaced_between_lstat_and_open(self) -> None:
+        record = self.evidence()
+        self.write_evidence(record)
+        real_fstat = os.fstat
+
+        def replaced_metadata(descriptor):
+            metadata = real_fstat(descriptor)
+            fields = list(metadata)
+            fields[1] += 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(gate.os, "fstat", side_effect=replaced_metadata):
+            with self.assertRaisesRegex(gate.GateError, "unsafe or unexpected"):
+                gate.load_evidence(self.root)
 
     def test_launcher_rejects_python_from_untrusted_path(self) -> None:
         fake_bin = Path(self.temp.name) / "fake-bin"
@@ -593,8 +638,13 @@ class ReleaseGateTest(unittest.TestCase):
 
     def test_exact_issue_117_v1_fixture_passes_without_changing_evidence(self) -> None:
         record = self.issue_117_evidence()
-        self.write_evidence(record)
-        before = json.dumps(record, sort_keys=True)
+        self.write_evidence(record, canonical_bytes=True)
+        target = gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)
+        before = target.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(before).hexdigest(),
+            gate.ISSUE_117_COMPATIBILITY["evidenceSha256"],
+        )
         merge = gate.ISSUE_117_COMPATIBILITY["merge"]
         pr = self.pr(head=record["head"], state="closed", merged=True, merge=merge)
         with mock.patch.object(
@@ -609,7 +659,82 @@ class ReleaseGateTest(unittest.TestCase):
             ),
         ):
             gate.post_merge_gate(self.root, "117", merge, record["head"], record["tree"], "")
-        self.assertEqual(json.dumps(record, sort_keys=True), before)
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_issue_117_v1_payload_field_changes_fail_digest_binding(self) -> None:
+        merge = gate.ISSUE_117_COMPATIBILITY["merge"]
+        for field, value in (
+            ("task", 116),
+            ("downstreamPr", 7),
+            ("operation", "dogfood"),
+            ("recordedAt", "2026-09-01T00:00:00Z"),
+        ):
+            with self.subTest(field=field):
+                record = self.issue_117_evidence()
+                record[field] = value
+                self.write_evidence(record, canonical_bytes=True)
+                pr = self.pr(head=record["head"], state="closed", merged=True, merge=merge)
+                with mock.patch.object(
+                    gate,
+                    "gh",
+                    side_effect=self.merge_gh(
+                        merge,
+                        record["tree"],
+                        evidence=record,
+                        pr_values=[pr] * 4,
+                        run_pull_requests=[],
+                    ),
+                ):
+                    with self.assertRaisesRegex(gate.GateError, "issue #117"):
+                        gate.post_merge_gate(
+                            self.root, "117", merge, record["head"], record["tree"], ""
+                        )
+                (gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)).unlink()
+
+    def test_issue_117_same_json_with_different_bytes_fails(self) -> None:
+        record = self.issue_117_evidence()
+        self.write_evidence(record)
+        merge = gate.ISSUE_117_COMPATIBILITY["merge"]
+        pr = self.pr(head=record["head"], state="closed", merged=True, merge=merge)
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.merge_gh(
+                merge,
+                record["tree"],
+                evidence=record,
+                pr_values=[pr] * 4,
+                run_pull_requests=[],
+            ),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "issue #117"):
+                gate.post_merge_gate(
+                    self.root, "117", merge, record["head"], record["tree"], ""
+                )
+
+    def test_issue_117_wrong_known_digest_fails(self) -> None:
+        record = self.issue_117_evidence()
+        self.write_evidence(record, canonical_bytes=True)
+        merge = gate.ISSUE_117_COMPATIBILITY["merge"]
+        pr = self.pr(head=record["head"], state="closed", merged=True, merge=merge)
+        with mock.patch.dict(
+            gate.ISSUE_117_COMPATIBILITY,
+            {"evidenceSha256": "0" * 64},
+        ), mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.merge_gh(
+                merge,
+                record["tree"],
+                evidence=record,
+                pr_values=[pr] * 4,
+                run_pull_requests=[],
+            ),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "issue #117"):
+                gate.post_merge_gate(
+                    self.root, "117", merge, record["head"], record["tree"], ""
+                )
 
     def test_arbitrary_v1_evidence_fails(self) -> None:
         record = self.evidence(version=1)

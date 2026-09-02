@@ -37,6 +37,7 @@ ISSUE_117_COMPATIBILITY = {
     "workflowPath": CANONICAL_WORKFLOW_PATH,
     "runId": 33584314368,
     "runAttempt": 1,
+    "evidenceSha256": "317dd08ea4840dac4a820043630315ece7c098e13ff77c992af63568442190ce",
 }
 
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -773,28 +774,63 @@ def evidence_filename(payload: dict[str, Any]) -> str:
     )
 
 
-def load_evidence(root: Path, *, create: bool = False) -> list[dict[str, Any]]:
-    directory = evidence_root(root, create=create)
-    records: list[dict[str, Any]] = []
-    for path in sorted(directory.iterdir()):
-        metadata = path.lstat()
+def read_evidence_record(path: Path) -> tuple[dict[str, Any], str]:
+    if path.suffix != ".json":
+        raise GateError(f"unsafe or unexpected evidence entry: {path.name}")
+    try:
+        initial_metadata = path.lstat()
+    except OSError as exc:
+        raise GateError(f"unsafe or unexpected evidence entry: {path.name}") from exc
+    if (
+        not stat.S_ISREG(initial_metadata.st_mode)
+        or stat.S_ISLNK(initial_metadata.st_mode)
+        or initial_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(initial_metadata.st_mode) & 0o077
+    ):
+        raise GateError(f"unsafe or unexpected evidence entry: {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise GateError(f"unsafe or unexpected evidence entry: {path.name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
         if (
-            path.suffix != ".json"
-            or not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
+            not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
             or stat.S_IMODE(metadata.st_mode) & 0o077
+            or (metadata.st_dev, metadata.st_ino)
+            != (initial_metadata.st_dev, initial_metadata.st_ino)
         ):
             raise GateError(f"unsafe or unexpected evidence entry: {path.name}")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise GateError(f"invalid evidence record: {path.name}") from exc
-        validated = validate_evidence_payload(payload)
-        if path.name != evidence_filename(validated):
-            raise GateError(f"evidence filename does not match its immutable subject: {path.name}")
-        records.append(validated)
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            raw = stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise GateError(f"invalid evidence record: {path.name}") from exc
+    validated = validate_evidence_payload(payload)
+    if path.name != evidence_filename(validated):
+        raise GateError(f"evidence filename does not match its immutable subject: {path.name}")
+    return validated, hashlib.sha256(raw).hexdigest()
+
+
+def load_evidence_records(
+    root: Path, *, create: bool = False
+) -> list[tuple[dict[str, Any], str]]:
+    directory = evidence_root(root, create=create)
+    records: list[tuple[dict[str, Any], str]] = []
+    for path in sorted(directory.iterdir()):
+        records.append(read_evidence_record(path))
     return records
+
+
+def load_evidence(root: Path, *, create: bool = False) -> list[dict[str, Any]]:
+    return [payload for payload, _digest in load_evidence_records(root, create=create)]
 
 
 def record_evidence(
@@ -941,7 +977,12 @@ def post_merge_template_ci(
 
 
 def evidence_matches_issue_117(
-    evidence: dict[str, Any], pr: int, head: str, tree: str, merge: str
+    evidence: dict[str, Any],
+    evidence_digest: str,
+    pr: int,
+    head: str,
+    tree: str,
+    merge: str,
 ) -> bool:
     return (
         evidence["version"] == 1
@@ -952,6 +993,7 @@ def evidence_matches_issue_117(
         and evidence["pr"] == pr
         and evidence["head"] == head
         and evidence["tree"] == tree
+        and evidence_digest == ISSUE_117_COMPATIBILITY["evidenceSha256"]
     )
 
 
@@ -1018,19 +1060,26 @@ def post_merge_gate(
     if not isinstance(comparison, dict) or comparison.get("status") not in {"identical", "ahead"}:
         raise GateError("current main does not contain the merge commit")
 
-    records = load_evidence(root)
+    records = load_evidence_records(root)
     matching = [
-        item
-        for item in records
+        (item, digest)
+        for item, digest in records
         if item["pr"] == int(number)
         and item["head"] == dogfood_head
         and item["tree"] == dogfood_tree
     ]
     if len(matching) != 1:
         raise GateError("exact PASS dogfood evidence is missing, duplicated, or conflicting")
-    selected = matching[0]
+    selected, selected_digest = matching[0]
     legacy = selected["version"] == 1
-    if legacy and not evidence_matches_issue_117(selected, int(number), dogfood_head, dogfood_tree, merge_commit):
+    if legacy and not evidence_matches_issue_117(
+        selected,
+        selected_digest,
+        int(number),
+        dogfood_head,
+        dogfood_tree,
+        merge_commit,
+    ):
         raise GateError("legacy evidence is not the guarded issue #117 compatibility binding")
     check_rollup(root, number, dogfood_head)
     detail = post_merge_template_ci(root, dogfood_head, int(number), selected)
