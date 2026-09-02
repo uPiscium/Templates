@@ -115,29 +115,32 @@ class ReleaseGateTest(unittest.TestCase):
         conclusion: str | None = "success",
         run_id: int = 700,
         attempt: int = 1,
+        workflow_id: int = 600,
+        workflow_path: str = gate.CANONICAL_WORKFLOW_PATH,
+        pr_number: int = 115,
+        pull_requests=None,
     ) -> dict:
+        associated = [{
+            "number": pr_number,
+            "head": {
+                "sha": head or self.head,
+                "repo": {"url": f"https://api.github.com/repos/{gate.CANONICAL_REPO}"},
+            },
+            "base": {
+                "ref": "main",
+                "repo": {"url": f"https://api.github.com/repos/{gate.CANONICAL_REPO}"},
+            },
+        }]
         return {
             "id": run_id,
-            "workflow_id": 600,
-            "path": gate.CANONICAL_WORKFLOW_PATH,
+            "workflow_id": workflow_id,
+            "path": workflow_path,
             "event": "pull_request",
             "head_sha": head or self.head,
             "run_attempt": attempt,
             "status": status,
             "conclusion": conclusion,
-            "pull_requests": [
-                {
-                    "number": 115,
-                    "head": {
-                        "sha": head or self.head,
-                        "repo": {"url": f"https://api.github.com/repos/{gate.CANONICAL_REPO}"},
-                    },
-                    "base": {
-                        "ref": "main",
-                        "repo": {"url": f"https://api.github.com/repos/{gate.CANONICAL_REPO}"},
-                    },
-                }
-            ],
+            "pull_requests": associated if pull_requests is None else pull_requests,
         }
 
     def gh_candidate(
@@ -150,13 +153,14 @@ class ReleaseGateTest(unittest.TestCase):
         workflow_runs=None,
         workflow_detail=None,
         workflow=None,
+        workflow_id=600,
     ):
         values = iter(pr_values or [self.pr(), self.pr(), self.pr(), self.pr()])
         trees = commit_trees or {self.head: self.tree}
         runs = [self.workflow_run()] if workflow_runs is None else workflow_runs
         detail = workflow_detail or (runs[0] if runs else self.workflow_run())
         workflow_metadata = workflow or {
-            "id": 600,
+            "id": workflow_id,
             "path": gate.CANONICAL_WORKFLOW_PATH,
             "state": "active",
         }
@@ -172,9 +176,9 @@ class ReleaseGateTest(unittest.TestCase):
             endpoint = args[1]
             if endpoint.endswith("/actions/workflows/template-ci.yml"):
                 return workflow_metadata
-            if "/actions/workflows/600/runs?" in endpoint:
+            if f"/actions/workflows/{workflow_metadata['id']}/runs?" in endpoint:
                 return {"total_count": len(runs), "workflow_runs": runs}
-            if endpoint.endswith("/actions/runs/700"):
+            if "/actions/runs/" in endpoint:
                 return detail
             if "/pulls/" in endpoint:
                 return next(values)
@@ -189,7 +193,30 @@ class ReleaseGateTest(unittest.TestCase):
     def test_exact_open_head_tree_and_successful_ci_ready(self) -> None:
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
             result = gate.candidate(self.root, "115")
-        self.assertEqual({"pr": 115, "head": self.head, "tree": self.tree, "base": "main", "ci": "PASS", "status": "READY_FOR_DOGFOOD"}, result)
+        self.assertEqual({"pr": 115, "head": self.head, "tree": self.tree, "base": "main",
+                          "workflowId": 600, "workflowPath": gate.CANONICAL_WORKFLOW_PATH,
+                          "runId": 700, "runAttempt": 1, "ci": "PASS",
+                          "status": "READY_FOR_DOGFOOD"}, result)
+
+    def test_open_pr_with_empty_workflow_association_is_blocked(self) -> None:
+        run = self.workflow_run(pull_requests=[])
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate(workflow_runs=[run], workflow_detail=run)):
+            with self.assertRaisesRegex(gate.GateError, "ambiguous pull request identity"):
+                gate.candidate(self.root, "115")
+
+    def test_candidate_rejects_each_workflow_identity_mismatch(self) -> None:
+        cases = (
+            ("workflow_id", 601, "exact candidate"),
+            ("workflow_path", "other.yml", "exact candidate"),
+            ("head", "a" * 40, "exact candidate"),
+        )
+        for field, value, message in cases:
+            with self.subTest(field=field):
+                kwargs = {field: value}
+                run = self.workflow_run(**kwargs)
+                with mock.patch.object(gate, "gh", side_effect=self.gh_candidate(workflow_runs=[run], workflow_detail=run)):
+                    with self.assertRaisesRegex(gate.GateError, message):
+                        gate.candidate(self.root, "115")
 
     def test_only_unrelated_successful_rollup_without_template_ci_is_blocked(self) -> None:
         with mock.patch.object(
@@ -320,11 +347,22 @@ class ReleaseGateTest(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "unsafe local Git configuration"):
                 gate.create_or_verify_worktree(self.root, "115", "rc")
 
-    def evidence(self, *, head=None, tree=None, operation="dogfood") -> dict:
+    def evidence(self, *, head=None, tree=None, operation="dogfood", version=2, **identity) -> dict:
+        record = {"schema": "agent-core-release-gate", "version": version, "repo": gate.CANONICAL_REPO,
+                 "pr": 115, "head": head or self.head, "tree": tree or self.tree,
+                 "downstreamRepo": gate.DOWNSTREAM_REPO, "task": 116, "downstreamPr": 7,
+                 "outcome": "PASS", "operation": operation, "recordedAt": "2026-09-01T00:00:00Z"}
+        if version == 2:
+            record.update({"workflowId": 600, "workflowPath": gate.CANONICAL_WORKFLOW_PATH,
+                           "runId": 700, "runAttempt": 1, **identity})
+        return record
+
+    def issue_117_evidence(self) -> dict:
         return {"schema": "agent-core-release-gate", "version": 1, "repo": gate.CANONICAL_REPO,
-                "pr": 115, "head": head or self.head, "tree": tree or self.tree,
+                "pr": 117, "head": gate.ISSUE_117_COMPATIBILITY["head"],
+                "tree": gate.ISSUE_117_COMPATIBILITY["tree"],
                 "downstreamRepo": gate.DOWNSTREAM_REPO, "task": 116, "downstreamPr": 7,
-                "outcome": "PASS", "operation": operation, "recordedAt": "2026-09-01T00:00:00Z"}
+                "outcome": "PASS", "operation": "dogfood", "recordedAt": "2026-09-01T00:00:00Z"}
 
     def write_evidence(self, *records: dict) -> None:
         directory = gate.evidence_root(self.root, create=True)
@@ -460,20 +498,55 @@ class ReleaseGateTest(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateError, "unsafe worktree Git configuration"):
             gate.validate_local_git_configuration(self.root)
 
-    def merge_gh(self, merge: str, merge_tree: str, *, evidence=None, pr_values=None, comparison=None):
+    def merge_gh(
+        self,
+        merge: str,
+        merge_tree: str,
+        *,
+        evidence=None,
+        pr_values=None,
+        comparison=None,
+        run_pull_requests=None,
+    ):
         values = iter(pr_values or [self.pr(state="closed", merged=True, merge=merge)] * 4)
-        trees = {self.head: self.tree, merge: merge_tree}
+        recorded = evidence or self.evidence()
+        recorded_head = recorded.get("head", self.head)
+        recorded_pr = recorded.get("pr", 115)
+        canonical_workflow_id = (gate.ISSUE_117_COMPATIBILITY["workflowId"]
+                                 if recorded.get("version") == 1 else 600)
+        canonical_run_id = (gate.ISSUE_117_COMPATIBILITY["runId"]
+                            if recorded.get("version") == 1 else 700)
+        trees = {self.head: self.tree, recorded_head: recorded.get("tree", self.tree), merge: merge_tree}
         def fake(args, cwd):
             if args[:2] == ["api", "graphql"]:
                 raise AssertionError("graphql must be routed to the rollup fixture")
             endpoint = args[1]
             if endpoint.endswith("/actions/workflows/template-ci.yml"):
-                return {"id": 600, "path": gate.CANONICAL_WORKFLOW_PATH, "state": "active"}
-            if "/actions/workflows/600/runs?" in endpoint:
-                run = self.workflow_run()
+                return {"id": canonical_workflow_id,
+                        "path": gate.CANONICAL_WORKFLOW_PATH,
+                        "state": "active"}
+            if "/actions/workflows/" in endpoint and "/runs?" in endpoint:
+                run = self.workflow_run(
+                    workflow_id=canonical_workflow_id,
+                    workflow_path=gate.CANONICAL_WORKFLOW_PATH,
+                    head=recorded_head,
+                    pr_number=recorded_pr,
+                    run_id=recorded.get("runId", 700),
+                    attempt=recorded.get("runAttempt", 1),
+                    pull_requests=recorded.get("pull_requests", None),
+                )
                 return {"total_count": 1, "workflow_runs": [run]}
-            if endpoint.endswith("/actions/runs/700"):
-                return self.workflow_run()
+            if "/actions/runs/" in endpoint:
+                identity = recorded
+                return self.workflow_run(
+                    workflow_id=canonical_workflow_id,
+                    workflow_path=gate.CANONICAL_WORKFLOW_PATH,
+                    head=recorded_head,
+                    pr_number=recorded_pr,
+                    run_id=canonical_run_id,
+                    attempt=1,
+                    pull_requests=run_pull_requests,
+                )
             if "/pulls/" in endpoint:
                 return next(values)
             if "/git/commits/" in endpoint:
@@ -484,12 +557,110 @@ class ReleaseGateTest(unittest.TestCase):
             raise AssertionError(args)
         # The post-merge candidate still requires a successful rollup for the head.
         rollup = {"data": {"repository": {"pullRequest": {"commits": {"nodes": [{"commit": {
-            "oid": self.head, "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False}, "nodes": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
+            "oid": recorded_head, "statusCheckRollup": {"contexts": {"pageInfo": {"hasNextPage": False}, "nodes": [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
         }}]}}}}}
         def routed(args, cwd):
             if args[:2] == ["api", "graphql"]: return rollup
             return fake(args, cwd)
         return routed
+
+    def test_merged_v2_exact_recorded_empty_association_passes(self) -> None:
+        record = self.evidence(version=2)
+        self.write_evidence(record)
+        merge = "c" * 40
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.merge_gh(
+                merge, self.tree, evidence=record, run_pull_requests=[]
+            ),
+        ):
+            self.assertEqual(gate.post_merge_gate(self.root, "115", merge, self.head, self.tree, "")["status"], "RELEASE_READY")
+
+    def test_merged_v2_wrong_recorded_identity_fails(self) -> None:
+        merge = "c" * 40
+        for field, value in (("workflowId", 601), ("workflowPath", "other.yml"),
+                             ("runId", 701), ("runAttempt", 2), ("head", "a" * 40)):
+            with self.subTest(field=field):
+                record = self.evidence(version=2, **({field: value} if field != "head" else {}))
+                if field == "head":
+                    record["head"] = value
+                self.write_evidence(record)
+                with mock.patch.object(gate, "gh", side_effect=self.merge_gh(merge, self.tree, evidence=record)):
+                    with self.assertRaises(gate.GateError):
+                        gate.post_merge_gate(self.root, "115", merge, self.head, self.tree, "")
+                (gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)).unlink()
+
+    def test_exact_issue_117_v1_fixture_passes_without_changing_evidence(self) -> None:
+        record = self.issue_117_evidence()
+        self.write_evidence(record)
+        before = json.dumps(record, sort_keys=True)
+        merge = gate.ISSUE_117_COMPATIBILITY["merge"]
+        pr = self.pr(head=record["head"], state="closed", merged=True, merge=merge)
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.merge_gh(
+                merge,
+                record["tree"],
+                evidence=record,
+                pr_values=[pr] * 4,
+                run_pull_requests=[],
+            ),
+        ):
+            gate.post_merge_gate(self.root, "117", merge, record["head"], record["tree"], "")
+        self.assertEqual(json.dumps(record, sort_keys=True), before)
+
+    def test_arbitrary_v1_evidence_fails(self) -> None:
+        record = self.evidence(version=1)
+        self.write_evidence(record)
+        merge = "c" * 40
+        with mock.patch.object(gate, "gh", side_effect=self.merge_gh(merge, self.tree, evidence=record)):
+            with self.assertRaisesRegex(gate.GateError, "issue #117"):
+                gate.post_merge_gate(self.root, "115", merge, self.head, self.tree, "")
+
+    def test_merged_v2_conflicting_non_empty_association_fails(self) -> None:
+        record = self.evidence(version=2)
+        self.write_evidence(record)
+        merge = "c" * 40
+        with mock.patch.object(
+            gate,
+            "gh",
+            side_effect=self.merge_gh(
+                merge,
+                self.tree,
+                evidence=record,
+                run_pull_requests=[{"number": 999}],
+            ),
+        ):
+            with self.assertRaisesRegex(gate.GateError, "another pull request"):
+                gate.post_merge_gate(self.root, "115", merge, self.head, self.tree, "")
+
+    def test_post_merge_run_attempt_change_during_validation_fails(self) -> None:
+        record = self.evidence(version=2)
+        self.write_evidence(record)
+        merge = "c" * 40
+        routed = self.merge_gh(
+            merge, self.tree, evidence=record, run_pull_requests=[]
+        )
+        detail_reads = 0
+
+        def changing_attempt(args, cwd):
+            nonlocal detail_reads
+            if len(args) > 1 and "/actions/runs/" in args[1]:
+                detail_reads += 1
+                if detail_reads == 2:
+                    return self.workflow_run(
+                        attempt=2,
+                        pull_requests=[],
+                    )
+            return routed(args, cwd)
+
+        with mock.patch.object(gate, "gh", side_effect=changing_attempt):
+            with self.assertRaisesRegex(gate.GateError, "attempt changed"):
+                gate.post_merge_gate(
+                    self.root, "115", merge, self.head, self.tree, ""
+                )
 
     def test_pass_evidence_binds_identity_and_wrong_identity_is_blocked(self) -> None:
         record = self.evidence()

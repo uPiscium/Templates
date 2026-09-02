@@ -59,8 +59,11 @@ just agent-core::release-gate-check <pr> <merge-commit> <dogfood-head> <dogfood-
 `release-candidate-check` verifies the current open PR and proves that the
 canonical `.github/workflows/template-ci.yml` workflow has exactly one
 unambiguous `pull_request` run for its exact head, with the current attempt
-completed successfully. It also requires the complete GitHub status rollup to
-be successful; an unrelated green context cannot substitute for Template CI.
+completed successfully. The workflow must be the exact active canonical
+workflow, and its workflow ID, path, run ID, and attempt are returned as an
+immutable Template CI identity; list, detail, and final list observations must
+retain that exact run/attempt identity. It also requires the complete GitHub
+status rollup to be successful; an unrelated green context cannot substitute for Template CI.
 Human review and security review remain explicit operator prerequisites rather
 than inferred CI evidence. The result identifies the exact PR head that can be
 frozen.
@@ -83,9 +86,10 @@ clean candidate root. Neither surface merges, pushes, tags, or publishes.
 operation identifier (and, where applicable, the downstream Task and PR) after
 the operator has run AKV against the exact candidate revision. The record binds
 the Templates repository, PR, candidate head/tree, canonical downstream
-repository, operation, optional IDs, PASS, and timestamp. It does not claim to
-capture raw command logs and does not alter downstream Task State, PR metadata,
-or merge state.
+repository, Template CI workflow ID/path and run ID/attempt, operation,
+optional IDs, PASS, and timestamp. New records are schema version 2 and carry
+all four Template CI identity fields. It does not claim to capture raw command
+logs and does not alter downstream Task State, PR metadata, or merge state.
 
 There is exactly one immutable PASS record per candidate head/tree. Its
 operation identifier names the overall externally executed dogfood run. When a
@@ -94,8 +98,12 @@ and record the aggregate PASS only after every applicable step has passed.
 
 `release-gate-check` is the final read-only assertion. It requires the recorded
 evidence, supplied merge commit, exact dogfooded **Templates** PR head/tree,
-and (when supplied) the intended version. It checks that the merge commit has
-the same tree as the frozen candidate. When a version is supplied, both the
+and (when supplied) the intended version. It independently verifies the merged
+PR's canonical repository, base, head, merge state, and merge commit, then
+checks that the merge commit has the same tree as the frozen candidate. The
+recorded workflow run is read again at the final boundary so its stable
+workflow, run, attempt, event, head, status, and conclusion fields must still
+match the immutable pre-merge binding. When a version is supplied, both the
 GitHub Release and the exact Git tag must be absent; an existing tag fails
 closed even without a Release object. It does not
 merge, create a release, publish a tag, or claim that a release was published.
@@ -158,10 +166,14 @@ Evidence is local and auditable under:
 .agent-core-release-gate/evidence/
 ```
 
-Each record is immutable and must not overwrite an earlier record. It binds
-the Templates PR number and exact frozen PR head/tree and the canonical AKV
-repository, operation, PASS outcome, timestamp, and Task/downstream PR when
-present. This is a narrow local operator self-attestation within the trusted
+Each record is immutable and must not overwrite an earlier record. Schema v2
+binds the Templates PR number and exact frozen PR head/tree, the canonical AKV
+repository, the exact Template CI workflow ID/path and run ID/attempt,
+operation, PASS outcome, timestamp, and Task/downstream PR when present. The
+loader accepts schema v1 structurally so old files remain readable; post-merge
+trusts v1 only for the narrow hardcoded issue #117 PR/head/tree/run/workflow/
+attempt/merge binding. There is no migration or evidence-upgrade command; do
+not rewrite evidence files. This is a narrow local operator self-attestation within the trusted
 operator/filesystem boundary, not a cryptographic downstream receipt. Its
 filename is exactly the SHA-256 digest of the canonical repository,
 PR, head, tree, and downstream-repository subject followed by `.json`; records
@@ -191,3 +203,23 @@ merge tree: 0eeaad174d2ff519a2db4b23ac80252c48d6bec7
 It is historical documentation, not a production input or a substitute for
 current CI, review, security, dogfood, or human merge evidence. Agent Core
 `VERSION` remains **3**.
+
+## Issue #117 legacy compatibility binding
+
+This is the sole v1 post-merge compatibility exception. It is an exact,
+hardcoded binding and is not a general legacy trust rule:
+
+```text
+PR:         117
+head:       9eb86882bbb569aeae356c59e7d459e9fd8ba4f9
+tree:       7c5c6fb0bd5e0e881510e256f0b76e95c304c9c5
+merge:      67fbc64e1127c19b9e424ab99dff4626f67be63b
+workflow:   .github/workflows/template-ci.yml (ID 329870494)
+run:        33584314368 (attempt 1)
+```
+
+Post-merge accepts a singleton `pull_requests` association only when it matches
+the merged PR exactly. An empty association is accepted only with immutable v2
+evidence, or with the exact guarded issue #117 compatibility binding above
+after merged-PR proof succeeds;
+non-empty conflicting or ambiguous associations always fail.

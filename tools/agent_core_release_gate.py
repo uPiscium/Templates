@@ -26,6 +26,19 @@ EVIDENCE_ROOT_NAME = ".agent-core-release-gate/evidence"
 GATE_TOOL_RELATIVE = "tools/agent_core_release_gate.py"
 GATE_LAUNCHER_RELATIVE = "tools/run_agent_core_release_gate.sh"
 
+# This is the sole legacy exception.  It describes the v1 receipt emitted by
+# issue #117; v1 is otherwise only a loadable file format, never a trust rule.
+ISSUE_117_COMPATIBILITY = {
+    "pr": 117,
+    "head": "9eb86882bbb569aeae356c59e7d459e9fd8ba4f9",
+    "tree": "7c5c6fb0bd5e0e881510e256f0b76e95c304c9c5",
+    "merge": "67fbc64e1127c19b9e424ab99dff4626f67be63b",
+    "workflowId": 329870494,
+    "workflowPath": CANONICAL_WORKFLOW_PATH,
+    "runId": 33584314368,
+    "runAttempt": 1,
+}
+
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 PR_RE = re.compile(r"[1-9][0-9]{0,8}")
 OPERATION_RE = re.compile(r"[a-z][a-z0-9._-]{0,63}")
@@ -371,6 +384,8 @@ def workflow_run_subject(
     workflow_id: int,
     expected_head: str,
     expected_pr: int,
+    *,
+    allow_empty_pull_requests: bool = False,
 ) -> tuple[int, int]:
     if not isinstance(run, dict):
         raise GateError("Template CI workflow run is invalid")
@@ -393,8 +408,13 @@ def workflow_run_subject(
     ):
         raise GateError("Template CI workflow run is not bound to the exact candidate")
     pull_requests = run.get("pull_requests")
-    if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+    if not isinstance(pull_requests, list) or (
+        len(pull_requests) != 1
+        and not (allow_empty_pull_requests and not pull_requests)
+    ):
         raise GateError("Template CI workflow run has ambiguous pull request identity")
+    if not pull_requests:
+        return run_id, attempt
     associated = pull_requests[0]
     if (
         not isinstance(associated, dict)
@@ -440,7 +460,7 @@ def exact_template_ci_run(
     return runs[0]
 
 
-def check_template_ci(root: Path, expected_head: str, expected_pr: int) -> None:
+def check_template_ci(root: Path, expected_head: str, expected_pr: int) -> dict[str, int | str]:
     workflow = gh(
         ["api", f"repos/{CANONICAL_REPO}/actions/workflows/template-ci.yml"],
         root,
@@ -468,6 +488,12 @@ def check_template_ci(root: Path, expected_head: str, expected_pr: int) -> None:
     final = exact_template_ci_run(root, workflow_id, expected_head, expected_pr)
     if workflow_run_subject(final, workflow_id, expected_head, expected_pr) != (run_id, attempt):
         raise GateError("Template CI workflow run changed during validation")
+    return {
+        "workflowId": workflow_id,
+        "workflowPath": CANONICAL_WORKFLOW_PATH,
+        "runId": run_id,
+        "runAttempt": attempt,
+    }
 
 
 def commit_tree(root: Path, commit: str, name: str = "commit") -> str:
@@ -482,7 +508,7 @@ def candidate(root: Path, number: str, *, require_open: bool = True) -> dict[str
     first = pull_request(root, number)
     head = validate_pr_identity(first, require_open=require_open)
     tree = commit_tree(root, head, "candidate commit")
-    check_template_ci(root, head, int(number))
+    template_ci = check_template_ci(root, head, int(number))
     check_rollup(root, number, head)
     final = pull_request(root, number)
     final_head = validate_pr_identity(final, require_open=require_open)
@@ -493,6 +519,7 @@ def candidate(root: Path, number: str, *, require_open: bool = True) -> dict[str
         "head": head,
         "tree": tree,
         "base": DEFAULT_BRANCH,
+        **template_ci,
         "ci": "PASS",
         "status": "READY_FOR_DOGFOOD",
     }
@@ -671,7 +698,7 @@ def validate_timestamp(value: Any) -> str:
 def validate_evidence_payload(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise GateError("evidence record is not a JSON object")
-    expected_keys = {
+    common_keys = {
         "schema",
         "version",
         "repo",
@@ -685,9 +712,19 @@ def validate_evidence_payload(value: Any) -> dict[str, Any]:
         "operation",
         "recordedAt",
     }
+    version = value.get("version")
+    if isinstance(version, bool):
+        version = None
+    identity_keys = {"workflowId", "workflowPath", "runId", "runAttempt"}
+    if version == 1:
+        expected_keys = common_keys
+    elif version == 2:
+        expected_keys = common_keys | identity_keys
+    else:
+        expected_keys = set()
     if set(value) != expected_keys:
         raise GateError("evidence record has an unexpected schema")
-    if value["schema"] != "agent-core-release-gate" or value["version"] != 1:
+    if value["schema"] != "agent-core-release-gate" or version not in {1, 2}:
         raise GateError("evidence schema version is unsupported")
     if value["repo"] != CANONICAL_REPO or value["downstreamRepo"] != DOWNSTREAM_REPO:
         raise GateError("evidence repository binding is invalid")
@@ -695,6 +732,12 @@ def validate_evidence_payload(value: Any) -> dict[str, Any]:
         raise GateError("evidence pull request is invalid")
     valid_sha(value["head"], "evidence head")
     valid_sha(value["tree"], "evidence tree")
+    if version == 2:
+        positive_optional_integer(value["workflowId"], "workflow ID")
+        if value["workflowPath"] != CANONICAL_WORKFLOW_PATH:
+            raise GateError("evidence workflow path is invalid")
+        positive_optional_integer(value["runId"], "run ID")
+        positive_optional_integer(value["runAttempt"], "run attempt")
     positive_optional_integer(value["task"], "Task ID")
     positive_optional_integer(value["downstreamPr"], "downstream PR")
     if value["outcome"] != "PASS":
@@ -784,11 +827,15 @@ def record_evidence(
 
     payload = {
         "schema": "agent-core-release-gate",
-        "version": 1,
+        "version": 2,
         "repo": CANONICAL_REPO,
         "pr": checked["pr"],
         "head": checked["head"],
         "tree": checked["tree"],
+        "workflowId": checked["workflowId"],
+        "workflowPath": checked["workflowPath"],
+        "runId": checked["runId"],
+        "runAttempt": checked["runAttempt"],
         "downstreamRepo": DOWNSTREAM_REPO,
         "task": task_id,
         "downstreamPr": downstream_pr_id,
@@ -841,6 +888,99 @@ def release_absent(root: Path, version: str) -> None:
         raise GateError(f"Git tag lookup returned unexpected HTTP status {tag_status}")
 
 
+def post_merge_template_ci(
+    root: Path,
+    expected_head: str,
+    expected_pr: int,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify the workflow and the exact run named by the selected receipt."""
+    workflow = gh(["api", f"repos/{CANONICAL_REPO}/actions/workflows/template-ci.yml"], root)
+    if not isinstance(workflow, dict):
+        raise GateError("canonical Template CI workflow metadata is invalid")
+    workflow_id = workflow.get("id")
+    if (
+        isinstance(workflow_id, bool)
+        or not isinstance(workflow_id, int)
+        or workflow_id <= 0
+        or workflow.get("path") != CANONICAL_WORKFLOW_PATH
+        or workflow.get("state") != "active"
+    ):
+        raise GateError("canonical Template CI workflow is missing or inactive")
+
+    if evidence["version"] == 2:
+        identity = {
+            "workflowId": evidence["workflowId"],
+            "workflowPath": evidence["workflowPath"],
+            "runId": evidence["runId"],
+            "runAttempt": evidence["runAttempt"],
+        }
+    else:
+        identity = ISSUE_117_COMPATIBILITY
+    if identity["workflowId"] != workflow_id or identity["workflowPath"] != workflow.get("path"):
+        raise GateError("recorded Template CI workflow identity is not canonical")
+    detail = gh(["api", f"repos/{CANONICAL_REPO}/actions/runs/{identity['runId']}"], root)
+    try:
+        observed = workflow_run_subject(
+            detail,
+            workflow_id,
+            expected_head,
+            expected_pr,
+            # An empty list is safe here only because v1 was already gated by
+            # the exact issue #117 predicate, while v2 carries immutable CI
+            # identity. Arbitrary v1 never reaches this call.
+            allow_empty_pull_requests=True,
+        )
+    except GateError:
+        raise
+    if observed != (identity["runId"], identity["runAttempt"]):
+        raise GateError("recorded Template CI workflow attempt changed during validation")
+    if detail.get("status") != "completed" or detail.get("conclusion") != "success":
+        raise GateError("Template CI workflow is incomplete or unsuccessful")
+    return detail
+
+
+def evidence_matches_issue_117(
+    evidence: dict[str, Any], pr: int, head: str, tree: str, merge: str
+) -> bool:
+    return (
+        evidence["version"] == 1
+        and pr == ISSUE_117_COMPATIBILITY["pr"]
+        and head == ISSUE_117_COMPATIBILITY["head"]
+        and tree == ISSUE_117_COMPATIBILITY["tree"]
+        and merge == ISSUE_117_COMPATIBILITY["merge"]
+        and evidence["pr"] == pr
+        and evidence["head"] == head
+        and evidence["tree"] == tree
+    )
+
+
+def validate_post_merge_run_association(
+    run: dict[str, Any], *, expected_pr: int, expected_head: str, legacy: bool
+) -> None:
+    associations = run.get("pull_requests")
+    if not isinstance(associations, list):
+        raise GateError("Template CI workflow pull request identity is invalid")
+    if not associations:
+        # v1 reaches this point only after the exact issue #117 binding and
+        # merged-PR proof above; v2 has its immutable recorded run identity.
+        return
+    if len(associations) != 1:
+        raise GateError("Template CI workflow has ambiguous pull request identity")
+    associated = associations[0]
+    if (
+        not isinstance(associated, dict)
+        or associated.get("number") != expected_pr
+        or (associated.get("head") or {}).get("sha") != expected_head
+        or (associated.get("head") or {}).get("repo", {}).get("url")
+        != f"https://api.github.com/repos/{CANONICAL_REPO}"
+        or (associated.get("base") or {}).get("ref") != DEFAULT_BRANCH
+        or (associated.get("base") or {}).get("repo", {}).get("url")
+        != f"https://api.github.com/repos/{CANONICAL_REPO}"
+    ):
+        raise GateError("Template CI workflow run belongs to another pull request")
+
+
 def post_merge_gate(
     root: Path,
     number: str,
@@ -863,8 +1003,9 @@ def post_merge_gate(
     if merged.get("merge_commit_sha") != merge_commit:
         raise GateError("supplied merge commit is not the pull request merge commit")
 
-    checked = candidate(root, number, require_open=False)
-    if checked["head"] != dogfood_head or checked["tree"] != dogfood_tree:
+    checked_head = validate_pr_identity(merged, require_open=False)
+    checked_tree = commit_tree(root, checked_head, "candidate commit")
+    if checked_head != dogfood_head or checked_tree != dogfood_tree:
         raise GateError("dogfood identity does not match the current pull request candidate")
     merge_tree = commit_tree(root, merge_commit, "merge commit")
     if merge_tree != dogfood_tree:
@@ -881,12 +1022,21 @@ def post_merge_gate(
     matching = [
         item
         for item in records
-        if item["pr"] == checked["pr"]
+        if item["pr"] == int(number)
         and item["head"] == dogfood_head
         and item["tree"] == dogfood_tree
     ]
     if len(matching) != 1:
         raise GateError("exact PASS dogfood evidence is missing, duplicated, or conflicting")
+    selected = matching[0]
+    legacy = selected["version"] == 1
+    if legacy and not evidence_matches_issue_117(selected, int(number), dogfood_head, dogfood_tree, merge_commit):
+        raise GateError("legacy evidence is not the guarded issue #117 compatibility binding")
+    check_rollup(root, number, dogfood_head)
+    detail = post_merge_template_ci(root, dogfood_head, int(number), selected)
+    validate_post_merge_run_association(
+        detail, expected_pr=int(number), expected_head=dogfood_head, legacy=legacy
+    )
     if version:
         release_absent(root, version)
 
@@ -898,8 +1048,12 @@ def post_merge_gate(
         or final.get("merge_commit_sha") != merge_commit
     ):
         raise GateError("pull request merge identity changed during release-gate validation")
+    final_detail = post_merge_template_ci(root, dogfood_head, int(number), selected)
+    validate_post_merge_run_association(
+        final_detail, expected_pr=int(number), expected_head=dogfood_head, legacy=legacy
+    )
     return {
-        "pr": checked["pr"],
+        "pr": int(number),
         "status": "RELEASE_READY",
         "dogfoodHead": dogfood_head,
         "dogfoodTree": dogfood_tree,
