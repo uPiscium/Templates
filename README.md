@@ -350,13 +350,20 @@ tracked files unchanged, and reports `PROVENANCE_REBOUND` or idempotent
 `PROVENANCE_ALREADY_BOUND`. Then run ordinary consumer verification and the
 existing `automation::commit`.
 
+Rebind is an operator-serialized maintenance transition: no commit or other
+authority mutation may run concurrently in the target worktree. Current Agent
+Core revisions additionally fence rebind and commit with the same ordered
+common/admin migration locks; explicit quiescence preserves the older pending
+consumer needed to finish an in-flight upgrade.
+
 Eligibility requires the exact registered maintenance Task/worktree/branch/HEAD,
 one standard active receipt matching exactly one authority, no consumed,
 source-recovery, or ambiguous state, and old/expected revisions in the same
 Templates object database. Missing authority remains the Issue #85 route;
 committed or consumed state, including a crossed guarded publication boundary,
 is rejected. Handled failures
-rollback safely and concurrency fails closed. No cross-filesystem atomicity or
+rollback safely; operations by current lock-aware revisions fail closed under
+the shared fence. No cross-filesystem atomicity or
 hard-crash durability claim is made; that remains Issue #89 scope.
 
 For AgentKnowledgeVault Issue #19, the exact command is:

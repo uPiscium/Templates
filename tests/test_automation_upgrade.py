@@ -1435,6 +1435,13 @@ mod project 'just/project/mod.just'
             self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy maintenance")["status"])
             self.assertFalse(legacy_path.exists())
 
+    def test_commit_rejects_unsafe_canonical_authority_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            authority = upgrade.authority_path(repo)
+            authority.chmod(0o666)
+            self.assertIn("unsafe canonical private-state record mode", self._commit_error(repo))
+
     def test_linked_worktree_ignores_legacy_authority_under_escaped_common_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1500,8 +1507,11 @@ mod project 'just/project/mod.just'
                 with self.assertRaisesRegex(upgrade.UpgradeError, "injected staging check failure"):
                     upgrade.commit(repo, "TASK-78", "legacy rollback")
             self.assertEqual(active_bytes, upgrade.receipt_path(repo).read_bytes())
-            self.assertEqual(authority_bytes, legacy_path.read_bytes())
-            self.assertFalse(new_path.exists())
+            current_new, current_fallback = upgrade._authority_locations(repo)
+            restored = current_new if current_new.exists() else current_fallback
+            self.assertIsNotNone(restored)
+            assert restored is not None
+            self.assertEqual(authority_bytes, restored.read_bytes())
             self.assertFalse(upgrade.consumed_receipt_path(repo).exists())
             self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy retry")["status"])
             self.assertFalse(legacy_path.exists())
@@ -1515,12 +1525,18 @@ mod project 'just/project/mod.just'
             legacy_path.parent.mkdir(parents=True, exist_ok=True)
             legacy_path.write_bytes(new_path.read_bytes())
             new_path.write_text("not json\n", encoding="utf-8")
-            self.assertIn("invalid successful-upgrade authority", self._commit_error(repo))
+            self.assertRegex(
+                self._commit_error(repo),
+                "invalid successful-upgrade authority|invalid legacy private-state record",
+            )
             new_path.unlink()
             common_file = root / "common-file"
             common_file.write_text("not a git directory\n", encoding="utf-8")
             with mock.patch.object(upgrade, "common_git_dir", return_value=common_file):
-                self.assertIn("missing or invalid successful-upgrade authority", self._commit_error(repo))
+                self.assertRegex(
+                    self._commit_error(repo),
+                    "missing or invalid successful-upgrade authority|cannot inspect private-state namespace",
+                )
 
     def test_no_change_upgrade_preserves_consumed_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2308,6 +2324,12 @@ mod project 'just/project/mod.just'
             )["state"])
             self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
 
+            authority_locations = upgrade._authority_locations(task)
+            self.assertEqual(
+                1,
+                sum(path is not None and path.is_file() for path in authority_locations),
+                authority_locations,
+            )
             committed = json.loads(
                 self._cli(task, ["commit", fixture["task"], "fix: upgrade Agent Core v3.1.2"]).stdout
             )

@@ -773,7 +773,11 @@ Tracked files remain unchanged; success reports `PROVENANCE_REBOUND`, while an
 already-correct pair reports `PROVENANCE_ALREADY_BOUND`. Missing authority
 remains the #85 route; committed or consumed state, including a crossed guarded
 publication boundary, rejects.
-Handled failures roll back safely and concurrency fails closed. No
+Rebind is operator-serialized: older pending consumers require quiescence with
+no concurrent commit or authority mutation. Current lock-aware revisions also
+share ordered common/admin migration fences for rebind and commit. Handled
+failures roll back safely, and concurrency among those current revisions fails
+closed. No
 cross-filesystem atomicity or hard-crash durability is claimed; that remains
 #89 scope.
 

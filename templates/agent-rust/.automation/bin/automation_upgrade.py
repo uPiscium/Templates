@@ -233,7 +233,13 @@ def write_authority(repo: Path, receipt: dict) -> None:
     )
 
 
-def _write_authority_at(path: Path, value: dict, *, admin: Path | None = None) -> None:
+def _write_authority_at(
+    path: Path,
+    value: dict,
+    *,
+    admin: Path | None = None,
+    lock_held: bool = False,
+) -> None:
     try:
         if admin is not None:
             parent_before = path.parent.resolve()
@@ -247,6 +253,7 @@ def _write_authority_at(path: Path, value: dict, *, admin: Path | None = None) -
         private_state.exclusive_write_bytes(
             path,
             json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+            _lock_held=lock_held,
         )
     except (OSError, ValueError, RuntimeError, private_state.GitPrivateStateError) as exc:
         raise UpgradeError(f"cannot publish authority record: {path}") from exc
@@ -275,6 +282,7 @@ def validate_authority(repo: Path, receipt: dict) -> Path:
             raise UpgradeError("missing or invalid successful-upgrade authority record")
         path = legacy_path
     try:
+        private_state.validate_record(path, "successful-upgrade authority record")
         authority = json.loads(
             private_state.read_bytes(path, "successful-upgrade authority record").decode("utf-8")
         )
@@ -1642,9 +1650,10 @@ def _rename_record_at(source: str, destination: str, *, source_dir_fd: int, dest
     )
 
 
-def _replace_standard_pair(repo: Path, old_receipt_raw: bytes, old_authority_raw: bytes,
-                           receipt: dict, authority_path_value: Path,
-                           receipt_identity: tuple[int, int], authority_identity: tuple[int, int]) -> None:
+def _replace_standard_pair_locked(repo: Path, old_receipt_raw: bytes, old_authority_raw: bytes,
+                                  receipt: dict, authority_path_value: Path,
+                                  receipt_identity: tuple[int, int],
+                                  authority_identity: tuple[int, int]) -> None:
     active = receipt_path(repo)
     admin = _rollback_authority_guard(repo, authority_path_value)
     _validate_admin_record_parent(authority_path_value, admin)
@@ -1823,6 +1832,25 @@ def _replace_standard_pair(repo: Path, old_receipt_raw: bytes, old_authority_raw
                 pass
 
 
+def _replace_standard_pair(repo: Path, old_receipt_raw: bytes, old_authority_raw: bytes,
+                           receipt: dict, authority_path_value: Path,
+                           receipt_identity: tuple[int, int], authority_identity: tuple[int, int]) -> None:
+    """Replace a common/admin record pair under ordered namespace fences."""
+    try:
+        with private_state.mutation_lock(repo, admin=True):
+            _replace_standard_pair_locked(
+                repo,
+                old_receipt_raw,
+                old_authority_raw,
+                receipt,
+                authority_path_value,
+                receipt_identity,
+                authority_identity,
+            )
+    except private_state.GitPrivateStateError as exc:
+        raise UpgradeError(str(exc)) from exc
+
+
 def _rebind_maintenance_provenance(repo: Path, source_path: Path, expected_source_revision: str,
                                    *, require_source_head: bool,
                                    expected_implementation_revision: str | None = None) -> dict:
@@ -1994,6 +2022,16 @@ def recover_maintenance_authority_from_source(
         expected_implementation_revision
     )
     task_id, branch, worktree = require_maintenance(target_repo)
+    try:
+        private_state.prepare(
+            target_repo,
+            admin=True,
+            common_dir=common_git_dir(target_repo),
+            admin_dir=worktree_admin_dir(target_repo),
+            _allow_incomplete_recovery=True,
+        )
+    except private_state.GitPrivateStateError as exc:
+        raise UpgradeError(str(exc)) from exc
     source, implementation_revision = resolve_clean_source_worktree(templates_source_root)
     if implementation_revision != expected_implementation_revision:
         raise UpgradeError("source HEAD does not match the expected implementation revision")
@@ -2215,7 +2253,7 @@ def normalized_git_fingerprint(fingerprint: object) -> dict[str, object]:
     }
 
 
-def _commit_mode(
+def _commit_mode_locked(
     repo: Path,
     task: str,
     message: str,
@@ -2321,7 +2359,12 @@ def _commit_mode(
         )
         if json.loads(authority_raw.decode("utf-8")) != expected_authority:
             raise UpgradeError("authority changed before commit mutation")
-        private_state.unlink(authority, expected_identity=authority_identity)
+        private_state.unlink(
+            authority,
+            expected_identity=authority_identity,
+            expected_content=authority_raw,
+            _lock_held=True,
+        )
         authority_removed = True
         if mode == "source_recovery" and proof is not None:
             current_proof, current_proof_identity = private_state.read_bytes_identity(
@@ -2329,7 +2372,12 @@ def _commit_mode(
             )
             if current_proof != proof_raw or current_proof_identity != proof_identity:
                 raise UpgradeError("source-recovery proof changed before removal")
-            private_state.unlink(proof_path, expected_identity=proof_identity)
+            private_state.unlink(
+                proof_path,
+                expected_identity=proof_identity,
+                expected_content=proof_raw,
+                _lock_held=True,
+            )
             proof_removed = True
         task_state_dir(repo)
         private_index.unlink(missing_ok=True)
@@ -2391,7 +2439,9 @@ def _commit_mode(
             if proof_removed and proof is not None:
                 if proof_raw is None:
                     raise UpgradeError("source-recovery proof bytes were not captured")
-                private_state.exclusive_write_bytes(proof_path, proof_raw)
+                private_state.exclusive_write_bytes(
+                    proof_path, proof_raw, _lock_held=True
+                )
         except (OSError, UpgradeError, private_state.GitPrivateStateError) as rollback_error:
             rollback_errors.append(f"proof restore failed: {rollback_error}")
         try:
@@ -2401,7 +2451,12 @@ def _commit_mode(
                     "worktree": receipt["worktree"], "authority_nonce": receipt["authority_nonce"],
                     "receipt_sha256": receipt_digest(receipt),
                 }
-                _write_authority_at(authority, restored, admin=_rollback_authority_guard(repo, authority))
+                _write_authority_at(
+                    authority,
+                    restored,
+                    admin=_rollback_authority_guard(repo, authority),
+                    lock_held=True,
+                )
         except (OSError, UpgradeError) as rollback_error:
             rollback_errors.append(f"authority restore failed: {rollback_error}")
         try:
@@ -2446,6 +2501,35 @@ def _commit_mode(
             "mergePerformed": False,
         })
     return result
+
+
+def _commit_mode(
+    repo: Path,
+    task: str,
+    message: str,
+    mode: str,
+    *,
+    source_root: Path | None = None,
+    expected_implementation_revision: str | None = None,
+) -> dict[str, object]:
+    try:
+        private_state.prepare(
+            repo,
+            admin=True,
+            common_dir=common_git_dir(repo),
+            admin_dir=worktree_admin_dir(repo),
+        )
+        with private_state.mutation_lock(repo, admin=True):
+            return _commit_mode_locked(
+                repo,
+                task,
+                message,
+                mode,
+                source_root=source_root,
+                expected_implementation_revision=expected_implementation_revision,
+            )
+    except private_state.GitPrivateStateError as exc:
+        raise UpgradeError(str(exc)) from exc
 
 
 def commit(repo: Path, task: str, message: str) -> dict[str, object]:
