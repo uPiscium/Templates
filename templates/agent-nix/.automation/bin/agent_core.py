@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import task_lifecycle as lifecycle
 import publication_metadata as publication
 import task_contract
+import git_private_state as private_state
 
 try:
     import tomllib
@@ -527,22 +528,31 @@ def validate_integration(root: Path, pr: str) -> dict:
 
 
 def integration_checkpoint(root: Path, pr: str) -> Path:
-    path = common_git_dir(root) / "opencode" / "integration" / f"pr-{pr}.head"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+    try:
+        return private_state.integration_checkpoint(root, pr)
+    except private_state.GitPrivateStateError as exc:
+        raise AutomationError(str(exc)) from exc
 
 
 def integrate_check(root: Path, pr: str) -> None:
     data = validate_integration(root, pr)
-    integration_checkpoint(root, pr).write_text(data["headRefOid"] + "\n", encoding="utf-8")
+    try:
+        private_state.prepare(root)
+        checkpoint = integration_checkpoint(root, pr)
+        private_state.write_bytes(checkpoint, (data["headRefOid"] + "\n").encode("utf-8"))
+    except private_state.GitPrivateStateError as exc:
+        raise AutomationError(str(exc)) from exc
     print(json.dumps({"pr": data["number"], "head": data["headRefOid"], "status": "verified"}))
 
 
 def integrate_merge(root: Path, pr: str) -> None:
     checkpoint = integration_checkpoint(root, pr)
-    if not checkpoint.exists():
+    if not checkpoint.exists() or checkpoint.is_symlink() or not checkpoint.is_file():
         raise AutomationError("run integrate::check before merge")
-    expected = checkpoint.read_text(encoding="utf-8").strip()
+    try:
+        expected = private_state.read_bytes(checkpoint, "integration checkpoint").decode("utf-8").strip()
+    except (private_state.GitPrivateStateError, UnicodeDecodeError) as exc:
+        raise AutomationError("integration checkpoint is invalid") from exc
     data = validate_integration(root, pr)
     if data["headRefOid"] != expected:
         raise AutomationError(f"PR head moved after integration check: expected {expected}, got {data['headRefOid']}")

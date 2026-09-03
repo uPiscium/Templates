@@ -180,6 +180,23 @@ class PristineDiscardTest(unittest.TestCase):
         state = lifecycle.state_path(restarted.path).read_text(encoding="utf-8")
         self.assertIn(f"- Base revision: {current_main}", state)
 
+    def test_discard_preserves_opencode_project_file(self) -> None:
+        task_worktree = self.start()
+        foreign = Path(command("git", "rev-parse", "--git-common-dir", cwd=self.repo)) / "opencode"
+        if not foreign.is_absolute():
+            foreign = self.repo / foreign
+        foreign.write_bytes(b"0123456789abcdef0123456789abcdef01234567")
+        before = foreign.lstat()
+        with self.github():
+            discard.task_discard_pristine(self.repo, "13")
+        after = foreign.lstat()
+        self.assertFalse(task_worktree.exists())
+        self.assertEqual(foreign.read_bytes(), b"0123456789abcdef0123456789abcdef01234567")
+        self.assertEqual(
+            (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns),
+            (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns),
+        )
+
     def test_dirty_worktree_is_rejected(self) -> None:
         task_worktree = self.start()
         (task_worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")

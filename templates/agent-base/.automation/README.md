@@ -184,5 +184,29 @@ upgrade with changes replaces the active receipt and removes the previous consum
 receipt. A no-change invocation returns `NO_CHANGES` without discarding existing
 receipt lifecycle evidence.
 
+## Git-private runtime state
+
+Agent Core owns only the `agent-core/` namespace beneath Git administrative
+directories. Shared cleanup receipts, pristine-discard receipts, integration
+checkpoints, the cleanup lock, the migration lock, and historical hashed
+maintenance authorities live beneath `<git-common-dir>/agent-core/`.
+Worktree-specific maintenance `authority.json` and
+`source-recovery-proof.json` live beneath
+`<absolute-git-dir>/agent-core/automation-maintenance/`. Repository Task State
+under `.task-state/`, Git's `info/exclude`, and committed `.opencode/` and
+`opencode.json` configuration are separate ownership surfaces.
+
+The path `<git-common-dir>/opencode` is OpenCode-owned when it is a regular
+file and Agent Core never changes its bytes, metadata, or identity. A legacy
+directory at that name is accepted only when every entry has an explicitly
+known historical Agent Core path and schema. Known regular records are copied byte for
+byte with durable no-overwrite publication, all conflicts are rejected before
+migration mutation, and legacy records are removed only after every canonical
+destination is verified equivalent. Equivalent dual state and partially
+completed migration are retryable. Unknown entries, unexpected nesting,
+symlinks, and special files fail closed. The historical `cleanup.lock` is
+retained as a mixed-version locking ABI and is acquired before the canonical
+lock; it is never renamed or unlinked automatically.
+
 Do not bypass these guards with raw Git/GitHub commands. Merge is not part of
 this workflow and remains the separately gated Main Orchestrator operation.

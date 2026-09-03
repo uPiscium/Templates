@@ -312,6 +312,7 @@ mod project 'just/project/mod.just'
         self._git(["switch", "--detach", "HEAD"], bridge)
         implementation = (
             "components/agent-core/.automation/bin/automation_upgrade.py",
+            "components/agent-core/.automation/bin/git_private_state.py",
             "tools/automation_recovery_bridge.py",
             "just/agent-core.just",
         )
@@ -1316,14 +1317,14 @@ mod project 'just/project/mod.just'
             authority = upgrade.authority_path(repo)
             active_bytes = active.read_bytes()
             authority_bytes = authority.read_bytes()
-            original_unlink = Path.unlink
+            original_unlink = upgrade.private_state.unlink
 
             def fail_authority_unlink(path: Path, *args, **kwargs) -> None:
                 if path == authority:
                     raise OSError("injected authority consume failure")
                 original_unlink(path, *args, **kwargs)
 
-            with mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_authority_unlink):
+            with mock.patch.object(upgrade.private_state, "unlink", side_effect=fail_authority_unlink):
                 with self.assertRaises(upgrade.UpgradeError):
                     upgrade.commit(repo, "TASK-78", "maintenance")
             self.assertEqual(active_bytes, active.read_bytes())
@@ -2080,6 +2081,7 @@ mod project 'just/project/mod.just'
             )
             implementation = (
                 "components/agent-core/.automation/bin/automation_upgrade.py",
+                "components/agent-core/.automation/bin/git_private_state.py",
                 "components/agent-core/.automation/bin/task_contract.py",
                 "components/agent-core/.automation/bin/task_lifecycle.py",
                 "tools/automation_recovery_bridge.py",
@@ -2179,7 +2181,10 @@ mod project 'just/project/mod.just'
             receipt_before = self._receipt(task)
             self.assertEqual(old_revision, receipt_before["source_revision"])
             self.assertEqual(local_baseline, receipt_before["authority_head"])
-            self.assertTrue(upgrade.authority_path(task).is_file())
+            _, installed_legacy_authority = upgrade._authority_locations(task)
+            self.assertIsNotNone(installed_legacy_authority)
+            assert installed_legacy_authority is not None
+            self.assertTrue(installed_legacy_authority.is_file())
             self.assertFalse(upgrade.consumed_receipt_path(task).exists())
             self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
 

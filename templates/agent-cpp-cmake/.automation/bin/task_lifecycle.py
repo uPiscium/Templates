@@ -15,6 +15,10 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import git_private_state as private_state
+
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 WORK_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -1053,19 +1057,19 @@ def require_cleanup_base_revision(root: Path, base_revision: str) -> None:
 
 def cleanup_receipt_path(root: Path, task: str) -> Path:
     validate_task(task)
-    return common_git_dir(root) / "opencode" / "cleanup" / f"{task}.json"
+    try:
+        return private_state.cleanup_receipt(root, task)
+    except private_state.GitPrivateStateError as exc:
+        raise LifecycleError(str(exc)) from exc
 
 
 @contextmanager
 def cleanup_lock(root: Path):
-    path = common_git_dir(root) / "opencode" / "cleanup.lock"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
+    try:
+        with private_state.cleanup_lock(root):
             yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except private_state.GitPrivateStateError as exc:
+        raise LifecycleError(str(exc)) from exc
 
 
 def cleanup_repository(root: Path) -> str:
@@ -1230,8 +1234,8 @@ def read_cleanup_receipt(path: Path, task: str) -> dict:
     if path.is_symlink() or not path.is_file():
         raise LifecycleError("cleanup receipt is not a regular local file")
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(private_state.read_bytes(path, "cleanup receipt").decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, private_state.GitPrivateStateError) as exc:
         raise LifecycleError("cleanup receipt is invalid") from exc
     required = {"schema_version", "task", "status", "worktree", "branch", "local_head", "evidence"}
     if (
@@ -1317,7 +1321,10 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
         run(["git", "update-ref", "-d", branch_ref, expected_head], cwd=root)
     if git("rev-parse", "--verify", branch_ref, cwd=root, check=False):
         raise LifecycleError("cleanup failed to delete the expected local Task branch")
-    receipt.unlink(missing_ok=True)
+    try:
+        private_state.unlink(receipt)
+    except private_state.GitPrivateStateError as exc:
+        raise LifecycleError(str(exc)) from exc
     print(
         json.dumps(
             {
@@ -1332,13 +1339,18 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
 
 def task_cleanup(root: Path, task: str) -> None:
     require_main_worktree(root)
-    receipt = cleanup_receipt_path(root, task)
     with cleanup_lock(root):
+        receipt = cleanup_receipt_path(root, task)
         if receipt.exists():
             finish_cleanup(root, read_cleanup_receipt(receipt, task), receipt)
             return
         plan = cleanup_plan(root, task)
-        atomic_json(receipt, plan)
+        try:
+            private_state.write_bytes(
+                receipt, (json.dumps(plan, sort_keys=True) + "\n").encode("utf-8")
+            )
+        except private_state.GitPrivateStateError as exc:
+            raise LifecycleError(str(exc)) from exc
         finish_cleanup(root, plan, receipt)
 
 
