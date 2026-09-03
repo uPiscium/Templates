@@ -178,6 +178,23 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
 
 
 class PostMergeFinalizationTest(RepositoryFixture):
+    def test_cleanup_preserves_opencode_project_file(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        foreign = Path(command("git", "rev-parse", "--git-common-dir", cwd=self.repo)) / "opencode"
+        if not foreign.is_absolute():
+            foreign = self.repo / foreign
+        foreign.write_bytes(b"0123456789abcdef0123456789abcdef01234567")
+        before = foreign.lstat()
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        after = foreign.lstat()
+        self.assertFalse(task_worktree.exists())
+        self.assertEqual(foreign.read_bytes(), b"0123456789abcdef0123456789abcdef01234567")
+        self.assertEqual(
+            (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns),
+            (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns),
+        )
+
     def merged_evidence(self, task_worktree: Path, merge_oid: str, **changes: object) -> dict:
         value = {
             "number": 93,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,28 @@ spec.loader.exec_module(agent_core)
 
 
 class AgentCoreSafetyTest(unittest.TestCase):
+    def test_integration_checkpoint_preserves_opencode_project_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True,
+                           capture_output=True)
+            foreign = root / ".git/opencode"
+            foreign.write_bytes(b"0123456789abcdef0123456789abcdef01234567")
+            before = foreign.lstat()
+            details = {"number": 12, "headRefOid": "a" * 40}
+            with mock.patch.object(agent_core, "validate_integration", return_value=details):
+                agent_core.integrate_check(root, "12")
+            after = foreign.lstat()
+            self.assertEqual(foreign.read_bytes(), b"0123456789abcdef0123456789abcdef01234567")
+            self.assertEqual(
+                (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns),
+                (after.st_dev, after.st_ino, after.st_mode, after.st_size, after.st_mtime_ns),
+            )
+            self.assertEqual(
+                (root / ".git/agent-core/integration/pr-12.head").read_bytes(),
+                b"a" * 40 + b"\n",
+            )
+
     def test_automation_core_change_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -59,7 +82,8 @@ class AgentCoreSafetyTest(unittest.TestCase):
     def test_integration_merge_rejects_head_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            checkpoint = root / "checkpoint"
+            checkpoint = root / "agent-core" / "integration" / "checkpoint"
+            checkpoint.parent.mkdir(parents=True)
             checkpoint.write_text("old-head\n", encoding="utf-8")
             with (
                 mock.patch.object(agent_core, "integration_checkpoint", return_value=checkpoint),

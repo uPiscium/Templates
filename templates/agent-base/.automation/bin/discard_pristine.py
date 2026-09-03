@@ -7,7 +7,10 @@ import re
 import sys
 from pathlib import Path
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 import task_lifecycle as lifecycle
+import git_private_state as private_state
 
 
 RECEIPT_SCHEMA_VERSION = 1
@@ -18,12 +21,10 @@ REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 def discard_receipt_path(root: Path, task: str) -> Path:
     lifecycle.validate_task(task)
-    return (
-        lifecycle.common_git_dir(root)
-        / "opencode"
-        / "discard-pristine"
-        / f"{task}.json"
-    )
+    try:
+        return private_state.discard_receipt(root, task)
+    except private_state.GitPrivateStateError as exc:
+        raise lifecycle.LifecycleError(str(exc)) from exc
 
 
 def _branch_publication_configuration(record: lifecycle.WorktreeRecord) -> list[str]:
@@ -255,8 +256,8 @@ def read_discard_receipt(root: Path, path: Path, task: str) -> dict:
             "discard-pristine receipt is not a regular local file"
         )
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value = json.loads(private_state.read_bytes(path, "discard-pristine receipt").decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, private_state.GitPrivateStateError) as exc:
         raise lifecycle.LifecycleError("discard-pristine receipt is invalid") from exc
     required = {
         "schema_version",
@@ -394,7 +395,10 @@ def finish_pristine_discard(root: Path, plan: dict, receipt: Path) -> None:
             "discard-pristine failed to delete the expected local Task branch"
         )
 
-    receipt.unlink(missing_ok=True)
+    try:
+        private_state.unlink(receipt)
+    except private_state.GitPrivateStateError as exc:
+        raise lifecycle.LifecycleError(str(exc)) from exc
     print(
         json.dumps(
             {
@@ -421,7 +425,12 @@ def task_discard_pristine(root: Path, task: str) -> None:
             )
             return
         plan = pristine_discard_plan(root, task)
-        lifecycle.atomic_json(receipt, plan)
+        try:
+            private_state.write_bytes(
+                receipt, (json.dumps(plan, sort_keys=True) + "\n").encode("utf-8")
+            )
+        except private_state.GitPrivateStateError as exc:
+            raise lifecycle.LifecycleError(str(exc)) from exc
         finish_pristine_discard(root, plan, receipt)
 
 

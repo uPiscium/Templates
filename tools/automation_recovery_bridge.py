@@ -27,6 +27,7 @@ PUBLICATION_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / 
 AGENT_CORE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "agent_core.py"
 MAINTENANCE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "maintenance_lifecycle.py"
 CANONICAL_MODULES = (
+    ("git_private_state", "components/agent-core/.automation/bin/git_private_state.py"),
     ("task_lifecycle", "components/agent-core/.automation/bin/task_lifecycle.py"),
     ("task_contract", "components/agent-core/.automation/bin/task_contract.py"),
     ("publication_metadata", "components/agent-core/.automation/bin/publication_metadata.py"),
@@ -270,6 +271,7 @@ def _verified_modules(root: Path, revision: str):
                 module.run = _pinned_run
             loaded["automation_upgrade"]._GIT_EXECUTABLE = git
             loaded["automation_upgrade"].git_executable = lambda: git
+            loaded["git_private_state"]._GIT_EXECUTABLE = str(git)
             loaded["task_lifecycle"].gh = lambda *args, cwd, check=True: _pinned_run(
                 ["gh", *args], cwd=cwd, check=check)
             loaded["agent_core"].gh = lambda *args, cwd=None: _pinned_run(
@@ -294,22 +296,31 @@ def _verified_task_contract(root: Path, revision: str):
     """Load the contract and its dependency exclusively from HEAD Git blobs."""
     contract_oid, contract_mode = _tree_blob(root, revision, "components/agent-core/.automation/bin/task_contract.py")
     lifecycle_oid, lifecycle_mode = _tree_blob(root, revision, "components/agent-core/.automation/bin/task_lifecycle.py")
+    private_state_oid, private_state_mode = _tree_blob(
+        root, revision, "components/agent-core/.automation/bin/git_private_state.py"
+    )
     with tempfile.TemporaryDirectory(prefix="automation-contract-") as directory:
         directory_path = Path(directory)
         lifecycle_path = directory_path / "task_lifecycle.py"
         contract_path = directory_path / "task_contract.py"
+        private_state_path = directory_path / "git_private_state.py"
+        private_state_path.write_bytes(_blob(root, private_state_oid))
         lifecycle_path.write_bytes(_blob(root, lifecycle_oid))
         contract_path.write_bytes(_blob(root, contract_oid))
         # The Git modes are validated by _tree_blob; the private copies need
         # not retain executable bits and must not be writable by other users.
         os.chmod(lifecycle_path, 0o600)
         os.chmod(contract_path, 0o600)
+        os.chmod(private_state_path, 0o600)
         lifecycle_name = f"_templates_verified_lifecycle_{secrets.token_hex(16)}"
         contract_name = f"_templates_verified_contract_{secrets.token_hex(16)}"
         previous_lifecycle = sys.modules.get("task_lifecycle")
+        previous_private_state = sys.modules.get("git_private_state")
+        old_path = list(sys.path)
         previous_bytecode = sys.dont_write_bytecode
         sys.dont_write_bytecode = True
         try:
+            sys.path.insert(0, str(directory_path))
             lifecycle_spec = importlib.util.spec_from_file_location(lifecycle_name, lifecycle_path)
             if lifecycle_spec is None or lifecycle_spec.loader is None:
                 raise BridgeError("cannot create specification for verified Task Contract dependency")
@@ -317,6 +328,7 @@ def _verified_task_contract(root: Path, revision: str):
             sys.modules[lifecycle_name] = lifecycle
             sys.modules["task_lifecycle"] = lifecycle
             lifecycle_spec.loader.exec_module(lifecycle)
+            sys.modules["git_private_state"]._GIT_EXECUTABLE = str(trusted_git())
 
             def trusted_lifecycle_run(command, *, cwd=None, check=True):
                 if not command or command[0] != "git":
@@ -352,6 +364,11 @@ def _verified_task_contract(root: Path, revision: str):
                 sys.modules.pop("task_lifecycle", None)
             else:
                 sys.modules["task_lifecycle"] = previous_lifecycle
+            if previous_private_state is None:
+                sys.modules.pop("git_private_state", None)
+            else:
+                sys.modules["git_private_state"] = previous_private_state
+            sys.path[:] = old_path
             sys.dont_write_bytecode = previous_bytecode
 
 
@@ -359,9 +376,16 @@ def _verified_task_contract(root: Path, revision: str):
 def _verified_engine(root: Path, revision: str):
     oid, mode = _tree_blob(root, revision, "components/agent-core/.automation/bin/automation_upgrade.py")
     engine_bytes = _blob(root, oid)
+    private_oid, private_mode = _tree_blob(
+        root, revision, "components/agent-core/.automation/bin/git_private_state.py"
+    )
+    private_bytes = _blob(root, private_oid)
     _clean_root(root, revision)
     with tempfile.TemporaryDirectory(prefix="automation-bridge-") as directory:
         path = Path(directory) / "engine.py"
+        private_path = Path(directory) / "git_private_state.py"
+        private_path.write_bytes(private_bytes)
+        os.chmod(private_path, 0o600)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -378,15 +402,20 @@ def _verified_engine(root: Path, revision: str):
             raise
         name = f"_templates_verified_engine_{secrets.token_hex(16)}"
         previous = sys.dont_write_bytecode
+        previous_private_state = sys.modules.get("git_private_state")
+        old_path = list(sys.path)
         sys.dont_write_bytecode = True
         spec = None
         try:
+            sys.path.insert(0, directory)
+            sys.modules.pop("git_private_state", None)
             spec = importlib.util.spec_from_file_location(name, path)
             if spec is None or spec.loader is None:
                 raise BridgeError("cannot create specification for verified recovery engine")
             engine = importlib.util.module_from_spec(spec)
             sys.modules[name] = engine
             spec.loader.exec_module(engine)
+            sys.modules["git_private_state"]._GIT_EXECUTABLE = str(trusted_git())
             yield engine
         except BridgeError:
             raise
@@ -394,6 +423,11 @@ def _verified_engine(root: Path, revision: str):
             raise BridgeError(f"cannot load verified recovery engine: {exc}") from exc
         finally:
             sys.modules.pop(name, None)
+            if previous_private_state is None:
+                sys.modules.pop("git_private_state", None)
+            else:
+                sys.modules["git_private_state"] = previous_private_state
+            sys.path[:] = old_path
             sys.dont_write_bytecode = previous
 
 

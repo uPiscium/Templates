@@ -148,6 +148,12 @@ files unchanged. It reports `PROVENANCE_REBOUND` or idempotent
 `PROVENANCE_ALREADY_BOUND`; then run ordinary consumer verification and the
 existing `automation::commit`.
 
+Rebind is an operator-serialized maintenance transition: no commit or other
+authority mutation may run concurrently in the target worktree. Current Agent
+Core revisions additionally fence rebind and commit with the same ordered
+common/admin migration locks; the explicit quiescence requirement preserves the
+older pending consumer needed to finish an in-flight upgrade.
+
 Eligibility is exact: registered maintenance Task/worktree/branch/HEAD; one
 standard active receipt matching exactly one authority; safe pending Agent
 Core paths/fingerprints only; no consumed, source-recovery, or ambiguous state;
@@ -155,7 +161,8 @@ the old and expected revisions in the same Templates object database; and an
 identical expected canonical diff. Missing authority remains the Issue #85
 route. Committed or consumed state, including a crossed guarded publication
 boundary, is rejected. Handled
-failures roll back safely and concurrency fails closed. No cross-filesystem
+failures roll back safely; operations by current revisions fail closed under the
+shared fence. No cross-filesystem
 atomicity or hard-crash durability is claimed; that remains Issue #89 scope.
 
 The receipt is schema-1 JSON containing Task identity (`task_id`, `branch`, and
@@ -183,6 +190,51 @@ atomicity is claimed. After a successful commit it is consumed at
 upgrade with changes replaces the active receipt and removes the previous consumed
 receipt. A no-change invocation returns `NO_CHANGES` without discarding existing
 receipt lifecycle evidence.
+
+## Git-private runtime state
+
+Agent Core owns only the `agent-core/` namespace beneath Git administrative
+directories. Shared cleanup receipts, pristine-discard receipts, integration
+checkpoints, the cleanup lock, the migration lock, and historical hashed
+maintenance authorities live beneath `<git-common-dir>/agent-core/`.
+Worktree-specific maintenance `authority.json` and
+`source-recovery-proof.json` live beneath
+`<absolute-git-dir>/agent-core/automation-maintenance/`. Repository Task State
+under `.task-state/`, Git's `info/exclude`, and committed `.opencode/` and
+`opencode.json` configuration are separate ownership surfaces.
+
+The path `<git-common-dir>/opencode` is OpenCode-owned when it is a regular
+file and Agent Core never changes its bytes, metadata, or identity. A legacy
+directory at that name is accepted only when every entry satisfies the exact
+historical path, schema, Task/branch/worktree identity, repository syntax, and
+authority/proof relationship that Agent Core produced. The legacy namespace,
+subdirectories, records, and lock must be owned by the current effective user.
+Directories require owner access and reject group/other mutation while retaining
+historically produced read/traverse modes such as `0755`; records and locks reject
+group/other mutation and executable bits. Canonical directories
+are exactly mode `0700`, and canonical records, locks, and publication
+artifacts are exactly mode `0600`.
+
+Known records are copied byte for byte with durable no-overwrite publication,
+all conflicts are rejected before migration mutation, and legacy records are
+removed only after every canonical destination is mode-, owner-, and
+content-equivalent. The legacy cleanup-lock inode is acquired nonblocking and
+hard-linked into the canonical cleanup-lock path before its legacy name is
+removed. Existing waiters therefore remain fenced on the same inode. A
+contended legacy lock, or distinct legacy and canonical lock inodes, reports a
+precise `BLOCKED` condition rather than claiming migration success. Successful
+cutover removes the legacy lock last and then removes the empty `opencode/`
+directory, leaving the path available to OpenCode.
+
+Canonical publication is serialized by `migration.lock`. Only exact owned
+`.migrate.<pid>.<16-lowercase-hex>` and
+`.record.<pid>.<16-lowercase-hex>` artifacts are recoverable. On the next
+operation they are validated and durably removed under that lock before the
+legacy source is retried or an already-durable destination is used. Equivalent
+dual state, partial legacy removal, and interruption before or after durable
+publication are therefore retryable. Unknown entries, malformed temporary
+names, unsafe modes/ownership, unexpected nesting, symlinks, and special files
+fail closed without promotion.
 
 Do not bypass these guards with raw Git/GitHub commands. Merge is not part of
 this workflow and remains the separately gated Main Orchestrator operation.

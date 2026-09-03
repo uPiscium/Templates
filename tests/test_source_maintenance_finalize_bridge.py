@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,24 @@ class FirstAdoptionFinalizeBridgeTest(unittest.TestCase):
     def configure(self, repo: Path) -> None:
         self.git(repo, "config", "user.name", "Bootstrap Finalize Test")
         self.git(repo, "config", "user.email", "bootstrap@example.invalid")
+
+    def test_verified_module_bundle_loads_actual_private_state_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            self.git(source, "init", "-b", "main")
+            self.configure(source)
+            for _, relative in bridge.CANONICAL_MODULES:
+                destination = source / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(ROOT / relative, destination)
+            self.git(source, "add", ".")
+            self.git(source, "commit", "-m", "verified module fixture")
+            revision = self.git(source, "rev-parse", "HEAD")
+            with bridge._verified_modules(source, revision) as loaded:
+                self.assertIn("git_private_state", loaded)
+                self.assertIn("maintenance_lifecycle", loaded)
+                self.assertTrue(callable(loaded["maintenance_lifecycle"].maintenance_finalize))
 
     def test_stale_main_bootstraps_fast_forward_and_exact_idempotent_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -312,6 +312,7 @@ mod project 'just/project/mod.just'
         self._git(["switch", "--detach", "HEAD"], bridge)
         implementation = (
             "components/agent-core/.automation/bin/automation_upgrade.py",
+            "components/agent-core/.automation/bin/git_private_state.py",
             "tools/automation_recovery_bridge.py",
             "just/agent-core.just",
         )
@@ -1316,14 +1317,14 @@ mod project 'just/project/mod.just'
             authority = upgrade.authority_path(repo)
             active_bytes = active.read_bytes()
             authority_bytes = authority.read_bytes()
-            original_unlink = Path.unlink
+            original_unlink = upgrade.private_state.unlink
 
             def fail_authority_unlink(path: Path, *args, **kwargs) -> None:
                 if path == authority:
                     raise OSError("injected authority consume failure")
                 original_unlink(path, *args, **kwargs)
 
-            with mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_authority_unlink):
+            with mock.patch.object(upgrade.private_state, "unlink", side_effect=fail_authority_unlink):
                 with self.assertRaises(upgrade.UpgradeError):
                     upgrade.commit(repo, "TASK-78", "maintenance")
             self.assertEqual(active_bytes, active.read_bytes())
@@ -1434,6 +1435,13 @@ mod project 'just/project/mod.just'
             self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy maintenance")["status"])
             self.assertFalse(legacy_path.exists())
 
+    def test_commit_rejects_unsafe_canonical_authority_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._apply_fixture(Path(directory))
+            authority = upgrade.authority_path(repo)
+            authority.chmod(0o666)
+            self.assertIn("unsafe canonical private-state record mode", self._commit_error(repo))
+
     def test_linked_worktree_ignores_legacy_authority_under_escaped_common_parent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1499,8 +1507,11 @@ mod project 'just/project/mod.just'
                 with self.assertRaisesRegex(upgrade.UpgradeError, "injected staging check failure"):
                     upgrade.commit(repo, "TASK-78", "legacy rollback")
             self.assertEqual(active_bytes, upgrade.receipt_path(repo).read_bytes())
-            self.assertEqual(authority_bytes, legacy_path.read_bytes())
-            self.assertFalse(new_path.exists())
+            current_new, current_fallback = upgrade._authority_locations(repo)
+            restored = current_new if current_new.exists() else current_fallback
+            self.assertIsNotNone(restored)
+            assert restored is not None
+            self.assertEqual(authority_bytes, restored.read_bytes())
             self.assertFalse(upgrade.consumed_receipt_path(repo).exists())
             self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "legacy retry")["status"])
             self.assertFalse(legacy_path.exists())
@@ -1514,12 +1525,18 @@ mod project 'just/project/mod.just'
             legacy_path.parent.mkdir(parents=True, exist_ok=True)
             legacy_path.write_bytes(new_path.read_bytes())
             new_path.write_text("not json\n", encoding="utf-8")
-            self.assertIn("invalid successful-upgrade authority", self._commit_error(repo))
+            self.assertRegex(
+                self._commit_error(repo),
+                "invalid successful-upgrade authority|invalid legacy private-state record",
+            )
             new_path.unlink()
             common_file = root / "common-file"
             common_file.write_text("not a git directory\n", encoding="utf-8")
             with mock.patch.object(upgrade, "common_git_dir", return_value=common_file):
-                self.assertIn("missing or invalid successful-upgrade authority", self._commit_error(repo))
+                self.assertRegex(
+                    self._commit_error(repo),
+                    "missing or invalid successful-upgrade authority|cannot inspect private-state namespace",
+                )
 
     def test_no_change_upgrade_preserves_consumed_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2080,6 +2097,7 @@ mod project 'just/project/mod.just'
             )
             implementation = (
                 "components/agent-core/.automation/bin/automation_upgrade.py",
+                "components/agent-core/.automation/bin/git_private_state.py",
                 "components/agent-core/.automation/bin/task_contract.py",
                 "components/agent-core/.automation/bin/task_lifecycle.py",
                 "tools/automation_recovery_bridge.py",
@@ -2179,7 +2197,10 @@ mod project 'just/project/mod.just'
             receipt_before = self._receipt(task)
             self.assertEqual(old_revision, receipt_before["source_revision"])
             self.assertEqual(local_baseline, receipt_before["authority_head"])
-            self.assertTrue(upgrade.authority_path(task).is_file())
+            _, installed_legacy_authority = upgrade._authority_locations(task)
+            self.assertIsNotNone(installed_legacy_authority)
+            assert installed_legacy_authority is not None
+            self.assertTrue(installed_legacy_authority.is_file())
             self.assertFalse(upgrade.consumed_receipt_path(task).exists())
             self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
 
@@ -2303,6 +2324,12 @@ mod project 'just/project/mod.just'
             )["state"])
             self.assertEqual(local_baseline, self._git(["rev-parse", "HEAD"], task))
 
+            authority_locations = upgrade._authority_locations(task)
+            self.assertEqual(
+                1,
+                sum(path is not None and path.is_file() for path in authority_locations),
+                authority_locations,
+            )
             committed = json.loads(
                 self._cli(task, ["commit", fixture["task"], "fix: upgrade Agent Core v3.1.2"]).stdout
             )
