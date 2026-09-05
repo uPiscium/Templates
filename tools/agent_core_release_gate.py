@@ -526,6 +526,36 @@ def candidate(root: Path, number: str, *, require_open: bool = True) -> dict[str
     }
 
 
+def release_ready_check(root: Path, number: str) -> dict[str, Any]:
+    """Assert that the open candidate has exactly one current v2 dogfood receipt."""
+    checked = candidate(root, number)
+    records = load_evidence_records(root, create=False)
+    matching = [
+        (record, digest)
+        for record, digest in records
+        if record["pr"] == checked["pr"]
+        and record["head"] == checked["head"]
+        and record["tree"] == checked["tree"]
+    ]
+    if len(matching) != 1:
+        raise GateError("exact current dogfood evidence is missing, duplicated, or stale")
+    evidence, evidence_digest = matching[0]
+    if evidence["version"] != 2:
+        raise GateError("release-ready evidence must use schema version 2")
+    for field in ("workflowId", "workflowPath", "runId", "runAttempt"):
+        if evidence[field] != checked[field]:
+            raise GateError(f"release-ready evidence {field} does not match the candidate")
+
+    final = candidate(root, number)
+    if final != checked:
+        raise GateError("candidate changed during release-ready validation")
+    return {
+        **checked,
+        "status": "READY_FOR_MERGE",
+        "evidenceSha256": evidence_digest,
+    }
+
+
 def validate_git_execution_configuration(root: Path) -> None:
     raw_names = git(
         ["config", "--local", "--no-includes", "--null", "--name-only", "--list"],
@@ -684,6 +714,13 @@ def positive_optional_integer(value: Any, name: str) -> int | None:
     return value
 
 
+def positive_integer(value: Any, name: str) -> int:
+    checked = positive_optional_integer(value, name)
+    if checked is None:
+        raise GateError(f"evidence {name} is invalid")
+    return checked
+
+
 def validate_timestamp(value: Any) -> str:
     if not isinstance(value, str) or not value.endswith("Z"):
         raise GateError("evidence timestamp is invalid")
@@ -734,11 +771,11 @@ def validate_evidence_payload(value: Any) -> dict[str, Any]:
     valid_sha(value["head"], "evidence head")
     valid_sha(value["tree"], "evidence tree")
     if version == 2:
-        positive_optional_integer(value["workflowId"], "workflow ID")
+        positive_integer(value["workflowId"], "workflow ID")
         if value["workflowPath"] != CANONICAL_WORKFLOW_PATH:
             raise GateError("evidence workflow path is invalid")
-        positive_optional_integer(value["runId"], "run ID")
-        positive_optional_integer(value["runAttempt"], "run attempt")
+        positive_integer(value["runId"], "run ID")
+        positive_integer(value["runAttempt"], "run attempt")
     positive_optional_integer(value["task"], "Task ID")
     positive_optional_integer(value["downstreamPr"], "downstream PR")
     if value["outcome"] != "PASS":
@@ -1118,6 +1155,8 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     candidate_parser = commands.add_parser("release-candidate-check")
     candidate_parser.add_argument("pr")
+    ready_parser = commands.add_parser("release-ready-check")
+    ready_parser.add_argument("pr")
     worktree_parser = commands.add_parser("release-candidate-worktree")
     worktree_parser.add_argument("pr")
     worktree_parser.add_argument("path")
@@ -1140,6 +1179,8 @@ def main() -> int:
     root, implementation_head = source_root()
     if arguments.command == "release-candidate-check":
         output = candidate(root, arguments.pr)
+    elif arguments.command == "release-ready-check":
+        output = release_ready_check(root, arguments.pr)
     elif arguments.command == "release-candidate-worktree":
         output = create_or_verify_worktree(root, arguments.pr, arguments.path)
     elif arguments.command == "dogfood-evidence-record":

@@ -17,6 +17,10 @@ release-candidate-check pr:
     /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-candidate-check {{quote(pr)}}
 
 [working-directory: root]
+release-ready-check pr:
+    /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-ready-check {{quote(pr)}}
+
+[working-directory: root]
 release-candidate-worktree pr path:
     /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-candidate-worktree {{quote(pr)}} {{quote(path)}}
 

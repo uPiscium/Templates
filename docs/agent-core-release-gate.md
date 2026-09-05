@@ -5,13 +5,14 @@ affect downstream repositories. It is a gate and evidence protocol, not a
 merge or release publisher. The canonical path is:
 
 ```text
-Issue -> Draft PR -> full Templates CI/review/security
-      -> freeze exact PR head
-      -> detached, clean release-candidate worktree
-      -> exact-revision AKV downstream dogfood
-      -> PASS evidence
-      -> human merge
-      -> merge-tree equality
+Issue -> Draft PR -> full CI/review/security
+      -> release-candidate-check
+      -> detached exact candidate
+      -> exact downstream dogfood
+      -> dogfood-evidence-record
+      -> release-ready-check
+      -> human Ready/Merge
+      -> release-gate-check
       -> release
 ```
 
@@ -53,6 +54,7 @@ These are the narrow operator surfaces for the release gate:
 just agent-core::release-candidate-check <pr>
 just agent-core::release-candidate-worktree <pr> <path>
 just agent-core::dogfood-evidence-record <pr> <operation> [task] [downstream_pr]
+just agent-core::release-ready-check <pr>
 just agent-core::release-gate-check <pr> <merge-commit> <dogfood-head> <dogfood-tree> [version]
 ```
 
@@ -96,6 +98,17 @@ operation identifier names the overall externally executed dogfood run. When a
 run has several required guarded steps, complete or safely resume all of them
 and record the aggregate PASS only after every applicable step has passed.
 
+`release-ready-check` is a read-only pre-merge assertion. It requires the PR to
+be open and bound to the exact current candidate, an exact successful canonical
+Template CI workflow/run/attempt and complete status rollup, and exactly one
+strict schema-v2 PASS evidence record matching the current PR, head, tree,
+downstream repository, and the same Template CI workflow/run/attempt identity.
+It revalidates those bindings immediately before the operator marks the PR
+`READY_FOR_MERGE`; it does not mark the PR ready, merge it, or publish a
+release. Dogfood described only in a PR body is not canonical release-gate
+evidence. For downstream-sensitive changes, human Ready/Merge must not occur
+before this check is PASS.
+
 `release-gate-check` is the final read-only assertion. It requires the recorded
 evidence, supplied merge commit, exact dogfooded **Templates** PR head/tree,
 and (when supplied) the intended version. It independently verifies the merged
@@ -135,7 +148,10 @@ tag. It must never reuse a tag that appeared after the gate check.
 6. Require every applicable dogfood operation to PASS. A blocked, skipped, or
    unexecuted operation is not PASS. Preserve and resume partial guarded
    downstream progress rather than resetting it or launching duplicate work.
-7. After a human merges the PR, obtain the actual merge commit and run
+7. Run `release-ready-check <pr>` immediately before the human marks the PR
+   `READY_FOR_MERGE`. This must be PASS for downstream-sensitive changes;
+   dogfood claims in the PR body alone do not satisfy the evidence gate.
+8. After the human marks the PR ready and merges it, obtain the actual merge commit and run
    `release-gate-check <pr> <merge-commit> <dogfood-head> <dogfood-tree>
    [version]`. Release only after this check is PASS and the operator has
    retained the evidence.

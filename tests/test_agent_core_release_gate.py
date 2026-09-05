@@ -379,6 +379,136 @@ class ReleaseGateTest(unittest.TestCase):
             target.write_text(content, encoding="utf-8")
             os.chmod(target, 0o600)
 
+    def test_release_ready_accepts_exact_open_candidate_and_v2_evidence(self) -> None:
+        record = self.evidence()
+        self.write_evidence(record, canonical_bytes=True)
+        target = gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            result = gate.release_ready_check(self.root, "115")
+        self.assertEqual(result["status"], "READY_FOR_MERGE")
+        self.assertEqual((result["pr"], result["head"], result["tree"]),
+                         (115, self.head, self.tree))
+        self.assertEqual(result["evidenceSha256"], hashlib.sha256(target.read_bytes()).hexdigest())
+
+    def test_release_ready_rejects_absent_evidence_root(self) -> None:
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            with self.assertRaisesRegex(gate.GateError, "required directory is missing"):
+                gate.release_ready_check(self.root, "115")
+
+    def test_release_ready_rejects_previous_head_evidence(self) -> None:
+        self.write_evidence(self.evidence(head="a" * 40))
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            with self.assertRaisesRegex(gate.GateError, "missing, duplicated, or stale"):
+                gate.release_ready_check(self.root, "115")
+
+    def test_release_ready_rejects_each_recorded_ci_identity_mismatch(self) -> None:
+        for field, value, message in (
+            ("workflowId", 601, "workflowId"),
+            ("workflowPath", ".github/workflows/other.yml", "workflow path"),
+            ("runId", 701, "runId"),
+            ("runAttempt", 2, "runAttempt"),
+        ):
+            with self.subTest(field=field):
+                record = self.evidence(**{field: value})
+                self.write_evidence(record)
+                target = gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)
+                try:
+                    with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+                        with self.assertRaisesRegex(gate.GateError, message):
+                            gate.release_ready_check(self.root, "115")
+                finally:
+                    target.unlink()
+
+    def test_release_ready_rejects_duplicate_matching_records(self) -> None:
+        checked = {"pr": 115, "head": self.head, "tree": self.tree,
+                   "base": "main", "workflowId": 600,
+                   "workflowPath": gate.CANONICAL_WORKFLOW_PATH,
+                   "runId": 700, "runAttempt": 1, "ci": "PASS",
+                   "status": "READY_FOR_DOGFOOD"}
+        record = self.evidence()
+        with mock.patch.object(gate, "candidate", return_value=checked), mock.patch.object(
+            gate, "load_evidence_records", return_value=[(record, "a" * 64), (record, "b" * 64)]
+        ):
+            with self.assertRaisesRegex(gate.GateError, "duplicated"):
+                gate.release_ready_check(self.root, "115")
+
+    def test_release_ready_rejects_non_pass_and_legacy_evidence(self) -> None:
+        for record, message in (
+            (dict(self.evidence(), outcome="FAIL"), "outcome is not PASS"),
+            (self.evidence(version=1), "schema version 2"),
+        ):
+            with self.subTest(message=message):
+                self.write_evidence(record)
+                with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+                    with self.assertRaisesRegex(gate.GateError, message):
+                        gate.release_ready_check(self.root, "115")
+                (gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)).unlink()
+
+    def test_schema_v2_requires_non_null_ci_identity(self) -> None:
+        for field in ("workflowId", "runId", "runAttempt"):
+            with self.subTest(field=field):
+                record = self.evidence(**{field: None})
+                self.write_evidence(record)
+                target = gate.evidence_root(self.root, create=False) / gate.evidence_filename(record)
+                try:
+                    with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+                        with self.assertRaisesRegex(gate.GateError, "is invalid"):
+                            gate.release_ready_check(self.root, "115")
+                finally:
+                    target.unlink()
+
+    def test_release_ready_uses_strict_evidence_file_safety(self) -> None:
+        record = self.evidence()
+        directory = gate.evidence_root(self.root, create=True)
+        target = directory / gate.evidence_filename(record)
+        content = json.dumps(record) + "\n"
+        outside = self.root / "outside.json"
+        outside.write_text(content, encoding="utf-8")
+        outside.chmod(0o600)
+
+        target.symlink_to(outside)
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            with self.assertRaisesRegex(gate.GateError, "unsafe or unexpected"):
+                gate.release_ready_check(self.root, "115")
+        target.unlink()
+
+        target.write_text(content, encoding="utf-8")
+        target.chmod(0o644)
+        with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
+            with self.assertRaisesRegex(gate.GateError, "unsafe or unexpected"):
+                gate.release_ready_check(self.root, "115")
+        target.chmod(0o600)
+
+        with mock.patch.object(gate.os, "geteuid", return_value=os.geteuid() + 1), mock.patch.object(
+            gate, "gh", side_effect=self.gh_candidate()
+        ):
+            with self.assertRaisesRegex(gate.GateError, "directory is unsafe"):
+                gate.release_ready_check(self.root, "115")
+
+    def test_release_ready_rejects_closed_or_merged_pr(self) -> None:
+        for pr in (
+            self.pr(state="closed"),
+            self.pr(state="closed", merged=True, merge="c" * 40),
+        ):
+            with self.subTest(merged=pr["merged"]), mock.patch.object(
+                gate, "gh", side_effect=self.gh_candidate(pr_values=[pr])
+            ):
+                with self.assertRaisesRegex(gate.GateError, "not open"):
+                    gate.release_ready_check(self.root, "115")
+
+    def test_release_ready_rejects_candidate_change_during_final_recheck(self) -> None:
+        checked = {"pr": 115, "head": self.head, "tree": self.tree,
+                   "base": "main", "workflowId": 600,
+                   "workflowPath": gate.CANONICAL_WORKFLOW_PATH,
+                   "runId": 700, "runAttempt": 1, "ci": "PASS",
+                   "status": "READY_FOR_DOGFOOD"}
+        changed = dict(checked, head="b" * 40, tree="c" * 40)
+        with mock.patch.object(gate, "candidate", side_effect=[checked, changed]), mock.patch.object(
+            gate, "load_evidence_records", return_value=[(self.evidence(), "a" * 64)]
+        ):
+            with self.assertRaisesRegex(gate.GateError, "candidate changed"):
+                gate.release_ready_check(self.root, "115")
+
     def test_recorded_pass_evidence_contains_all_identity_bindings(self) -> None:
         with mock.patch.object(gate, "gh", side_effect=self.gh_candidate()):
             record = gate.record_evidence(self.root, "115", "dogfood-run", "116", "7")
