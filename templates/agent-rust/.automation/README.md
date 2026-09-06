@@ -226,6 +226,17 @@ precise `BLOCKED` condition rather than claiming migration success. Successful
 cutover removes the legacy lock last and then removes the empty `opencode/`
 directory, leaving the path available to OpenCode.
 
+Canonical reads and writes validate the actual descriptor chain. The opened Git
+administrative boundary must be owned by the effective user and must not be
+group- or world-writable; ordinary non-writable modes such as `0755` remain
+valid. Every opened directory below `agent-core/` must be owned by that user at
+exact mode `0700`, and every opened authority record must be a regular file
+owned by that user at exact mode `0600`. Traversal and record access remain
+descriptor-anchored with `O_NOFOLLOW`, and reads retain device, inode, and size
+stability checks. Recognized legacy `opencode/` state keeps its separate bounded
+migration mode policy. Hostile processes running as the same effective user are
+outside this local-filesystem trust boundary.
+
 Canonical publication is serialized by `migration.lock`. Only exact owned
 `.migrate.<pid>.<16-lowercase-hex>` and
 `.record.<pid>.<16-lowercase-hex>` artifacts are recoverable. On the next

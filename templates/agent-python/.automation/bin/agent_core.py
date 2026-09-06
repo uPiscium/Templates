@@ -551,7 +551,9 @@ def integrate_merge(root: Path, pr: str) -> None:
         raise AutomationError("run integrate::check before merge")
     try:
         expected = private_state.read_bytes(checkpoint, "integration checkpoint").decode("utf-8").strip()
-    except (private_state.GitPrivateStateError, UnicodeDecodeError) as exc:
+    except private_state.GitPrivateStateError as exc:
+        raise AutomationError(str(exc)) from exc
+    except UnicodeDecodeError as exc:
         raise AutomationError("integration checkpoint is invalid") from exc
     data = validate_integration(root, pr)
     if data["headRefOid"] != expected:

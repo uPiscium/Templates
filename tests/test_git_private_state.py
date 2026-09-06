@@ -141,6 +141,248 @@ class GitPrivateStateTest(unittest.TestCase):
             self.assertEqual(before, self.identity(foreign))
             self.assertEqual(b"0123456789abcdef0123456789abcdef01234567", foreign.read_bytes())
 
+    def canonical_checkpoint(self, root: Path) -> tuple[Path, Path]:
+        repo = self.repository(root)
+        private_state.prepare(repo)
+        checkpoint = private_state.integration_checkpoint(repo, "12")
+        private_state.write_bytes(checkpoint, b"a" * 40 + b"\n")
+        return repo, checkpoint
+
+    def test_canonical_read_validates_opened_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, checkpoint = self.canonical_checkpoint(Path(directory))
+            common = private_state.common_git_dir(repo)
+            common.chmod(0o755)
+            self.assertEqual(0o700, stat.S_IMODE((common / "agent-core").stat().st_mode))
+            self.assertEqual(
+                0o700, stat.S_IMODE((common / "agent-core/integration").stat().st_mode)
+            )
+            self.assertEqual(0o600, stat.S_IMODE(checkpoint.stat().st_mode))
+            self.assertEqual(b"a" * 40 + b"\n", private_state.read_bytes(checkpoint))
+
+    def test_canonical_read_rejects_unsafe_directory_and_record_modes(self) -> None:
+        cases = (
+            ("namespace", "agent-core", 0o755),
+            ("subdirectory", "agent-core/integration", 0o755),
+            ("record", "agent-core/integration/pr-12.head", 0o644),
+        )
+        for case, relative, mode in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repo, checkpoint = self.canonical_checkpoint(Path(directory))
+                common = private_state.common_git_dir(repo)
+                (common / relative).chmod(mode)
+                with self.assertRaisesRegex(private_state.GitPrivateStateError, "unsafe.*mode"):
+                    private_state.read_bytes(checkpoint, "integration checkpoint")
+
+    def test_canonical_read_rejects_writable_git_admin_boundary(self) -> None:
+        for mode in (0o775, 0o757):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as directory:
+                repo, checkpoint = self.canonical_checkpoint(Path(directory))
+                private_state.common_git_dir(repo).chmod(mode)
+                with self.assertRaisesRegex(
+                    private_state.GitPrivateStateError,
+                    "unsafe Git administrative directory mode",
+                ):
+                    private_state.read_bytes(checkpoint)
+
+    def test_canonical_write_rejects_writable_git_admin_boundary(self) -> None:
+        for mode in (0o775, 0o757):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as directory:
+                repo = self.repository(Path(directory))
+                common = private_state.common_git_dir(repo)
+                common.chmod(mode)
+                with self.assertRaisesRegex(
+                    private_state.GitPrivateStateError,
+                    "unsafe Git administrative directory mode",
+                ):
+                    private_state.prepare(repo)
+                self.assertFalse((common / "agent-core").exists())
+
+    def test_canonical_read_rejects_invalid_descriptor_ownership(self) -> None:
+        cases = (
+            ("admin", "_require_git_admin_descriptor", ".git"),
+            ("namespace", "_require_canonical_dir_descriptor", ".git/agent-core"),
+            ("subdirectory", "_require_canonical_dir_descriptor",
+             ".git/agent-core/integration"),
+            ("record", "_require_canonical_file_descriptor",
+             ".git/agent-core/integration/pr-12.head"),
+        )
+        for case, helper_name, suffix in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repo, checkpoint = self.canonical_checkpoint(Path(directory))
+                expected = (repo / suffix).resolve()
+                original = getattr(private_state, helper_name)
+                effective_uid = private_state.os.geteuid()
+
+                def require_wrong_owner(descriptor, path, *args, **kwargs):
+                    if path.resolve() == expected:
+                        with mock.patch.object(
+                            private_state.os, "geteuid", return_value=effective_uid + 1
+                        ):
+                            return original(descriptor, path, *args, **kwargs)
+                    return original(descriptor, path, *args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        private_state, helper_name, side_effect=require_wrong_owner
+                    ),
+                    self.assertRaisesRegex(
+                        private_state.GitPrivateStateError, "unsafe.*ownership"
+                    ),
+                ):
+                    private_state.read_bytes(checkpoint)
+
+    def test_canonical_read_rejects_symlinks_and_special_record(self) -> None:
+        cases = ("namespace", "subdirectory", "record", "fifo")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, checkpoint = self.canonical_checkpoint(root)
+                common = private_state.common_git_dir(repo)
+                outside = root / "outside"
+                outside.mkdir(mode=0o700)
+                if case == "namespace":
+                    namespace = common / "agent-core"
+                    namespace.rename(common / "agent-core-saved")
+                    namespace.symlink_to(outside, target_is_directory=True)
+                elif case == "subdirectory":
+                    integration = common / "agent-core/integration"
+                    integration.rename(common / "agent-core/integration-saved")
+                    integration.symlink_to(outside, target_is_directory=True)
+                else:
+                    checkpoint.unlink()
+                    if case == "record":
+                        target = outside / "checkpoint"
+                        target.write_bytes(b"a" * 40 + b"\n")
+                        target.chmod(0o600)
+                        checkpoint.symlink_to(target)
+                    else:
+                        os.mkfifo(checkpoint, 0o600)
+                with self.assertRaises(private_state.GitPrivateStateError):
+                    private_state.read_bytes(checkpoint)
+
+    def test_canonical_directory_replacement_during_traversal_is_revalidated(self) -> None:
+        for case in ("namespace", "subdirectory"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, checkpoint = self.canonical_checkpoint(root)
+                common = private_state.common_git_dir(repo)
+                replacement = root / "replacement"
+                if case == "namespace":
+                    (replacement / "integration").mkdir(parents=True, mode=0o700)
+                    alternate = replacement / "integration/pr-12.head"
+                    trigger = "agent-core"
+                    destination = common / "agent-core"
+                else:
+                    replacement.mkdir(mode=0o755)
+                    alternate = replacement / "pr-12.head"
+                    trigger = "integration"
+                    destination = common / "agent-core/integration"
+                alternate.write_bytes(b"b" * 40 + b"\n")
+                alternate.chmod(0o600)
+                if case == "namespace":
+                    replacement.chmod(0o755)
+                real_open = private_state.os.open
+                replaced = False
+
+                def replace_then_open(path, flags, *args, **kwargs):
+                    nonlocal replaced
+                    if path == trigger and kwargs.get("dir_fd") is not None and not replaced:
+                        replaced = True
+                        destination.rename(destination.with_name(destination.name + "-saved"))
+                        replacement.rename(destination)
+                    return real_open(path, flags, *args, **kwargs)
+
+                with (
+                    mock.patch.object(
+                        private_state.os, "open", side_effect=replace_then_open
+                    ),
+                    self.assertRaisesRegex(
+                        private_state.GitPrivateStateError, "unsafe.*mode"
+                    ),
+                ):
+                    private_state.read_bytes(checkpoint)
+
+    def test_checkpoint_replacement_before_open_is_revalidated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, checkpoint = self.canonical_checkpoint(Path(directory))
+            real_open = private_state.os.open
+            replaced = False
+
+            def replace_then_open(path, flags, *args, **kwargs):
+                nonlocal replaced
+                if path == checkpoint.name and kwargs.get("dir_fd") is not None and not replaced:
+                    replaced = True
+                    checkpoint.unlink()
+                    checkpoint.write_bytes(b"b" * 40 + b"\n")
+                    checkpoint.chmod(0o644)
+                return real_open(path, flags, *args, **kwargs)
+
+            with (
+                mock.patch.object(private_state.os, "open", side_effect=replace_then_open),
+                self.assertRaisesRegex(private_state.GitPrivateStateError, "unsafe.*mode"),
+            ):
+                private_state.read_bytes(checkpoint)
+
+    def test_canonical_read_rejects_size_change_during_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _, checkpoint = self.canonical_checkpoint(Path(directory))
+            real_read = private_state.os.read
+            changed = False
+
+            def mutate_then_read(descriptor, size):
+                nonlocal changed
+                chunk = real_read(descriptor, size)
+                if not changed:
+                    changed = True
+                    with checkpoint.open("ab") as handle:
+                        handle.write(b"changed")
+                return chunk
+
+            with (
+                mock.patch.object(private_state.os, "read", side_effect=mutate_then_read),
+                self.assertRaisesRegex(
+                    private_state.GitPrivateStateError, "changed while reading"
+                ),
+            ):
+                private_state.read_bytes(checkpoint)
+
+    def test_all_canonical_authority_record_kinds_share_strict_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            private_state.prepare(repo, admin=True)
+            paths = (
+                private_state.cleanup_receipt(repo, "1"),
+                private_state.discard_receipt(repo, "1"),
+                private_state.integration_checkpoint(repo, "1"),
+                private_state.admin_maintenance(repo) / "authority.json",
+                private_state.admin_maintenance(repo) / "source-recovery-proof.json",
+            )
+            for path in paths:
+                private_state.write_bytes(path, b"authority")
+                path.chmod(0o644)
+                with self.subTest(path=path), self.assertRaisesRegex(
+                    private_state.GitPrivateStateError, "unsafe.*mode"
+                ):
+                    private_state.read_bytes(path)
+                path.chmod(0o600)
+
+    def test_legacy_namespace_is_not_confused_by_agent_core_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "agent-core"
+            parent.mkdir()
+            repo = self.repository(parent)
+            common = private_state.common_git_dir(repo)
+            legacy = common / "opencode/integration/pr-12.head"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(b"a" * 40 + b"\n")
+
+            private_state.prepare(repo)
+
+            self.assertFalse((common / "opencode").exists())
+            canonical = common / "agent-core/integration/pr-12.head"
+            self.assertEqual(b"a" * 40 + b"\n", private_state.read_bytes(canonical))
+
     def test_all_recognized_legacy_records_migrate_exactly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.repository(Path(directory))
