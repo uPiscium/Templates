@@ -193,23 +193,84 @@ def _open_dir(path: Path) -> int:
     return descriptor
 
 
-def _open_anchored_parent(path: Path) -> int:
-    """Open a state parent without following namespace or descendant symlinks."""
-    parts = path.parts
-    indexes = [index for index, part in enumerate(parts) if part in {NAMESPACE, LEGACY_NAMESPACE}]
+def _require_git_admin_descriptor(
+    descriptor: int, path: Path, what: str = "Git administrative directory"
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise GitPrivateStateError(f"unsafe {what}: {path}")
+    if metadata.st_uid != os.geteuid():
+        raise GitPrivateStateError(f"unsafe {what} ownership: {path}")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise GitPrivateStateError(f"unsafe {what} mode: {path}")
+    return metadata
+
+
+def _require_canonical_dir_descriptor(
+    descriptor: int, path: Path, what: str = "canonical private-state directory"
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise GitPrivateStateError(f"unsafe {what}: {path}")
+    if metadata.st_uid != os.geteuid():
+        raise GitPrivateStateError(f"unsafe {what} ownership: {path}")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise GitPrivateStateError(f"unsafe {what} mode: {path}")
+    return metadata
+
+
+def _require_canonical_file_descriptor(
+    descriptor: int, path: Path, what: str
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise GitPrivateStateError(f"unsafe {what}: {path}")
+    if metadata.st_uid != os.geteuid():
+        raise GitPrivateStateError(f"unsafe {what} ownership: {path}")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise GitPrivateStateError(f"unsafe {what} mode: {path}")
+    return metadata
+
+
+def _namespace_marker(path: Path) -> tuple[int, str]:
+    indexes = [
+        index for index, part in enumerate(path.parts)
+        if part in {NAMESPACE, LEGACY_NAMESPACE}
+    ]
     if not indexes:
-        raise GitPrivateStateError(f"path is outside a recognized private-state namespace: {path}")
+        raise GitPrivateStateError(
+            f"path is outside a recognized private-state namespace: {path}"
+        )
     marker = indexes[-1]
+    return marker, path.parts[marker]
+
+
+def _open_anchored_parent(path: Path) -> int:
+    """Open and validate the descriptors that anchor a private-state parent."""
+    parts = path.parts
+    marker, namespace = _namespace_marker(path)
+    canonical = namespace == NAMESPACE
     boundary = Path(*parts[:marker])
     descriptor = _open_dir(boundary)
     try:
+        if canonical:
+            _require_git_admin_descriptor(descriptor, boundary)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        current = boundary
         for component in parts[marker:-1]:
             child = os.open(component, flags, dir_fd=descriptor)
-            child_meta = os.fstat(child)
-            if not stat.S_ISDIR(child_meta.st_mode):
+            current /= component
+            try:
+                child_meta = os.fstat(child)
+                if not stat.S_ISDIR(child_meta.st_mode):
+                    raise GitPrivateStateError(
+                        f"unsafe private-state directory component: {current}"
+                    )
+                if canonical:
+                    _require_canonical_dir_descriptor(child, current)
+            except (GitPrivateStateError, OSError):
                 os.close(child)
-                raise GitPrivateStateError(f"unsafe private-state directory component: {component}")
+                raise
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -253,10 +314,10 @@ def _ensure_child_directory(parent: Path, name: str) -> Path:
 
 
 def _ensure_namespace(base: Path, subdirectories: tuple[str, ...]) -> Path:
-    _require_dir(base, "Git administrative directory")
     descriptor = _open_dir(base)
     current = base
     try:
+        _require_git_admin_descriptor(descriptor, base)
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         for name in (NAMESPACE, *subdirectories):
             created = False
@@ -290,13 +351,16 @@ def _ensure_namespace(base: Path, subdirectories: tuple[str, ...]) -> Path:
 def read_bytes_identity(
     path: Path, what: str = "private-state record"
 ) -> tuple[bytes, tuple[int, int]]:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+             getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
     parent_fd = _open_anchored_parent(path)
     try:
         descriptor = os.open(path.name, flags, dir_fd=parent_fd)
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
+            if _namespace_marker(path)[1] == NAMESPACE:
+                metadata = _require_canonical_file_descriptor(descriptor, path, what)
+            elif not stat.S_ISREG(metadata.st_mode):
                 raise GitPrivateStateError(f"unsafe {what}: {path}")
             chunks: list[bytes] = []
             while True:

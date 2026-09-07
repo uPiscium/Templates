@@ -84,7 +84,10 @@ class AgentCoreSafetyTest(unittest.TestCase):
             root = Path(directory)
             checkpoint = root / "agent-core" / "integration" / "checkpoint"
             checkpoint.parent.mkdir(parents=True)
+            checkpoint.parent.parent.chmod(0o700)
+            checkpoint.parent.chmod(0o700)
             checkpoint.write_text("old-head\n", encoding="utf-8")
+            checkpoint.chmod(0o600)
             with (
                 mock.patch.object(agent_core, "integration_checkpoint", return_value=checkpoint),
                 mock.patch.object(
@@ -95,6 +98,56 @@ class AgentCoreSafetyTest(unittest.TestCase):
                 self.assertRaisesRegex(agent_core.AutomationError, "head moved"),
             ):
                 agent_core.integrate_merge(root, "10")
+
+    def test_integration_merge_accepts_valid_unchanged_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "agent-core/integration/checkpoint"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.parent.parent.chmod(0o700)
+            checkpoint.parent.chmod(0o700)
+            checkpoint.write_text("current-head\n", encoding="utf-8")
+            checkpoint.chmod(0o600)
+            with (
+                mock.patch.object(
+                    agent_core, "integration_checkpoint", return_value=checkpoint
+                ),
+                mock.patch.object(
+                    agent_core,
+                    "validate_integration",
+                    return_value={"headRefOid": "current-head", "number": 10},
+                ),
+                mock.patch.object(agent_core, "gh") as merge,
+            ):
+                agent_core.integrate_merge(root, "10")
+            merge.assert_called_once_with(
+                "pr", "merge", "10", "--squash", "--match-head-commit",
+                "current-head", cwd=root
+            )
+
+    def test_integration_merge_rejects_unsafe_canonical_checkpoint_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            details = {"number": 12, "headRefOid": "a" * 40}
+            with mock.patch.object(agent_core, "validate_integration", return_value=details):
+                agent_core.integrate_check(root, "12")
+            checkpoint = root / ".git/agent-core/integration/pr-12.head"
+            checkpoint.chmod(0o644)
+
+            with (
+                mock.patch.object(agent_core, "validate_integration") as validate,
+                mock.patch.object(agent_core, "gh") as merge,
+                self.assertRaisesRegex(agent_core.AutomationError, "unsafe integration checkpoint"),
+            ):
+                agent_core.integrate_merge(root, "12")
+            validate.assert_not_called()
+            merge.assert_not_called()
 
 
 class PublicationMetadataTest(unittest.TestCase):
